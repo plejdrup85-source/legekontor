@@ -25,17 +25,13 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 # APP MODE / BRANDING
 # ============================================================
 APP_MODE = os.getenv("APP_MODE", "standard").strip().lower()
-# For Legekontor-versjonen kan du sette:
-#   APP_MODE=legekontor
-#   APP_TITLE="Legekontor – prissammenligning"
 APP_TITLE = os.getenv("APP_TITLE", "Produktmatching").strip() or "Produktmatching"
 APP_SUBTITLE = os.getenv("APP_SUBTITLE", "").strip()
 
 # ============================================================
 # PATHS / PERSISTENT STORAGE
 # ============================================================
-
-DATA_DIR = Path(os.getenv("DATA_DIR", "/data")).resolve()
+DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "logo.png").resolve())))
@@ -45,23 +41,14 @@ RESULTS_DIR.mkdir(exist_ok=True)
 
 CATALOG_PATH = DATA_DIR / "catalog.xlsx"
 JOBS_INDEX = DATA_DIR / "jobs.jsonl"
+COMPETITOR_REGISTER_PATH = DATA_DIR / "competitor_price_register.xlsx"
 
 # ============================================================
 # APP STATE
 # ============================================================
-
 app = FastAPI(title=APP_TITLE, version=os.getenv("APP_VERSION", "2.6"))
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
-# TASKS structure:
-#   TASKS[task_id] = {
-#       "progress": float,
-#       "status": "running|done|cancel_requested|cancelled|error",
-#       "error": str|None,
-#       "cancel_requested": bool,
-#       "_cancel_event": threading.Event,
-#       "meta": {...} (optional)
-#   }
 TASKS: Dict[str, Dict[str, Any]] = {}
 
 EMBEDDINGS_STATUS: Dict[str, Any] = {
@@ -69,22 +56,22 @@ EMBEDDINGS_STATUS: Dict[str, Any] = {
     "started_at": None,
     "finished_at": None,
     "error": None,
+}
 
 # ============================================================
 # LEGEKONTOR: TO PRISLISTER + PRISOPPSLAG
 # ============================================================
-
 LK_SHEET_NAME = os.getenv("LK_SHEET_NAME", "Legekontor pri")
 FULL_SHEET_NAME = os.getenv("FULL_SHEET_NAME", "Ikke på prisliste")
 CURRENT_LK_SHEET = None
 CURRENT_FULL_SHEET = None
 
-COMPETITOR_REGISTER_PATH = DATA_DIR / "competitor_price_register.xlsx"
 
 def _norm_key(s: str) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9æøå]+", "", s)
     return s
+
 
 def _find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
     cols = list(df.columns)
@@ -101,6 +88,7 @@ def _find_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
                 return orig
     return None
 
+
 def _to_float(x) -> Optional[float]:
     if x is None:
         return None
@@ -113,6 +101,7 @@ def _to_float(x) -> Optional[float]:
     except Exception:
         return None
 
+
 class LegekontorCatalogBundle:
     def __init__(self, lk_catalog: Catalog, full_catalog: Catalog, price_lookup: Dict[str, Dict[str, Any]]):
         self.lk = lk_catalog
@@ -120,7 +109,6 @@ class LegekontorCatalogBundle:
         self.price_lookup = price_lookup  # artnr -> {price: float, source: 'lk'|'full'}
 
     def items_count(self) -> int:
-        # vis total fra full (den er superset)
         return len(self.full.items) if self.full else 0
 
     def embeddings_enabled(self) -> bool:
@@ -145,18 +133,17 @@ class LegekontorCatalogBundle:
         # 1) prøv først LK-prislista
         artnr, _alts, best_row, quality = self.lk.match_row(mrow, top_n=top_n, prefer_own_brands=prefer_own_brands)
         if artnr:
-            return artnr, best_row, quality
+            return artnr, best_row, quality, "lk"
 
         # 2) fallback: full katalog
         artnr, _alts, best_row, quality = self.full.match_row(mrow, top_n=top_n, prefer_own_brands=prefer_own_brands)
-        return artnr, best_row, quality
+        return artnr, best_row, quality, "full"
 
     def price_for_artnr(self, artnr: str) -> Tuple[Optional[float], str]:
         d = self.price_lookup.get(str(artnr).strip())
         if not d:
             return None, ""
         return d.get("price"), d.get("source") or ""
-}
 
 
 # ============================================================
@@ -164,6 +151,11 @@ class LegekontorCatalogBundle:
 # ============================================================
 WATCHDOG_STUCK_SECONDS = int(os.getenv("WATCHDOG_STUCK_SECONDS", "600"))  # 10 min
 WATCHDOG_POLL_SECONDS = int(os.getenv("WATCHDOG_POLL_SECONDS", "30"))
+
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 
 def _watchdog_loop():
     """Markerer tasks som 'error' hvis progress ikke har endret seg på en stund."""
@@ -198,19 +190,17 @@ def _watchdog_loop():
             logger.warning(f"Watchdog-feil: {e}")
         time.sleep(WATCHDOG_POLL_SECONDS)
 
+
 # ============================================================
 # UTIL
 # ============================================================
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
 def append_job(event: Dict[str, Any]) -> None:
     try:
         with open(JOBS_INDEX, "a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False) + "\n")
     except Exception as e:
         logger.warning(f"Kunne ikke skrive jobs-index: {e}")
+
 
 def load_jobs(limit: int = 200) -> List[Dict[str, Any]]:
     if not JOBS_INDEX.exists():
@@ -239,6 +229,7 @@ def load_jobs(limit: int = 200) -> List[Dict[str, Any]]:
     out.sort(key=lambda x: x.get("created_at", ""), reverse=True)
     return out[:limit]
 
+
 def catalog_meta() -> Dict[str, Any]:
     if not CATALOG_PATH.exists():
         return {"loaded": False, "items": 0, "updated_at": None, "path": str(CATALOG_PATH)}
@@ -265,6 +256,7 @@ def catalog_meta() -> Dict[str, Any]:
             "path": str(CATALOG_PATH),
         }
 
+
 def embeddings_meta() -> Dict[str, Any]:
     meta = dict(EMBEDDINGS_STATUS)
     meta["enabled_in_catalog"] = bool(CATALOG_BUNDLE and CATALOG_BUNDLE.embeddings_enabled())
@@ -275,12 +267,7 @@ def embeddings_meta() -> Dict[str, Any]:
 # ============================================================
 # INPUT TEMPLATE
 # ============================================================
-
 def generate_input_template_bytes() -> bytes:
-    """
-    Legekontor-versjon: enkel input-template for prissammenligning.
-    Bruker fyller ut konkurrent-linjene (eller importer i neste versjon).
-    """
     cols = [
         "Konkurrent Navn",
         "Konkurrent Art.Nr",
@@ -299,33 +286,22 @@ def generate_input_template_bytes() -> bytes:
             "Konkurrent Pris": 12.5,
             "Konkurrent salgsenhet": "stk",
             "Antall": 10,
-        },
-        {
-            "Konkurrent Navn": "Konkurrent X",
-            "Konkurrent Art.Nr": "ABC-9",
-            "Konkurrent Item Description": "2-veis kateter silikon, med ballong",
-            "Konkurrent Specification": "40 cm, CH18",
-            "Konkurrent Pris": 45.0,
-            "Konkurrent salgsenhet": "stk",
-            "Antall": 5,
-        },
+        }
     ]
     df = pd.DataFrame(example_rows, columns=cols)
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Input")
-
     return buf.getvalue()
 
 
 # ============================================================
 # CATALOG AUTOLOAD (NON-BLOCKING)
 # ============================================================
-
 def _start_embeddings_build_background() -> None:
     """Build embeddings asynchronously so Render can detect open port quickly."""
-    global CATALOG_BUNDLE_BUNDLE
+    global CATALOG_BUNDLE
 
     if CATALOG_BUNDLE is None:
         return
@@ -340,7 +316,6 @@ def _start_embeddings_build_background() -> None:
         })
         return
 
-    # Avoid parallel builds
     if EMBEDDINGS_STATUS.get("state") == "building":
         return
 
@@ -352,14 +327,13 @@ def _start_embeddings_build_background() -> None:
     })
 
     def _worker():
-        global CATALOG_BUNDLE_BUNDLE
+        global CATALOG_BUNDLE
         try:
             logger.info("Starter embedding-bygging i bakgrunnen (LK + Full)...")
 
-            # Bygg NYE Catalog med embeddings slått på (tungt),
-            # og kopier embed_index tilbake til de allerede lastede katalogene.
             lk_sheet = CURRENT_LK_SHEET if CURRENT_LK_SHEET is not None else LK_SHEET_NAME
             full_sheet = CURRENT_FULL_SHEET if CURRENT_FULL_SHEET is not None else FULL_SHEET_NAME
+
             lk2 = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=True, sheet_name=lk_sheet)
             full2 = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=True, sheet_name=full_sheet)
 
@@ -372,11 +346,7 @@ def _start_embeddings_build_background() -> None:
                 "finished_at": utc_now_iso(),
                 "error": None if ok else "Embedding-indeks ikke tilgjengelig",
             })
-
-            if ok:
-                logger.info("Embedding-indeks klar (bakgrunn).")
-            else:
-                logger.warning("Embedding-indeks kunne ikke bygges (bakgrunn).")
+            logger.info("Embedding-indeks klar (bakgrunn)." if ok else "Embedding-indeks feilet (bakgrunn).")
 
         except Exception as e:
             EMBEDDINGS_STATUS.update({
@@ -388,8 +358,9 @@ def _start_embeddings_build_background() -> None:
 
     threading.Thread(target=_worker, daemon=True).start()
 
+
 def load_catalog_from_disk() -> None:
-    global CATALOG_BUNDLE_BUNDLE
+    global CATALOG_BUNDLE
     if not CATALOG_PATH.exists():
         logger.info("Ingen katalog på disk enda.")
         CATALOG_BUNDLE = None
@@ -398,10 +369,9 @@ def load_catalog_from_disk() -> None:
 
     logger.info(f"Laster legekontor-katalog fra disk: {CATALOG_PATH}")
 
-    # Les begge ark (to prislister)
     xls = pd.ExcelFile(CATALOG_PATH)
-    # Finn faktiske ark-navn robust
     sheets = [s for s in xls.sheet_names]
+
     lk_sheet = LK_SHEET_NAME if LK_SHEET_NAME in sheets else (sheets[0] if sheets else 0)
     full_sheet = FULL_SHEET_NAME if FULL_SHEET_NAME in sheets else (sheets[1] if len(sheets) > 1 else lk_sheet)
 
@@ -412,25 +382,23 @@ def load_catalog_from_disk() -> None:
     df_lk = pd.read_excel(CATALOG_PATH, sheet_name=lk_sheet)
     df_full = pd.read_excel(CATALOG_PATH, sheet_name=full_sheet)
 
-    # Kolonner (pris)
     lk_price_col = _find_col(df_lk, "Pris Etter Rabatt", "Pris etter rabatt", "Pris etter rabatt (NOK)", "Price after discount")
     full_price_col = _find_col(df_full, "Net Price", "Net price", "NetPrice", "Net_Price", "Net Purch Price")
 
-    # Artikkelnummer-kolonne
     art_col_lk = _find_col(df_lk, "Artikkelnummer", "Art.nr", "Art nr", "Article Number", "Item NO", "Item No")
     art_col_full = _find_col(df_full, "Artikkelnummer", "Art.nr", "Art nr", "Article Number", "Item NO", "Item No")
 
     if not art_col_lk or not art_col_full:
-        raise ValueError("Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr).")
+        raise ValueError("Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No).")
 
     if not lk_price_col:
         logger.warning("Fant ikke 'Pris Etter Rabatt' i LK-arket. Priser fra LK kan bli tomme.")
     if not full_price_col:
         logger.warning("Fant ikke 'Net Price' i full-katalog-arket. Fallback-priser kan bli tomme.")
 
-    # Bygg prisoppslag: prefer LK-pris hvis finnes, ellers full
     price_lookup: Dict[str, Dict[str, Any]] = {}
 
+    # Full først
     for _, r in df_full.iterrows():
         art = str(r.get(art_col_full, "")).strip()
         if not art or art.lower() == "nan":
@@ -440,6 +408,7 @@ def load_catalog_from_disk() -> None:
             continue
         price_lookup[art] = {"price": float(p), "source": "full"}
 
+    # LK overstyrer
     for _, r in df_lk.iterrows():
         art = str(r.get(art_col_lk, "")).strip()
         if not art or art.lower() == "nan":
@@ -447,10 +416,9 @@ def load_catalog_from_disk() -> None:
         p = _to_float(r.get(lk_price_col)) if lk_price_col else None
         if p is None:
             continue
-        # LK har prioritet
         price_lookup[art] = {"price": float(p), "source": "lk"}
 
-    # Critical: do NOT build embeddings during startup (Render port scan timeout)
+    # Ikke bygg embeddings ved startup
     lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
     full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
 
@@ -459,7 +427,6 @@ def load_catalog_from_disk() -> None:
     logger.info(f"Legekontor-katalog lastet: LK={len(lk_cat.items)} produkter, Full={len(full_cat.items)} produkter")
     logger.info(f"Prisoppslag: {len(price_lookup)} art.nr med pris")
 
-    # Start embeddings in background
     _start_embeddings_build_background()
 
 
@@ -469,78 +436,206 @@ def startup_event():
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
 
+
+# ============================================================
+# COMPETITOR REGISTER
+# ============================================================
+def append_competitor_register(rows: List[Dict[str, Any]]) -> None:
+    if not rows:
+        return
+    try:
+        new_df = pd.DataFrame(rows)
+        if COMPETITOR_REGISTER_PATH.exists():
+            try:
+                old_df = pd.read_excel(COMPETITOR_REGISTER_PATH)
+                out_df = pd.concat([old_df, new_df], ignore_index=True)
+            except Exception:
+                out_df = new_df
+        else:
+            out_df = new_df
+
+        with pd.ExcelWriter(COMPETITOR_REGISTER_PATH, engine="openpyxl") as writer:
+            out_df.to_excel(writer, index=False, sheet_name="Register")
+    except Exception as e:
+        logger.warning(f"Kunne ikke oppdatere konkurrentregister: {e}")
+
+
 # ============================================================
 # MATCH CORE
 # ============================================================
+OUTPUT_COLUMNS_LK = [
+    "Konkurrent Navn",
+    "Konkurrent Art.Nr",
+    "Konkurrent Item Description",
+    "Konkurrent Specification",
+    "Konkurrent Pris",
+    "Konkurrent salgsenhet",
+    "Item NO",
+    "Item Description",
+    "Speciciation",
+    "Antall",
+    "Pris per enhet",
+    "Total pris",
+    "Pris Konkurrent vs oss",
+]
+
 
 def match_excel(
-    cat: Catalog,
+    bundle: LegekontorCatalogBundle,
     content: bytes,
+    input_filename: str,
     progress_cb: Optional[Callable[[float], None]] = None,
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    """
-    Leser input-xlsx, kjører matching via matcher._match_rows_batched, og returnerer bytes for output-xlsx.
-    cancel_event: hvis set() -> avbryt så raskt som mulig (mellom rader / før Claude-kall).
-    """
-    df = pd.read_excel(BytesIO(content))
-    total = len(df)
+    df_in = pd.read_excel(BytesIO(content))
+    total = len(df_in)
 
-    from matcher import OUTPUT_COLUMNS, _match_rows_batched
+    # ensure input cols exist
+    for c in [
+        "Konkurrent Navn",
+        "Konkurrent Art.Nr",
+        "Konkurrent Item Description",
+        "Konkurrent Specification",
+        "Konkurrent Pris",
+        "Konkurrent salgsenhet",
+        "Antall",
+    ]:
+        if c not in df_in.columns:
+            df_in[c] = ""
 
-    for col in OUTPUT_COLUMNS:
-        if col not in df.columns:
-            df[col] = ""
-
-    df = df.reindex(columns=OUTPUT_COLUMNS)
     rows_out: List[Dict[str, Any]] = []
+    reg_rows: List[Dict[str, Any]] = []
 
-    batch_size = int(os.getenv("ROW_BATCH_SIZE", "25"))
+    sum_comp_total = 0.0
+    sum_our_total = 0.0
 
-    for start in range(0, total, batch_size):
+    run_date = datetime.now(timezone.utc).date().isoformat()
+
+    for idx, r in df_in.iterrows():
         if cancel_event is not None and cancel_event.is_set():
             raise CancelledError("Avbrutt av bruker")
 
-        batch_df = df.iloc[start:start + batch_size].copy()
+        comp = r.to_dict()
+        comp_name = str(comp.get("Konkurrent Navn", "") or "").strip()
+        comp_art = str(comp.get("Konkurrent Art.Nr", "") or "").strip()
+        comp_desc = str(comp.get("Konkurrent Item Description", "") or "").strip()
+        comp_spec = str(comp.get("Konkurrent Specification", "") or "").strip()
+        comp_unit = _to_float(comp.get("Konkurrent Pris")) or 0.0
+        comp_unit_name = str(comp.get("Konkurrent salgsenhet", "") or "").strip()
+        qty = _to_float(comp.get("Antall")) or 0.0
 
-        # ✅ Signature: (df_work, bm25_index, embed_index, ...)
-        df_out, _meta = _match_rows_batched(
-            batch_df,
-            cat.bm25_index,
-            getattr(cat, "embed_index", None),
+        artnr, best_row, quality, matched_from = bundle.match_competitor_row(
+            comp,
             top_n=30,
-            progress_cb=None,
-            cancel_event=cancel_event,            # <— viktig (robust cancel)
             prefer_own_brands=prefer_own_brands,
         )
 
-        for i, (_, out_r) in enumerate(df_out.iterrows()):
-            rows_out.append(out_r.to_dict())
-            if progress_cb and total > 0:
-                progress_cb((start + i + 1) / total)
+        our_unit, price_source = (None, "")
+        if artnr:
+            our_unit, price_source = bundle.price_for_artnr(artnr)
 
-    df_out_all = pd.DataFrame(rows_out).reindex(columns=OUTPUT_COLUMNS)
+        our_unit_val = float(our_unit) if our_unit is not None else 0.0
+
+        comp_total = float(comp_unit) * float(qty)
+        our_total = float(our_unit_val) * float(qty)
+        diff_total = comp_total - our_total
+
+        sum_comp_total += comp_total
+        sum_our_total += our_total
+
+        # try to read best_row fields robustly
+        item_desc = ""
+        item_spec = ""
+        if isinstance(best_row, dict):
+            item_desc = str(best_row.get("Item Description") or best_row.get("Beskrivelse") or best_row.get("Description") or "")
+            item_spec = str(best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
+
+        out = {
+            "Konkurrent Navn": comp_name,
+            "Konkurrent Art.Nr": comp_art,
+            "Konkurrent Item Description": comp_desc,
+            "Konkurrent Specification": comp_spec,
+            "Konkurrent Pris": comp_unit,
+            "Konkurrent salgsenhet": comp_unit_name,
+            "Item NO": str(artnr or ""),
+            "Item Description": item_desc,
+            "Speciciation": item_spec,
+            "Antall": qty,
+            "Pris per enhet": our_unit if our_unit is not None else "",
+            "Total pris": our_total,
+            "Pris Konkurrent vs oss": diff_total,
+        }
+        rows_out.append(out)
+
+        reg_rows.append({
+            "Dato": run_date,
+            "Inputfil": input_filename,
+            "Konkurrent Navn": comp_name,
+            "Konkurrent Art.Nr": comp_art,
+            "Konkurrent Item Description": comp_desc,
+            "Konkurrent Specification": comp_spec,
+            "Konkurrent Pris": comp_unit,
+            "Konkurrent salgsenhet": comp_unit_name,
+            "Antall": qty,
+            "Matchet Item NO": str(artnr or ""),
+            "Matchet Item Description": item_desc,
+            "Matchet Specification": item_spec,
+            "Vår pris per enhet": our_unit if our_unit is not None else "",
+            "Vår pris kilde": price_source or matched_from,
+            "Match kvalitet": quality,
+        })
+
+        if progress_cb and total > 0:
+            progress_cb((idx + 1) / total)
+
+    # Summary rows
+    rows_out.append({c: "" for c in OUTPUT_COLUMNS_LK})
+    rows_out.append({
+        "Konkurrent Item Description": "Total pris for konkurrent",
+        "Konkurrent Pris": sum_comp_total,
+        "Total pris": "",
+        "Pris Konkurrent vs oss": "",
+    })
+    rows_out.append({
+        "Konkurrent Item Description": "Total pris for oss",
+        "Konkurrent Pris": "",
+        "Total pris": sum_our_total,
+        "Pris Konkurrent vs oss": "",
+    })
+    rows_out.append({
+        "Konkurrent Item Description": "Differanse (konkurrent - oss)",
+        "Konkurrent Pris": "",
+        "Total pris": "",
+        "Pris Konkurrent vs oss": (sum_comp_total - sum_our_total),
+    })
+
+    df_out = pd.DataFrame(rows_out)
+    for c in OUTPUT_COLUMNS_LK:
+        if c not in df_out.columns:
+            df_out[c] = ""
+    df_out = df_out.reindex(columns=OUTPUT_COLUMNS_LK)
+
+    # Update competitor register (persistent)
+    append_competitor_register(reg_rows)
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        df_out_all.to_excel(writer, index=False, sheet_name="Input")
+        df_out.to_excel(writer, index=False, sheet_name="Output")
 
     meta = {
         "rows_in": int(total),
-        "rows_out": int(len(df_out_all)),
-        "claude_enabled": bool(os.getenv("ANTHROPIC_API_KEY", "").strip()),
-        "embedding_enabled": bool(getattr(cat, "embed_index", None)) and bool(getattr(cat.embed_index, "available", False)),
+        "rows_out": int(total),
         "timestamp": utc_now_iso(),
         "prefer_own_brands": bool(prefer_own_brands),
+        "register_path": str(COMPETITOR_REGISTER_PATH),
     }
-
     return buf.getvalue(), meta
+
 
 # ============================================================
 # UI
 # ============================================================
-
 INDEX_HTML = f"""
 <!doctype html>
 <html>
@@ -548,28 +643,28 @@ INDEX_HTML = f"""
   <meta charset="utf-8"/>
   <title>{APP_TITLE}</title>
   <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 32px; color:#1a1a1a; }
-    .card { border:1px solid #e6e6e6; padding:16px; border-radius:12px; max-width: 1100px; }
-    input[type=file] { margin: 8px 0; }
-    button { background:#1F4E79; color:white; border:0; padding:10px 14px; border-radius:8px; cursor:pointer; }
-    button.secondary { background:#6b7280; }
-    button:disabled { opacity: 0.5; cursor:not-allowed; }
-    .row { display:flex; gap:24px; flex-wrap: wrap; }
-    .col { flex: 1; min-width: 320px; }
-    .muted { color:#666; }
-    .bar-wrap { width:100%; background:#f2f2f2; border-radius: 999px; overflow:hidden; height: 14px; }
-    .bar { height: 14px; width: 0%; background: #1F4E79; transition: width .3s; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align:left; border-bottom:1px solid #eee; padding:10px 8px; vertical-align: top; }
-    th { font-size: 13px; color:#444; }
-    .right { text-align:right; }
-    a { color:#1F4E79; text-decoration:none; }
-    a:hover { text-decoration:underline; }
-    pre { background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; overflow:auto; }
+    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 32px; color:#1a1a1a; }}
+    .card {{ border:1px solid #e6e6e6; padding:16px; border-radius:12px; max-width: 1100px; }}
+    input[type=file] {{ margin: 8px 0; }}
+    button {{ background:#1F4E79; color:white; border:0; padding:10px 14px; border-radius:8px; cursor:pointer; }}
+    button.secondary {{ background:#6b7280; }}
+    button:disabled {{ opacity: 0.5; cursor:not-allowed; }}
+    .row {{ display:flex; gap:24px; flex-wrap: wrap; }}
+    .col {{ flex: 1; min-width: 320px; }}
+    .muted {{ color:#666; }}
+    .bar-wrap {{ width:100%; background:#f2f2f2; border-radius: 999px; overflow:hidden; height: 14px; }}
+    .bar {{ height: 14px; width: 0%; background: #1F4E79; transition: width .3s; }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{ text-align:left; border-bottom:1px solid #eee; padding:10px 8px; vertical-align: top; }}
+    th {{ font-size: 13px; color:#444; }}
+    .right {{ text-align:right; }}
+    a {{ color:#1F4E79; text-decoration:none; }}
+    a:hover {{ text-decoration:underline; }}
+    pre {{ background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; overflow:auto; }}
   </style>
 </head>
 <body>
-  <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="OneTinder" style="max-height:110px; width:auto;" onerror="this.style.display='none';"/></div>
+  <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" style="max-height:110px; width:auto;" onerror="this.style.display='none';"/></div>
   <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">{APP_SUBTITLE}</div>
   <div class="card">
     <div class="row">
@@ -584,7 +679,7 @@ INDEX_HTML = f"""
       <div class="col">
         <h3>2) Prissammenligning</h3>
         <p class="muted">Last opp konkurrentfil i input-format og start matching.</p>
-        <p class="muted"><a href="/template">Last ned input-template.xlsx</a> (anbefalt format). Import fra faktura/PDF kommer i neste steg.</p>
+        <p class="muted"><a href="/template">Last ned input-template.xlsx</a></p>
         <div class="muted" style="margin:10px 0 6px 0;">
           <b>Preferer egne merkevarer?</b>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
@@ -615,15 +710,15 @@ INDEX_HTML = f"""
 <script>
 let taskId = null;
 
-function esc(s) {
+function esc(s) {{
   return String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-}
+}}
 
-function formatOsloTime(iso) {
+function formatOsloTime(iso) {{
   if (!iso) return "";
-  try {
+  try {{
     const d = new Date(iso);
-    return new Intl.DateTimeFormat("nb-NO", {
+    return new Intl.DateTimeFormat("nb-NO", {{
       timeZone: "Europe/Oslo",
       year: "numeric",
       month: "2-digit",
@@ -631,19 +726,19 @@ function formatOsloTime(iso) {
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
-    }).format(d);
-  } catch {
+    }}).format(d);
+  }} catch {{
     return iso;
-  }
-}
+  }}
+}}
 
-async function refreshCatalogInfo() {
+async function refreshCatalogInfo() {{
   const resp = await fetch("/catalog_status");
   const data = await resp.json();
   document.getElementById("debug").textContent = JSON.stringify(data, null, 2);
 
   const el = document.getElementById("catalogInfo");
-  if (data.path) {
+  if (data.path) {{
     el.innerHTML = `
       <div><b>Path:</b> ${esc(data.path)}</div>
       <div><b>Finnes på disk:</b> ${data.exists ? "Ja" : "Nei"}</div>
@@ -652,12 +747,12 @@ async function refreshCatalogInfo() {
       <div><b>Sist oppdatert (Oslo):</b> ${esc(formatOsloTime(data.updated_at))}</div>
       <div><b>Embeddings:</b> ${esc((data.embeddings && data.embeddings.state) || "")}</div>
     `;
-  }
+  }}
 
   document.getElementById("btnMatch").disabled = !data.loaded;
-}
+}}
 
-async function uploadCatalog() {
+async function uploadCatalog() {{
   const file = document.getElementById("catalog").files[0];
   if (!file) return alert("Velg en katalogfil (.xlsx)");
   document.getElementById("catStatus").textContent = "Laster opp katalog...";
@@ -665,20 +760,20 @@ async function uploadCatalog() {
   const fd = new FormData();
   fd.append("file", file);
 
-  const resp = await fetch("/upload_catalog", { method: "POST", body: fd });
-  const data = await resp.json().catch(() => ({}));
+  const resp = await fetch("/upload_catalog", {{ method: "POST", body: fd }});
+  const data = await resp.json().catch(() => ({{}}));
 
-  if (!resp.ok) {
+  if (!resp.ok) {{
     document.getElementById("catStatus").textContent = "Feil: " + (data.error || "ukjent");
     await refreshCatalogInfo();
     return;
-  }
+  }}
 
   document.getElementById("catStatus").textContent = `Katalog oppdatert. Produkter: ${data.items}`;
   await refreshCatalogInfo();
-}
+}}
 
-async function startMatch() {
+async function startMatch() {{
   const file = document.getElementById("input").files[0];
   if (!file) return alert("Velg en inputfil (.xlsx)");
 
@@ -692,58 +787,58 @@ async function startMatch() {
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
-  const resp = await fetch("/match", { method: "POST", body: fd });
-  const data = await resp.json().catch(() => ({}));
+  const resp = await fetch("/match", {{ method: "POST", body: fd }});
+  const data = await resp.json().catch(() => ({{}}));
 
-  if (!resp.ok) {
+  if (!resp.ok) {{
     document.getElementById("matchStatus").textContent = "Feil: " + (data.error || "ukjent");
     document.getElementById("btnCancel").disabled = true;
     return;
-  }
+  }}
 
   taskId = data.task_id;
   pollProgress();
-}
+}}
 
-async function pollProgress() {
+async function pollProgress() {{
   const resp = await fetch(`/progress/${taskId}`);
-  const data = await resp.json().catch(() => ({}));
+  const data = await resp.json().catch(() => ({{}}));
 
   const p = Math.round((data.progress || 0) * 100);
   document.getElementById("bar").style.width = `${p}%`;
 
-  if (data.status === "cancel_requested") {
+  if (data.status === "cancel_requested") {{
     document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-  } else {
+  }} else {{
     document.getElementById("matchStatus").textContent = data.status || "running";
-  }
+  }}
 
-  if (data.status === "done") {
+  if (data.status === "done") {{
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("bar").style.width = "100%";
     document.getElementById("download").innerHTML = `<a href="/download/${esc(taskId)}">Last ned resultat</a>`;
     await loadHistory();
     return;
-  }
+  }}
 
-  if (data.status === "cancelled") {
+  if (data.status === "cancelled") {{
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("matchStatus").textContent = "Avbrutt";
     await loadHistory();
     return;
-  }
+  }}
 
-  if (data.status === "error") {
+  if (data.status === "error") {{
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("matchStatus").textContent = "Feil: " + (data.error || "");
     await loadHistory();
     return;
-  }
+  }}
 
   setTimeout(pollProgress, 2500);
-}
+}}
 
-async function loadHistory() {
+async function loadHistory() {{
   const resp = await fetch("/history?limit=200");
   const data = await resp.json();
 
@@ -752,7 +847,7 @@ async function loadHistory() {
   html += "<th>Tidspunkt (Oslo)</th><th>Filnavn</th><th>Status</th><th class='right'>Rader</th><th>Last ned</th><th>Avbryt</th>";
   html += "</tr></thead><tbody>";
 
-  for (const j of (data.jobs || [])) {
+  for (const j of (data.jobs || [])) {{
     const created = esc(formatOsloTime(j.created_at || ""));
     const fn = esc(j.input_filename || "");
     const st = esc(j.status || "");
@@ -760,30 +855,30 @@ async function loadHistory() {
     const dl = j.status === "done" ? `<a href="/download/${esc(j.task_id)}">Last ned</a>` : "";
     const cancel = (j.status === "running" || j.status === "cancel_requested") ? `<button class="secondary" onclick="cancelJob('${esc(j.task_id)}')">Avbryt</button>` : "";
     html += `<tr><td>${created}</td><td>${fn}</td><td>${st}</td><td class='right'>${rows}</td><td>${dl}</td><td>${cancel}</td></tr>`;
-  }
+  }}
 
   html += "</tbody></table>";
   document.getElementById("history").innerHTML = html;
-}
+}}
 
-async function cancelJob(tid) {
+async function cancelJob(tid) {{
   if (!tid) return;
-  try {
-    await fetch(`/cancel/${tid}`, { method: "POST" });
-  } catch (e) {}
-  if (tid === taskId) {
+  try {{
+    await fetch(`/cancel/${tid}`, {{ method: "POST" }});
+  }} catch (e) {{}}
+  if (tid === taskId) {{
     document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-  }
+  }}
   setTimeout(loadHistory, 600);
-}
+}}
 
 document.getElementById("btnCatalog").addEventListener("click", uploadCatalog);
 document.getElementById("btnMatch").addEventListener("click", startMatch);
-document.getElementById("btnCancel").addEventListener("click", async () => {
+document.getElementById("btnCancel").addEventListener("click", async () => {{
   if (!taskId) return;
-  await fetch(`/cancel/${taskId}`, { method: "POST" });
+  await fetch(`/cancel/${taskId}`, {{ method: "POST" }});
   document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-});
+}});
 
 refreshCatalogInfo();
 loadHistory();
@@ -795,11 +890,6 @@ loadHistory();
 
 @app.get("/static/logo.png")
 def static_logo():
-    """
-    Server logo som vises øverst på forsiden.
-    Standard: logo.png i repo-root (samme mappe som app.py),
-    eller sett LOGO_PATH env-var til f.eks. /data/onemed_logo.png.
-    """
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -812,7 +902,6 @@ def static_logo():
 # ============================================================
 # ROUTES
 # ============================================================
-
 @app.get("/template")
 def template():
     xlsx = generate_input_template_bytes()
@@ -822,13 +911,16 @@ def template():
         headers={"Content-Disposition": 'attachment; filename="input_template.xlsx"'},
     )
 
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return INDEX_HTML
 
+
 @app.get("/admin")
 def admin_redirect():
     return RedirectResponse(url="/", status_code=302)
+
 
 @app.get("/catalog_status")
 def catalog_status():
@@ -837,6 +929,7 @@ def catalog_status():
     meta["loaded"] = CATALOG_BUNDLE is not None
     meta["embeddings"] = embeddings_meta()
     return meta
+
 
 @app.post("/upload_catalog")
 async def upload_catalog(file: UploadFile = File(...)):
@@ -964,6 +1057,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
     threading.Thread(target=_worker, daemon=True).start()
     return {"ok": True, "task_id": task_id}
 
+
 @app.post("/cancel/{task_id}")
 def cancel(task_id: str):
     t = TASKS.get(task_id)
@@ -991,18 +1085,19 @@ def cancel(task_id: str):
 
     return {"ok": True, "status": "cancel_requested"}
 
+
 @app.get("/progress/{task_id}")
 def progress(task_id: str):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
-    # Return only JSON-safe fields (never include threading.Event)
     return {
         "status": t.get("status"),
         "progress": float(t.get("progress", 0.0)),
         "error": t.get("error"),
         "cancel_requested": bool(t.get("cancel_requested", False)),
     }
+
 
 @app.get("/download/{task_id}")
 def download(task_id: str):
@@ -1023,6 +1118,7 @@ def download(task_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="matching_{task_id}.xlsx"'}
     )
+
 
 @app.get("/history")
 def history(limit: int = 200):
