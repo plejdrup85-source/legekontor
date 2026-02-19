@@ -908,13 +908,6 @@ def _load_catalog_excel(path: str) -> List[_CatalogItem]:
     if "Article Number" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
         rename_map["Article Number"] = "Katalog: Artikkelnummer"
 
-    if "Item NO" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
-        rename_map["Item NO"] = "Katalog: Artikkelnummer"
-    if "Item No" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
-        rename_map["Item No"] = "Katalog: Artikkelnummer"
-    if "Item no" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
-        rename_map["Item no"] = "Katalog: Artikkelnummer"
-
     # Standardfelter
     if "Item Description" in cat.columns and "Katalog: Item Description" not in cat.columns:
         rename_map["Item Description"] = "Katalog: Item Description"
