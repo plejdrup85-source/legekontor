@@ -327,8 +327,13 @@ def embeddings_meta() -> Dict[str, Any]:
 # PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
 # ============================================================
 def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    """Trekk ut tekst fra PDF.
+
+    Primært: tekstlag via pypdf.extract_text().
+    Fallback: OCR hvis PDF er skannet (ingen/for lite tekst).
+    """
     reader = PdfReader(BytesIO(pdf_bytes))
-    parts = []
+    parts: List[str] = []
     for p in reader.pages:
         try:
             t = p.extract_text() or ""
@@ -336,7 +341,78 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
             t = ""
         if t:
             parts.append(t)
-    return "\n".join(parts)
+
+    text = "
+".join(parts).strip()
+
+    # OCR fallback hvis vi ikke får noe meningsfullt tekstlag
+    if len(text) >= 40:
+        return text
+
+    # Forsøk OCR (valgfritt - krever ekstra deps i miljøet). Vi gjør best-effort.
+    try:
+        ocr_text = _ocr_pdf_to_text(pdf_bytes)
+        ocr_text = (ocr_text or "").strip()
+        if ocr_text:
+            return ocr_text
+    except Exception:
+        pass
+
+    return text
+
+
+
+def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 10, dpi: int = 200) -> str:
+    """OCR av PDF (for skannede PDF-er uten tekstlag).
+
+    Prøver først PyMuPDF (fitz) for å rendere sider til bilder.
+    Fallback: pdf2image hvis tilgjengelig.
+
+    Krever at miljøet har OCR-avhengigheter installert (pytesseract + tesseract-binary).
+    Hvis ikke, returneres tom streng.
+    """
+    text_parts: List[str] = []
+
+    # Importer OCR libs lazily så appen ikke crasher hvis deps mangler
+    try:
+        import pytesseract  # type: ignore
+    except Exception:
+        return ""
+
+    # 1) PyMuPDF (fitz) render
+    try:
+        import fitz  # type: ignore
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for i in range(min(max_pages, doc.page_count)):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=dpi)
+            img_bytes = pix.tobytes("png")
+            try:
+                from PIL import Image  # type: ignore
+                from io import BytesIO as _BytesIO
+                img = Image.open(_BytesIO(img_bytes))
+                text_parts.append(pytesseract.image_to_string(img))
+            except Exception:
+                continue
+        doc.close()
+        out = "\n".join([t for t in text_parts if t]).strip()
+        if out:
+            return out
+    except Exception:
+        pass
+
+    # 2) pdf2image fallback (krever poppler i OS)
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore
+        images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=min(max_pages, 9999))
+        for img in images:
+            try:
+                text_parts.append(pytesseract.image_to_string(img))
+            except Exception:
+                continue
+        return "\n".join([t for t in text_parts if t]).strip()
+    except Exception:
+        return ""
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
@@ -993,7 +1069,7 @@ loadHistory();
 
 
 @app.get("/static/logo.png")
-def static_logo():
+def static_logo(_ok: bool = Depends(verify_basic_auth)):
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -1007,7 +1083,7 @@ def static_logo():
 # ROUTES
 # ============================================================
 @app.get("/template")
-def template():
+def template(_ok: bool = Depends(verify_basic_auth)):
     xlsx = generate_input_template_bytes()
     return StreamingResponse(
         BytesIO(xlsx),
@@ -1017,7 +1093,7 @@ def template():
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(_ok: bool = Depends(verify_basic_auth)):
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
@@ -1025,7 +1101,7 @@ def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
 
 
 @app.get("/catalog_status")
-def catalog_status():
+def catalog_status(_ok: bool = Depends(verify_basic_auth)):
     meta = catalog_meta()
     meta["exists"] = CATALOG_PATH.exists()
     meta["loaded"] = CATALOG_BUNDLE is not None
@@ -1037,20 +1113,6 @@ def catalog_status():
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
-    filename = (file.filename or "input").lower()
-    if filename.endswith('.pdf'):
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     filename = (file.filename or "").lower()
     if not filename.endswith(".xlsx"):
         return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
@@ -1071,11 +1133,30 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")):
+async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
     content = await file.read()
+
+    filename = (file.filename or "input").lower()
+    # Støtte for PDF input (f.eks. varelinjer fra anbud/faktura). Konverteres til Excel-template i minne før matching.
+    if filename.endswith(".pdf"):
+        try:
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse(
+                    {"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet PDF uten tekstlag, må den OCR'es eller eksporteres som 'searchable PDF'."},
+                    status_code=400,
+                )
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
+            content = buf.getvalue()
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1105,7 +1186,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "input_filename": file.filename or "input.xlsx",
     })
 
-    def progress(p: float):
+    def progress(p: float, _ok: bool = Depends(verify_basic_auth)):
         t = TASKS.get(task_id)
         if not t:
             return
@@ -1179,7 +1260,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
 
 
 @app.post("/cancel/{task_id}")
-def cancel(task_id: str):
+def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return JSONResponse({"error": "Ukjent task_id"}, status_code=404)
@@ -1220,7 +1301,7 @@ def progress(task_id: str):
 
 
 @app.get("/download/{task_id}")
-def download(task_id: str):
+def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     path = RESULTS_DIR / f"{task_id}.xlsx"
     if not path.exists():
         return JSONResponse({"error": "Fil finnes ikke"}, status_code=404)
@@ -1241,5 +1322,5 @@ def download(task_id: str):
 
 
 @app.get("/history")
-def history(limit: int = 200):
+def history(limit: int = 200, _ok: bool = Depends(verify_basic_auth)):
     return {"jobs": load_jobs(limit=limit)}
