@@ -13,3 +13,5 @@ rank-bm25==0.2.2
 # Embedding-basert søk (forbedret matching)
 sentence-transformers>=2.7.0
 numpy>=1.26.0
+
+pypdf>=4.0.0
