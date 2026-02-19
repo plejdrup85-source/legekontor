@@ -1153,11 +1153,7 @@ class Catalog:
 
     @classmethod
     def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: str | int | None = None) -> "Catalog":
-        # Backwards/forwards compatible: older versions of _load_catalog_excel may not accept sheet_name.
-        try:
-            items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
-        except TypeError:
-            items = _load_catalog_excel(catalog_path)
+        items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
         return cls(items, use_embeddings=use_embeddings)
 
     def match_row(self, row: Dict[str, Any], top_n: int = 30, prefer_own_brands: bool = True) -> Tuple[str, str, Optional[Dict[str, Any]], str]:
