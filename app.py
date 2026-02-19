@@ -185,37 +185,132 @@ def _pdf_text_from_bytes(content: bytes) -> str:
 
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
-    """Heuristisk parsing av fakturalinjer fra PDF-tekst.
-    Returnerer rader i samme format som excel-inputen forventer.
+    """
+    Heuristisk parsing av fakturalinjer fra PDF-tekst.
+
+    Tunet for typiske norske fakturaer der varelinjene er en tabell med kolonner:
+      Beskrivelse | Antall | Enh.pris | Beløp (ekskl. mva) | Mva | Beløp (inkl. mva)
+
+    I PDF-tekst kan beskrivelsen gå over flere linjer, og tallkolonnene kan komme på egen linje.
+    Vi akkumulerer beskrivelse i en buffer til vi treffer tallmønsteret.
     """
     rows: List[Dict[str, Any]] = []
-    # Normaliser
-    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    raw_lines = [ln for ln in raw_lines if ln and len(ln) >= 3]
 
-    # Typiske mønstre: qty + beskrivelse + pris
-    # Eksempel: "2 STK Handsker nitril M  49,00" eller "1 x Sprøyte 10ml  12.50"
-    rx = re.compile(r"^(?P<qty>\d+[\.,]?\d*)\s*(?:x|stk|st|pcs|pc)?\s+(?P<desc>.+?)\s+(?P<price>\d+[\.,]\d{2})\s*$", re.IGNORECASE)
+    # Normaliser linjer (behold linjedeling, men stram inn whitespace)
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln and len(ln) >= 2]
 
-    for ln in raw_lines:
-        m = rx.match(ln)
-        if not m:
+    # Finn leverandør (best-effort)
+    supplier = ""
+    for ln in lines[:25]:
+        if re.search(r"\bFAKTURA\b", ln, flags=re.IGNORECASE):
+            break
+        m_sup = re.match(r"^([A-Za-zÆØÅæøå0-9 .&\-\/]+\bAS)\b$", ln.strip())
+        if m_sup:
+            supplier = m_sup.group(1).strip()
+            break
+
+    # Finn start på varelinjer (etter header-raden)
+    start_idx = 0
+    for i, ln in enumerate(lines):
+        if re.search(r"\bBeskrivelse\b", ln, flags=re.IGNORECASE) and re.search(r"\bAntall\b", ln, flags=re.IGNORECASE):
+            start_idx = i + 1
+            break
+
+    stop_rx = re.compile(r"^(Sum\b|Betales\b|Frakt\b|Total\b)", re.IGNORECASE)
+
+    # Tallkolonne-mønster (med og uten prefix)
+    tail_with_prefix = re.compile(
+        r"^(?P<prefix>.+?)\s+"
+        r"(?P<qty>\d+(?:[\.,]\d+)?)\s+"
+        r"(?P<unit>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<amount>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<vat>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<incl>\d[\d\s]*[\.,]\d{2})$"
+    )
+    tail_numbers_only = re.compile(
+        r"^(?P<qty>\d+(?:[\.,]\d+)?)\s+"
+        r"(?P<unit>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<amount>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<vat>\d[\d\s]*[\.,]\d{2})\s+"
+        r"(?P<incl>\d[\d\s]*[\.,]\d{2})$"
+    )
+
+    header_noise_rx = re.compile(r"(Enh\.pris|Beløp|Mva\b|inkl\.\s*mva|ekskl\.\s*mva)", re.IGNORECASE)
+
+    buf = ""
+    for ln in lines[start_idx:]:
+        if stop_rx.match(ln):
+            break
+
+        # hopp over/rydd bort tydelig header-støy som ofte ligger rett under tabellheaderen
+        if header_noise_rx.search(ln):
+            buf = ""
             continue
-        qty = _to_float(m.group("qty")) or 0.0
-        price = _to_float(m.group("price")) or 0.0
-        desc = (m.group("desc") or "").strip()
-        if not desc:
+
+        m1 = tail_with_prefix.match(ln)
+        if m1:
+            prefix = (m1.group("prefix") or "").strip()
+            qty_str = (m1.group("qty") or "").strip()
+            unit_str = (m1.group("unit") or "").strip()
+
+            qty = _to_float(qty_str) or 0.0
+            unit_price = _to_float(unit_str) or 0.0
+
+            # Heuristikk: noen linjer inneholder "Nr 11 4 319,00 ..." der "11" er del av beskrivelse
+            # og "4 319,00" egentlig betyr qty=4 og enh.pris=319,00.
+            if prefix.lower().endswith(" nr") and qty >= 10 and " " in unit_str:
+                parts = [p for p in unit_str.split(" ") if p]
+                if len(parts) >= 2:
+                    maybe_qty = _to_float(parts[0])
+                    maybe_unit = _to_float(" ".join(parts[1:]))
+                    if maybe_qty is not None and maybe_unit is not None and 0 < maybe_qty <= 50 and maybe_unit < unit_price:
+                        # legg "Nr <qty_str>" inn i beskrivelsen
+                        prefix = (prefix + " " + qty_str).strip()
+                        qty = float(maybe_qty)
+                        unit_price = float(maybe_unit)
+
+            desc = " ".join(x for x in [buf.strip(), prefix] if x).strip()
+            buf = ""
+
+            if not desc:
+                continue
+
+            rows.append({
+                "Konkurrent Navn": supplier,
+                "Konkurrent Art.Nr": "",
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Konkurrent Pris": unit_price,
+                "Konkurrent salgsenhet": "",
+                "Antall": qty,
+            })
             continue
 
-        rows.append({
-            "Konkurrent Navn": "",
-            "Konkurrent Art.Nr": "",
-            "Konkurrent Item Description": desc,
-            "Konkurrent Specification": "",
-            "Konkurrent Pris": price,
-            "Konkurrent salgsenhet": "",
-            "Antall": qty,
-        })
+        m2 = tail_numbers_only.match(ln)
+        if m2 and buf.strip():
+            qty = _to_float(m2.group("qty")) or 0.0
+            unit_price = _to_float(m2.group("unit")) or 0.0
+            desc = buf.strip()
+            buf = ""
+
+            rows.append({
+                "Konkurrent Navn": supplier,
+                "Konkurrent Art.Nr": "",
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Konkurrent Pris": unit_price,
+                "Konkurrent salgsenhet": "",
+                "Antall": qty,
+            })
+            continue
+
+        # Akkumuler beskrivelse (inkl. linjebryting i PDF)
+        # Unngå å dra med rene betalings-/meta-linjer
+        if re.search(r"\bFakturanr\b|\bKID\b|\bKontonummer\b|\bForfallsdato\b", ln, flags=re.IGNORECASE):
+            continue
+
+        buf = (buf + " " + ln).strip()
 
     return rows
 
