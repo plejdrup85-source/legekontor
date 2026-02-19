@@ -5,6 +5,8 @@ WORKDIR /app
 # Install minimal system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    tesseract-ocr \
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Upgrade pip

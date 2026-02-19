@@ -1197,7 +1197,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "input_filename": file.filename or "input.xlsx",
     })
 
-    def progress(p: float, _ok: bool = Depends(verify_basic_auth)):
+    def progress(p: float):
         t = TASKS.get(task_id)
         if not t:
             return
