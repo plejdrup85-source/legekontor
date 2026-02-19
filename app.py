@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable, Tuple, List
 
 import pandas as pd
+from pypdf import PdfReader
 from fastapi import FastAPI, UploadFile, File, Form, Depends, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -104,11 +105,7 @@ def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-# Middleware so we don't have to add Depends() on every route.
-@app.middleware("http")
-async def basic_auth_middleware(request: Request, call_next):
-    if not _auth_enabled():
-        return await call_next(request)
+# (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
     # Allow health checks without auth (optional)
     path = request.url.path or ""
     if path in ("/health",):
@@ -345,6 +342,84 @@ def embeddings_meta() -> Dict[str, Any]:
 
 
 # ============================================================
+# PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
+# ============================================================
+def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    reader = PdfReader(BytesIO(pdf_bytes))
+    parts = []
+    for p in reader.pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        if t:
+            parts.append(t)
+    return "\n".join(parts)
+
+def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
+    """Returner rows i samme format som input-template.
+    Heuristikk: plukker ut varelinjer med beløp/pris. Epion/NorEngros-lignende tabeller støttes best-effort.
+    """
+    lines = [re.sub(r"\s+", " ", (l or "")).strip() for l in (text or "").splitlines()]
+    lines = [l for l in lines if l]
+
+    # Finn start på varelinjer
+    start_idx = 0
+    header_patterns = [
+        "beskrivelse antall", "antall pris", "varelinjer", "beskrivelse", "enhetspris", "beløp"
+    ]
+    for i, l in enumerate(lines[:200]):
+        ll = l.lower()
+        if any(h in ll for h in header_patterns):
+            start_idx = i + 1
+            break
+
+    rows = []
+    buf_desc = ""
+
+    def parse_numbers_from_line(l: str):
+        # finner tall med komma/punktum
+        nums = re.findall(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", l)
+        # rens
+        clean = []
+        for n in nums:
+            n2 = n.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
+            try:
+                clean.append(float(n2))
+            except Exception:
+                pass
+        return clean
+
+    for l in lines[start_idx:]:
+        ll = l.lower()
+        if any(x in ll for x in ["sum", "total", "mva", "å betale", "beløp å betale"]):
+            continue
+
+        nums = parse_numbers_from_line(l)
+        # typisk: ... antall enhpris beløp ...
+        if len(nums) >= 2:
+            # ta de to siste som (enhpris, beløp) eller (antall, pris). Vi bruker første plausible som enhetspris.
+            # Vi prioriterer "enhetspris" = nest siste, ellers siste.
+            unit_price = nums[-2] if len(nums) >= 2 else nums[-1]
+            desc = buf_desc.strip() or re.sub(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", "", l).strip()
+            if len(desc) >= 3:
+                rows.append({
+                    "Konkurrent Navn": "",
+                    "Konkurrent Art.Nr": "",
+                    "Konkurrent Item Description": desc,
+                    "Konkurrent Specification": "",
+                    "Konkurrent Pris": unit_price,
+                })
+                buf_desc = ""
+                continue
+
+        # ellers: bygg opp beskrivelse over flere linjer
+        if len(l) >= 3 and not re.match(r"^\d+$", l):
+            buf_desc = (buf_desc + " " + l).strip()
+
+    return rows
+
+# ============================================================
 # INPUT TEMPLATE
 # ============================================================
 def generate_input_template_bytes() -> bytes:
@@ -559,7 +634,7 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    df_in = pd.read_excel(BytesIO(content))
+    df_in = pd.read_excel(BytesIO(content), engine='openpyxl')
     total = len(df_in)
 
     # ensure input cols exist
@@ -731,7 +806,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx"/>
+        <input id="input" type="file" accept=".xlsx,.pdf"/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -821,7 +896,7 @@ async function uploadCatalog() {
 
 async function startMatch() {
   const file = document.getElementById("input").files[0];
-  if (!file) return alert("Velg en inputfil (.xlsx)");
+  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
@@ -976,10 +1051,25 @@ def catalog_status():
     return meta
 
 
-@app.post("/upload_catalog")
-async def upload_catalog(file: UploadFile = File(...)):
+@app.post(\"/upload_catalog\")
+async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
+    filename = (file.filename or "input").lower()
+    # PDF faktura -> konverter til input-format i minne
+    if filename.endswith('.pdf'):
+        try:
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse({"error": "Fant ingen varelinjer i PDF. (Hvis dette er en skannet faktura uten tekstlag, må den OCR'es.)"}, status_code=400)
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+                df.to_excel(writer, index=False, sheet_name='Input')
+            content = buf.getvalue()
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
 
     try:
         CATALOG_PATH.write_bytes(content)
