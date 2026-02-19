@@ -895,7 +895,7 @@ def _fill_catalog_fields(out_row: Dict[str, Any], best: Optional[_CatalogItem]) 
     out_row["Katalog: ALC"] = _norm(cat.get("Katalog: ALC", cat.get("ALC", cat.get("alc", cat.get("Alc", "")))))
 
 
-def _load_catalog_excel(path: str) -> List[_CatalogItem]:
+def _load_catalog_excel(path: str, sheet_name: str | int | None = None) -> List[_CatalogItem]:
     cat = pd.read_excel(path, sheet_name=sheet_name)
 
     rename_map: Dict[str, str] = {}
@@ -907,6 +907,12 @@ def _load_catalog_excel(path: str) -> List[_CatalogItem]:
         rename_map["Art.nr"] = "Katalog: Artikkelnummer"
     if "Article Number" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
         rename_map["Article Number"] = "Katalog: Artikkelnummer"
+    if "Item NO" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
+        rename_map["Item NO"] = "Katalog: Artikkelnummer"
+    if "Item No" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
+        rename_map["Item No"] = "Katalog: Artikkelnummer"
+    if "Item no" in cat.columns and "Katalog: Artikkelnummer" not in cat.columns:
+        rename_map["Item no"] = "Katalog: Artikkelnummer"
 
     # Standardfelter
     if "Item Description" in cat.columns and "Katalog: Item Description" not in cat.columns:

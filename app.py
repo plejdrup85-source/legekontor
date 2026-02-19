@@ -75,6 +75,35 @@ def verify_basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
+
+# ============================================================
+# ADMIN AUTH (KUN KATALOG-OPPLASTING)
+# Sett ADMIN_AUTH_USER / ADMIN_AUTH_PASS i Render for å kreve eget passord på /upload_catalog.
+# Hvis ikke satt, faller vi tilbake til BASIC_AUTH (hvis aktivert), ellers åpen.
+# ============================================================
+ADMIN_AUTH_USER = os.getenv("ADMIN_AUTH_USER", "").strip()
+ADMIN_AUTH_PASS = os.getenv("ADMIN_AUTH_PASS", "").strip()
+admin_security = HTTPBasic(auto_error=False)
+
+def _admin_auth_enabled() -> bool:
+    return bool(ADMIN_AUTH_USER and ADMIN_AUTH_PASS)
+
+def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security)):
+    if not _admin_auth_enabled():
+        # No dedicated admin creds -> require basic auth if enabled, else allow.
+        if _auth_enabled():
+            return verify_basic_auth(credentials)  # type: ignore
+        return True
+    if credentials is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    ok_user = secrets.compare_digest(credentials.username or "", ADMIN_AUTH_USER)
+    ok_pass = secrets.compare_digest(credentials.password or "", ADMIN_AUTH_PASS)
+    if not (ok_user and ok_pass):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    return True
+
 # Middleware so we don't have to add Depends() on every route.
 @app.middleware("http")
 async def basic_auth_middleware(request: Request, call_next):
@@ -933,9 +962,9 @@ def template():
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(INDEX_HTML)
-@app.get("/admin")
-def admin_redirect():
-    return RedirectResponse(url="/", status_code=302)
+@app.get("/admin", response_class=HTMLResponse)
+def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
+    return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/catalog_status")
