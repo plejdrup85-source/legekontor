@@ -10,6 +10,17 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable, Tuple, List
 
 import pandas as pd
+# PDF-støtte (fakturaer)
+try:
+    from pypdf import PdfReader  # type: ignore
+except Exception:
+    PdfReader = None  # type: ignore
+
+# Valgfritt: bruk Claude til å hente ut linjer fra PDF-tekst når heuristikk ikke treffer
+try:
+    from anthropic import Anthropic  # type: ignore
+except Exception:
+    Anthropic = None  # type: ignore
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
 
@@ -153,6 +164,134 @@ WATCHDOG_STUCK_SECONDS = int(os.getenv("WATCHDOG_STUCK_SECONDS", "600"))  # 10 m
 WATCHDOG_POLL_SECONDS = int(os.getenv("WATCHDOG_POLL_SECONDS", "30"))
 
 
+def _pdf_text_from_bytes(content: bytes) -> str:
+    """Best-effort tekstuttrekk fra PDF (fungerer best på tekstbaserte PDF-er)."""
+    if PdfReader is None:
+        raise ValueError("PDF-støtte er ikke installert (mangler pypdf).")
+    reader = PdfReader(BytesIO(content))
+    parts: List[str] = []
+    for p in reader.pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        if t:
+            parts.append(t)
+    text = "\n".join(parts).strip()
+    if not text:
+        # Mest sannsynlig skannet PDF (bilde). OCR er ikke støttet i denne deployen.
+        raise ValueError("PDF-en ser ut til å være skannet/basert på bilde (fant ingen tekst).")
+    return text
+
+
+def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
+    """Heuristisk parsing av fakturalinjer fra PDF-tekst.
+    Returnerer rader i samme format som excel-inputen forventer.
+    """
+    rows: List[Dict[str, Any]] = []
+    # Normaliser
+    raw_lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    raw_lines = [ln for ln in raw_lines if ln and len(ln) >= 3]
+
+    # Typiske mønstre: qty + beskrivelse + pris
+    # Eksempel: "2 STK Handsker nitril M  49,00" eller "1 x Sprøyte 10ml  12.50"
+    rx = re.compile(r"^(?P<qty>\d+[\.,]?\d*)\s*(?:x|stk|st|pcs|pc)?\s+(?P<desc>.+?)\s+(?P<price>\d+[\.,]\d{2})\s*$", re.IGNORECASE)
+
+    for ln in raw_lines:
+        m = rx.match(ln)
+        if not m:
+            continue
+        qty = _to_float(m.group("qty")) or 0.0
+        price = _to_float(m.group("price")) or 0.0
+        desc = (m.group("desc") or "").strip()
+        if not desc:
+            continue
+
+        rows.append({
+            "Konkurrent Navn": "",
+            "Konkurrent Art.Nr": "",
+            "Konkurrent Item Description": desc,
+            "Konkurrent Specification": "",
+            "Konkurrent Pris": price,
+            "Konkurrent salgsenhet": "",
+            "Antall": qty,
+        })
+
+    return rows
+
+
+def _claude_extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
+    """Bruker Claude til å hente ut fakturalinjer fra råtekst (robust på varierende layout)."""
+    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
+    if not api_key or Anthropic is None:
+        return []
+
+    client = Anthropic(api_key=api_key)
+    model = (os.getenv("CLAUDE_MODEL") or "claude-sonnet-4-20250514").strip()
+
+    # Begrens input for å unngå enorme PDF-er / kost
+    text_cut = text[:20000]
+
+    prompt = (
+        "Du får tekst fra en PDF-faktura. Ekstraher fakturalinjene som en JSON-array. "
+        "Hver linje skal være et objekt med feltene: "
+        "Konkurrent Item Description, Antall, Konkurrent Pris, Konkurrent Art.Nr (valgfri), Konkurrent salgsenhet (valgfri). "
+        "Hvis Antall eller Pris ikke finnes, sett dem til null. "
+        "Returner KUN gyldig JSON (ingen forklaring, ingen markdown).\n\n"
+        "PDF-tekst:\n"
+        + text_cut
+    )
+
+    msg = client.messages.create(
+        model=model,
+        max_tokens=1400,
+        temperature=0,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # anthropic python lib returns content blocks; pick text
+    out_text = ""
+    try:
+        for blk in msg.content:
+            if getattr(blk, "type", None) == "text":
+                out_text += blk.text
+            elif isinstance(blk, dict) and blk.get("type") == "text":
+                out_text += blk.get("text", "")
+    except Exception:
+        out_text = str(getattr(msg, "content", "") or "")
+
+    out_text = out_text.strip()
+
+    try:
+        data = json.loads(out_text)
+    except Exception:
+        # prøv å finne JSON i teksten
+        m = re.search(r"(\[.*\])", out_text, re.DOTALL)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(1))
+        except Exception:
+            return []
+
+    rows: List[Dict[str, Any]] = []
+    if isinstance(data, list):
+        for it in data:
+            if not isinstance(it, dict):
+                continue
+            desc = str(it.get("Konkurrent Item Description") or "").strip()
+            if not desc:
+                continue
+            rows.append({
+                "Konkurrent Navn": "",
+                "Konkurrent Art.Nr": str(it.get("Konkurrent Art.Nr") or "").strip(),
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": str(it.get("Konkurrent Specification") or "").strip(),
+                "Konkurrent Pris": _to_float(it.get("Konkurrent Pris")) or 0.0,
+                "Konkurrent salgsenhet": str(it.get("Konkurrent salgsenhet") or "").strip(),
+                "Antall": _to_float(it.get("Antall")) or 0.0,
+            })
+    return rows
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -488,7 +627,17 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    df_in = pd.read_excel(BytesIO(content))
+    ext = (Path(input_filename).suffix or "").lower()
+    if ext == ".pdf":
+        text = _pdf_text_from_bytes(content)
+        rows = _parse_invoice_text_heuristic(text)
+        if not rows:
+            rows = _claude_extract_invoice_rows(text)
+        if not rows:
+            raise ValueError("Kunne ikke finne noen fakturalinjer i PDF-en (prøv excel-template eller en tekstbasert PDF).")
+        df_in = pd.DataFrame(rows)
+    else:
+        df_in = pd.read_excel(BytesIO(content))
     total = len(df_in)
 
     # ensure input cols exist
@@ -685,7 +834,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx"/>
+        <input id="input" type="file" accept=".xlsx,.pdf"/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -775,7 +924,7 @@ async function uploadCatalog() {
 
 async function startMatch() {
   const file = document.getElementById("input").files[0];
-  if (!file) return alert("Velg en inputfil (.xlsx)");
+  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
