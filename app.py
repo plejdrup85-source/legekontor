@@ -35,12 +35,24 @@ APP_SUBTITLE = os.getenv("APP_SUBTITLE", "").strip()
 # PATHS / PERSISTENT STORAGE
 # ============================================================
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except PermissionError:
+    # Fallback for environments where /var/data is not writable (e.g., local tests).
+    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "logo.png").resolve())))
 
 RESULTS_DIR = DATA_DIR / "results"
-RESULTS_DIR.mkdir(exist_ok=True)
+try:
+    RESULTS_DIR.mkdir(exist_ok=True)
+except PermissionError:
+    # If something is off, fall back into /tmp as well.
+    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR = DATA_DIR / "results"
+    RESULTS_DIR.mkdir(exist_ok=True)
 
 CATALOG_PATH = DATA_DIR / "catalog.xlsx"
 JOBS_INDEX = DATA_DIR / "jobs.jsonl"
@@ -342,8 +354,7 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
         if t:
             parts.append(t)
 
-    text = "
-".join(parts).strip()
+    text = "\n".join(parts).strip()
 
     # OCR fallback hvis vi ikke får noe meningsfullt tekstlag
     if len(text) >= 40:
@@ -1288,7 +1299,7 @@ def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/progress/{task_id}")
-def progress(task_id: str):
+def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
