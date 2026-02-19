@@ -609,7 +609,11 @@ def load_catalog_from_disk() -> None:
     art_col_full = _find_col(df_full, "Artikkelnummer", "Art.nr", "Art nr", "Article Number", "Item NO", "Item No")
 
     if not art_col_lk or not art_col_full:
-        raise ValueError("Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No).")
+        err = "Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No)."
+        logger.error(err)
+        CATALOG_BUNDLE = None
+        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": err})
+        return
 
     if not lk_price_col:
         logger.warning("Fant ikke 'Pris Etter Rabatt' i LK-arket. Priser fra LK kan bli tomme.")
@@ -639,8 +643,15 @@ def load_catalog_from_disk() -> None:
         price_lookup[art] = {"price": float(p), "source": "lk"}
 
     # Ikke bygg embeddings ved startup
-    lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
-    full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
+    try:
+        lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
+        full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
+    except Exception as e:
+        # Viktig: appen skal ikke dø på startup hvis katalogen er tom/feilformatert.
+        logger.error(f"Kunne ikke laste katalog ved oppstart: {e}")
+        CATALOG_BUNDLE = None
+        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": str(e)})
+        return
 
     CATALOG_BUNDLE = LegekontorCatalogBundle(lk_catalog=lk_cat, full_catalog=full_cat, price_lookup=price_lookup)
 
@@ -652,9 +663,17 @@ def load_catalog_from_disk() -> None:
 
 @app.on_event("startup")
 def startup_event():
-    load_catalog_from_disk()
+    # Viktig: appen skal aldri dø på oppstart pga. en ødelagt/tom katalogfil.
+    try:
+        load_catalog_from_disk()
+    except Exception as e:
+        global CATALOG_BUNDLE
+        CATALOG_BUNDLE = None
+        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": str(e)})
+        logger.error(f"Startup: kunne ikke laste katalog (fortsetter uten katalog): {e}")
+
     threading.Thread(target=_watchdog_loop, daemon=True).start()
-    logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
+    logger.info("Startup complete. Ready to accept requests.")
 
 
 # ============================================================
@@ -875,7 +894,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx,.pdf"/>
+        <input id="input" type="file" accept=".xlsx,.pdf" multiple/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -963,9 +982,10 @@ async function uploadCatalog() {
   await refreshCatalogInfo();
 }
 
+
 async function startMatch() {
-  const file = document.getElementById("input").files[0];
-  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
+  const files = Array.from(document.getElementById("input").files || []);
+  if (!files.length) return alert("Velg en eller flere inputfiler (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
@@ -973,7 +993,7 @@ async function startMatch() {
   document.getElementById("bar").style.width = "1%";
 
   const fd = new FormData();
-  fd.append("file", file);
+  files.forEach(f => fd.append("files", f));
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
@@ -1144,30 +1164,50 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
+async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
-    content = await file.read()
+    dfs = []
 
-    filename = (file.filename or "input").lower()
-    # Støtte for PDF input (f.eks. varelinjer fra anbud/faktura). Konverteres til Excel-template i minne før matching.
-    if filename.endswith(".pdf"):
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse(
-                    {"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet PDF uten tekstlag, må den OCR'es eller eksporteres som 'searchable PDF'."},
-                    status_code=400,
-                )
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
+    # Les alle filer og bygg én samlet input-tabell
+    for f in (files or []):
+        content = await f.read()
+        filename = (f.filename or "input").lower()
+
+        if filename.endswith(".pdf"):
+            try:
+                text_pdf = _extract_text_from_pdf(content)
+                rows = _parse_invoice_text_heuristic(text_pdf)
+                if not rows:
+                    return JSONResponse(
+                        {"error": f"Fant ingen varelinjer i PDF: {f.filename}. Hvis dette er en skannet PDF uten tekstlag, må den OCR'es eller eksporteres som 'searchable PDF'."},
+                        status_code=400,
+                    )
+                df = pd.DataFrame(rows)
+            except Exception as e:
+                return JSONResponse({"error": f"Kunne ikke lese PDF {f.filename}: {e}"}, status_code=400)
+        else:
+            # Excel input
+            try:
+                df = pd.read_excel(BytesIO(content))
+            except Exception as e:
+                return JSONResponse({"error": f"Kunne ikke lese Excel {f.filename}: {e}"}, status_code=400)
+
+        # Spor kildefil i output for sporbarhet
+        if "SourceFile" not in df.columns:
+            df.insert(0, "SourceFile", f.filename or "input")
+        dfs.append(df)
+
+    if not dfs:
+        return JSONResponse({"error": "Ingen filer mottatt"}, status_code=400)
+
+    merged_df = pd.concat(dfs, ignore_index=True)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        merged_df.to_excel(writer, index=False, sheet_name="Input")
+    content = buf.getvalue()
+
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1184,7 +1224,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1194,7 +1234,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
     })
 
     def progress(p: float):
@@ -1211,7 +1251,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(file.filename or "input.xlsx"),
+                input_filename=(", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx"),
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,
