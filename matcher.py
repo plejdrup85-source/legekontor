@@ -895,7 +895,7 @@ def _fill_catalog_fields(out_row: Dict[str, Any], best: Optional[_CatalogItem]) 
     out_row["Katalog: ALC"] = _norm(cat.get("Katalog: ALC", cat.get("ALC", cat.get("alc", cat.get("Alc", "")))))
 
 
-def _load_catalog_excel(path: str, sheet_name: Optional[Any] = None) -> List[_CatalogItem]:
+def _load_catalog_excel(path: str) -> List[_CatalogItem]:
     cat = pd.read_excel(path, sheet_name=sheet_name)
 
     rename_map: Dict[str, str] = {}
@@ -1159,7 +1159,7 @@ class Catalog:
                 self.embed_index = None
 
     @classmethod
-    def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: Optional[Any] = None) -> "Catalog":
+    def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: str | int | None = None) -> "Catalog":
         items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
         return cls(items, use_embeddings=use_embeddings)
 

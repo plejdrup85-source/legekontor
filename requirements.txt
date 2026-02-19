@@ -14,4 +14,5 @@ rank-bm25==0.2.2
 sentence-transformers>=2.7.0
 numpy>=1.26.0
 
+# PDF parsing
 pypdf>=4.0.0

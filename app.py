@@ -10,17 +10,6 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable, Tuple, List
 
 import pandas as pd
-# PDF-støtte (fakturaer)
-try:
-    from pypdf import PdfReader  # type: ignore
-except Exception:
-    PdfReader = None  # type: ignore
-
-# Valgfritt: bruk Claude til å hente ut linjer fra PDF-tekst når heuristikk ikke treffer
-try:
-    from anthropic import Anthropic  # type: ignore
-except Exception:
-    Anthropic = None  # type: ignore
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
 
@@ -164,229 +153,6 @@ WATCHDOG_STUCK_SECONDS = int(os.getenv("WATCHDOG_STUCK_SECONDS", "600"))  # 10 m
 WATCHDOG_POLL_SECONDS = int(os.getenv("WATCHDOG_POLL_SECONDS", "30"))
 
 
-def _pdf_text_from_bytes(content: bytes) -> str:
-    """Best-effort tekstuttrekk fra PDF (fungerer best på tekstbaserte PDF-er)."""
-    if PdfReader is None:
-        raise ValueError("PDF-støtte er ikke installert (mangler pypdf).")
-    reader = PdfReader(BytesIO(content))
-    parts: List[str] = []
-    for p in reader.pages:
-        try:
-            t = p.extract_text() or ""
-        except Exception:
-            t = ""
-        if t:
-            parts.append(t)
-    text = "\n".join(parts).strip()
-    if not text:
-        # Mest sannsynlig skannet PDF (bilde). OCR er ikke støttet i denne deployen.
-        raise ValueError("PDF-en ser ut til å være skannet/basert på bilde (fant ingen tekst).")
-    return text
-
-
-def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
-    """
-    Heuristisk parsing av fakturalinjer fra PDF-tekst.
-
-    Tunet for typiske norske fakturaer der varelinjene er en tabell med kolonner:
-      Beskrivelse | Antall | Enh.pris | Beløp (ekskl. mva) | Mva | Beløp (inkl. mva)
-
-    I PDF-tekst kan beskrivelsen gå over flere linjer, og tallkolonnene kan komme på egen linje.
-    Vi akkumulerer beskrivelse i en buffer til vi treffer tallmønsteret.
-    """
-    rows: List[Dict[str, Any]] = []
-
-    # Normaliser linjer (behold linjedeling, men stram inn whitespace)
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln and len(ln) >= 2]
-
-    # Finn leverandør (best-effort)
-    supplier = ""
-    for ln in lines[:25]:
-        if re.search(r"\bFAKTURA\b", ln, flags=re.IGNORECASE):
-            break
-        m_sup = re.match(r"^([A-Za-zÆØÅæøå0-9 .&\-\/]+\bAS)\b$", ln.strip())
-        if m_sup:
-            supplier = m_sup.group(1).strip()
-            break
-
-    # Finn start på varelinjer (etter header-raden)
-    start_idx = 0
-    for i, ln in enumerate(lines):
-        if re.search(r"\bBeskrivelse\b", ln, flags=re.IGNORECASE) and re.search(r"\bAntall\b", ln, flags=re.IGNORECASE):
-            start_idx = i + 1
-            break
-
-    stop_rx = re.compile(r"^(Sum\b|Betales\b|Frakt\b|Total\b)", re.IGNORECASE)
-
-    # Tallkolonne-mønster (med og uten prefix)
-    tail_with_prefix = re.compile(
-        r"^(?P<prefix>.+?)\s+"
-        r"(?P<qty>\d+(?:[\.,]\d+)?)\s+"
-        r"(?P<unit>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<amount>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<vat>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<incl>\d[\d\s]*[\.,]\d{2})$"
-    )
-    tail_numbers_only = re.compile(
-        r"^(?P<qty>\d+(?:[\.,]\d+)?)\s+"
-        r"(?P<unit>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<amount>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<vat>\d[\d\s]*[\.,]\d{2})\s+"
-        r"(?P<incl>\d[\d\s]*[\.,]\d{2})$"
-    )
-
-    header_noise_rx = re.compile(r"(Enh\.pris|Beløp|Mva\b|inkl\.\s*mva|ekskl\.\s*mva)", re.IGNORECASE)
-
-    buf = ""
-    for ln in lines[start_idx:]:
-        if stop_rx.match(ln):
-            break
-
-        # hopp over/rydd bort tydelig header-støy som ofte ligger rett under tabellheaderen
-        if header_noise_rx.search(ln):
-            buf = ""
-            continue
-
-        m1 = tail_with_prefix.match(ln)
-        if m1:
-            prefix = (m1.group("prefix") or "").strip()
-            qty_str = (m1.group("qty") or "").strip()
-            unit_str = (m1.group("unit") or "").strip()
-
-            qty = _to_float(qty_str) or 0.0
-            unit_price = _to_float(unit_str) or 0.0
-
-            # Heuristikk: noen linjer inneholder "Nr 11 4 319,00 ..." der "11" er del av beskrivelse
-            # og "4 319,00" egentlig betyr qty=4 og enh.pris=319,00.
-            if prefix.lower().endswith(" nr") and qty >= 10 and " " in unit_str:
-                parts = [p for p in unit_str.split(" ") if p]
-                if len(parts) >= 2:
-                    maybe_qty = _to_float(parts[0])
-                    maybe_unit = _to_float(" ".join(parts[1:]))
-                    if maybe_qty is not None and maybe_unit is not None and 0 < maybe_qty <= 50 and maybe_unit < unit_price:
-                        # legg "Nr <qty_str>" inn i beskrivelsen
-                        prefix = (prefix + " " + qty_str).strip()
-                        qty = float(maybe_qty)
-                        unit_price = float(maybe_unit)
-
-            desc = " ".join(x for x in [buf.strip(), prefix] if x).strip()
-            buf = ""
-
-            if not desc:
-                continue
-
-            rows.append({
-                "Konkurrent Navn": supplier,
-                "Konkurrent Art.Nr": "",
-                "Konkurrent Item Description": desc,
-                "Konkurrent Specification": "",
-                "Konkurrent Pris": unit_price,
-                "Konkurrent salgsenhet": "",
-                "Antall": qty,
-            })
-            continue
-
-        m2 = tail_numbers_only.match(ln)
-        if m2 and buf.strip():
-            qty = _to_float(m2.group("qty")) or 0.0
-            unit_price = _to_float(m2.group("unit")) or 0.0
-            desc = buf.strip()
-            buf = ""
-
-            rows.append({
-                "Konkurrent Navn": supplier,
-                "Konkurrent Art.Nr": "",
-                "Konkurrent Item Description": desc,
-                "Konkurrent Specification": "",
-                "Konkurrent Pris": unit_price,
-                "Konkurrent salgsenhet": "",
-                "Antall": qty,
-            })
-            continue
-
-        # Akkumuler beskrivelse (inkl. linjebryting i PDF)
-        # Unngå å dra med rene betalings-/meta-linjer
-        if re.search(r"\bFakturanr\b|\bKID\b|\bKontonummer\b|\bForfallsdato\b", ln, flags=re.IGNORECASE):
-            continue
-
-        buf = (buf + " " + ln).strip()
-
-    return rows
-
-
-def _claude_extract_invoice_rows(text: str) -> List[Dict[str, Any]]:
-    """Bruker Claude til å hente ut fakturalinjer fra råtekst (robust på varierende layout)."""
-    api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
-    if not api_key or Anthropic is None:
-        return []
-
-    client = Anthropic(api_key=api_key)
-    model = (os.getenv("CLAUDE_MODEL") or "claude-sonnet-4-20250514").strip()
-
-    # Begrens input for å unngå enorme PDF-er / kost
-    text_cut = text[:20000]
-
-    prompt = (
-        "Du får tekst fra en PDF-faktura. Ekstraher fakturalinjene som en JSON-array. "
-        "Hver linje skal være et objekt med feltene: "
-        "Konkurrent Item Description, Antall, Konkurrent Pris, Konkurrent Art.Nr (valgfri), Konkurrent salgsenhet (valgfri). "
-        "Hvis Antall eller Pris ikke finnes, sett dem til null. "
-        "Returner KUN gyldig JSON (ingen forklaring, ingen markdown).\n\n"
-        "PDF-tekst:\n"
-        + text_cut
-    )
-
-    msg = client.messages.create(
-        model=model,
-        max_tokens=1400,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    # anthropic python lib returns content blocks; pick text
-    out_text = ""
-    try:
-        for blk in msg.content:
-            if getattr(blk, "type", None) == "text":
-                out_text += blk.text
-            elif isinstance(blk, dict) and blk.get("type") == "text":
-                out_text += blk.get("text", "")
-    except Exception:
-        out_text = str(getattr(msg, "content", "") or "")
-
-    out_text = out_text.strip()
-
-    try:
-        data = json.loads(out_text)
-    except Exception:
-        # prøv å finne JSON i teksten
-        m = re.search(r"(\[.*\])", out_text, re.DOTALL)
-        if not m:
-            return []
-        try:
-            data = json.loads(m.group(1))
-        except Exception:
-            return []
-
-    rows: List[Dict[str, Any]] = []
-    if isinstance(data, list):
-        for it in data:
-            if not isinstance(it, dict):
-                continue
-            desc = str(it.get("Konkurrent Item Description") or "").strip()
-            if not desc:
-                continue
-            rows.append({
-                "Konkurrent Navn": "",
-                "Konkurrent Art.Nr": str(it.get("Konkurrent Art.Nr") or "").strip(),
-                "Konkurrent Item Description": desc,
-                "Konkurrent Specification": str(it.get("Konkurrent Specification") or "").strip(),
-                "Konkurrent Pris": _to_float(it.get("Konkurrent Pris")) or 0.0,
-                "Konkurrent salgsenhet": str(it.get("Konkurrent salgsenhet") or "").strip(),
-                "Antall": _to_float(it.get("Antall")) or 0.0,
-            })
-    return rows
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -508,8 +274,6 @@ def generate_input_template_bytes() -> bytes:
         "Konkurrent Item Description",
         "Konkurrent Specification",
         "Konkurrent Pris",
-        "Konkurrent salgsenhet",
-        "Antall",
     ]
     example_rows = [
         {
@@ -518,8 +282,6 @@ def generate_input_template_bytes() -> bytes:
             "Konkurrent Item Description": "Inkontinensinnlegg for menn / herrebind",
             "Konkurrent Specification": "Oppsugning: 195 ml, lengde 29 cm",
             "Konkurrent Pris": 12.5,
-            "Konkurrent salgsenhet": "stk",
-            "Antall": 10,
         }
     ]
     df = pd.DataFrame(example_rows, columns=cols)
@@ -703,16 +465,11 @@ OUTPUT_COLUMNS_LK = [
     "Konkurrent Item Description",
     "Konkurrent Specification",
     "Konkurrent Pris",
-    "Konkurrent salgsenhet",
     "Item NO",
     "Item Description",
     "Speciciation",
-    "Antall",
     "Pris per enhet",
-    "Total pris",
-    "Pris Konkurrent vs oss",
 ]
-
 
 def match_excel(
     bundle: LegekontorCatalogBundle,
@@ -722,17 +479,7 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    ext = (Path(input_filename).suffix or "").lower()
-    if ext == ".pdf":
-        text = _pdf_text_from_bytes(content)
-        rows = _parse_invoice_text_heuristic(text)
-        if not rows:
-            rows = _claude_extract_invoice_rows(text)
-        if not rows:
-            raise ValueError("Kunne ikke finne noen fakturalinjer i PDF-en (prøv excel-template eller en tekstbasert PDF).")
-        df_in = pd.DataFrame(rows)
-    else:
-        df_in = pd.read_excel(BytesIO(content))
+    df_in = pd.read_excel(BytesIO(content))
     total = len(df_in)
 
     # ensure input cols exist
@@ -792,8 +539,8 @@ def match_excel(
         item_desc = ""
         item_spec = ""
         if isinstance(best_row, dict):
-            item_desc = str(best_row.get("Item Description") or best_row.get("Beskrivelse") or best_row.get("Description") or "")
-            item_spec = str(best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
+            item_desc = str(best_row.get("Katalog: Item Description") or best_row.get("Item Description") or best_row.get("Description") or "")
+            item_spec = str(best_row.get("Katalog: Specification") or best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
 
         out = {
             "Konkurrent Navn": comp_name,
@@ -801,14 +548,10 @@ def match_excel(
             "Konkurrent Item Description": comp_desc,
             "Konkurrent Specification": comp_spec,
             "Konkurrent Pris": comp_unit,
-            "Konkurrent salgsenhet": comp_unit_name,
             "Item NO": str(artnr or ""),
             "Item Description": item_desc,
             "Speciciation": item_spec,
-            "Antall": qty,
             "Pris per enhet": our_unit if our_unit is not None else "",
-            "Total pris": our_total,
-            "Pris Konkurrent vs oss": diff_total,
         }
         rows_out.append(out)
 
@@ -832,27 +575,6 @@ def match_excel(
 
         if progress_cb and total > 0:
             progress_cb((idx + 1) / total)
-
-    # Summary rows
-    rows_out.append({c: "" for c in OUTPUT_COLUMNS_LK})
-    rows_out.append({
-        "Konkurrent Item Description": "Total pris for konkurrent",
-        "Konkurrent Pris": sum_comp_total,
-        "Total pris": "",
-        "Pris Konkurrent vs oss": "",
-    })
-    rows_out.append({
-        "Konkurrent Item Description": "Total pris for oss",
-        "Konkurrent Pris": "",
-        "Total pris": sum_our_total,
-        "Pris Konkurrent vs oss": "",
-    })
-    rows_out.append({
-        "Konkurrent Item Description": "Differanse (konkurrent - oss)",
-        "Konkurrent Pris": "",
-        "Total pris": "",
-        "Pris Konkurrent vs oss": (sum_comp_total - sum_our_total),
-    })
 
     df_out = pd.DataFrame(rows_out)
     for c in OUTPUT_COLUMNS_LK:
@@ -929,7 +651,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx,.pdf"/>
+        <input id="input" type="file" accept=".xlsx"/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -1019,7 +741,7 @@ async function uploadCatalog() {
 
 async function startMatch() {
   const file = document.getElementById("input").files[0];
-  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
+  if (!file) return alert("Velg en inputfil (.xlsx)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
