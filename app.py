@@ -636,36 +636,36 @@ def match_excel(
 # ============================================================
 # UI
 # ============================================================
-INDEX_HTML = f"""
+INDEX_HTML = """
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
-  <title>{APP_TITLE}</title>
+  <title>__APP_TITLE__</title>
   <style>
-    body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 32px; color:#1a1a1a; }}
-    .card {{ border:1px solid #e6e6e6; padding:16px; border-radius:12px; max-width: 1100px; }}
-    input[type=file] {{ margin: 8px 0; }}
-    button {{ background:#1F4E79; color:white; border:0; padding:10px 14px; border-radius:8px; cursor:pointer; }}
-    button.secondary {{ background:#6b7280; }}
-    button:disabled {{ opacity: 0.5; cursor:not-allowed; }}
-    .row {{ display:flex; gap:24px; flex-wrap: wrap; }}
-    .col {{ flex: 1; min-width: 320px; }}
-    .muted {{ color:#666; }}
-    .bar-wrap {{ width:100%; background:#f2f2f2; border-radius: 999px; overflow:hidden; height: 14px; }}
-    .bar {{ height: 14px; width: 0%; background: #1F4E79; transition: width .3s; }}
-    table {{ width: 100%; border-collapse: collapse; }}
-    th, td {{ text-align:left; border-bottom:1px solid #eee; padding:10px 8px; vertical-align: top; }}
-    th {{ font-size: 13px; color:#444; }}
-    .right {{ text-align:right; }}
-    a {{ color:#1F4E79; text-decoration:none; }}
-    a:hover {{ text-decoration:underline; }}
-    pre {{ background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; overflow:auto; }}
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 32px; color:#1a1a1a; }
+    .card { border:1px solid #e6e6e6; padding:16px; border-radius:12px; max-width: 1100px; }
+    input[type=file] { margin: 8px 0; }
+    button { background:#1F4E79; color:white; border:0; padding:10px 14px; border-radius:8px; cursor:pointer; }
+    button.secondary { background:#6b7280; }
+    button:disabled { opacity: 0.5; cursor:not-allowed; }
+    .row { display:flex; gap:24px; flex-wrap: wrap; }
+    .col { flex: 1; min-width: 320px; }
+    .muted { color:#666; }
+    .bar-wrap { width:100%; background:#f2f2f2; border-radius: 999px; overflow:hidden; height: 14px; }
+    .bar { height: 14px; width: 0%; background: #1F4E79; transition: width .3s; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align:left; border-bottom:1px solid #eee; padding:10px 8px; vertical-align: top; }
+    th { font-size: 13px; color:#444; }
+    .right { text-align:right; }
+    a { color:#1F4E79; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+    pre { background:#fafafa; border:1px solid #eee; padding:12px; border-radius:8px; overflow:auto; }
   </style>
 </head>
 <body>
   <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" style="max-height:110px; width:auto;" onerror="this.style.display='none';"/></div>
-  <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">{APP_SUBTITLE}</div>
+  <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">__APP_SUBTITLE__</div>
   <div class="card">
     <div class="row">
       <div class="col">
@@ -710,15 +710,15 @@ INDEX_HTML = f"""
 <script>
 let taskId = null;
 
-function esc(s) {{
+function esc(s) {
   return String(s || "").replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
-}}
+}
 
-function formatOsloTime(iso) {{
+function formatOsloTime(iso) {
   if (!iso) return "";
-  try {{
+  try {
     const d = new Date(iso);
-    return new Intl.DateTimeFormat("nb-NO", {{
+    return new Intl.DateTimeFormat("nb-NO", {
       timeZone: "Europe/Oslo",
       year: "numeric",
       month: "2-digit",
@@ -726,19 +726,19 @@ function formatOsloTime(iso) {{
       hour: "2-digit",
       minute: "2-digit",
       second: "2-digit",
-    }}).format(d);
-  }} catch {{
+    }).format(d);
+  } catch {
     return iso;
-  }}
-}}
+  }
+}
 
-async function refreshCatalogInfo() {{
+async function refreshCatalogInfo() {
   const resp = await fetch("/catalog_status");
   const data = await resp.json();
   document.getElementById("debug").textContent = JSON.stringify(data, null, 2);
 
   const el = document.getElementById("catalogInfo");
-  if (data.path) {{
+  if (data.path) {
     el.innerHTML = `
       <div><b>Path:</b> ${esc(data.path)}</div>
       <div><b>Finnes på disk:</b> ${data.exists ? "Ja" : "Nei"}</div>
@@ -747,12 +747,12 @@ async function refreshCatalogInfo() {{
       <div><b>Sist oppdatert (Oslo):</b> ${esc(formatOsloTime(data.updated_at))}</div>
       <div><b>Embeddings:</b> ${esc((data.embeddings && data.embeddings.state) || "")}</div>
     `;
-  }}
+  }
 
   document.getElementById("btnMatch").disabled = !data.loaded;
-}}
+}
 
-async function uploadCatalog() {{
+async function uploadCatalog() {
   const file = document.getElementById("catalog").files[0];
   if (!file) return alert("Velg en katalogfil (.xlsx)");
   document.getElementById("catStatus").textContent = "Laster opp katalog...";
@@ -760,20 +760,20 @@ async function uploadCatalog() {{
   const fd = new FormData();
   fd.append("file", file);
 
-  const resp = await fetch("/upload_catalog", {{ method: "POST", body: fd }});
-  const data = await resp.json().catch(() => ({{}}));
+  const resp = await fetch("/upload_catalog", { method: "POST", body: fd });
+  const data = await resp.json().catch(() => ({}));
 
-  if (!resp.ok) {{
+  if (!resp.ok) {
     document.getElementById("catStatus").textContent = "Feil: " + (data.error || "ukjent");
     await refreshCatalogInfo();
     return;
-  }}
+  }
 
   document.getElementById("catStatus").textContent = `Katalog oppdatert. Produkter: ${data.items}`;
   await refreshCatalogInfo();
-}}
+}
 
-async function startMatch() {{
+async function startMatch() {
   const file = document.getElementById("input").files[0];
   if (!file) return alert("Velg en inputfil (.xlsx)");
 
@@ -787,58 +787,58 @@ async function startMatch() {{
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
-  const resp = await fetch("/match", {{ method: "POST", body: fd }});
-  const data = await resp.json().catch(() => ({{}}));
+  const resp = await fetch("/match", { method: "POST", body: fd });
+  const data = await resp.json().catch(() => ({}));
 
-  if (!resp.ok) {{
+  if (!resp.ok) {
     document.getElementById("matchStatus").textContent = "Feil: " + (data.error || "ukjent");
     document.getElementById("btnCancel").disabled = true;
     return;
-  }}
+  }
 
   taskId = data.task_id;
   pollProgress();
-}}
+}
 
-async function pollProgress() {{
+async function pollProgress() {
   const resp = await fetch(`/progress/${taskId}`);
-  const data = await resp.json().catch(() => ({{}}));
+  const data = await resp.json().catch(() => ({}));
 
   const p = Math.round((data.progress || 0) * 100);
   document.getElementById("bar").style.width = `${p}%`;
 
-  if (data.status === "cancel_requested") {{
+  if (data.status === "cancel_requested") {
     document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-  }} else {{
+  } else {
     document.getElementById("matchStatus").textContent = data.status || "running";
-  }}
+  }
 
-  if (data.status === "done") {{
+  if (data.status === "done") {
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("bar").style.width = "100%";
     document.getElementById("download").innerHTML = `<a href="/download/${esc(taskId)}">Last ned resultat</a>`;
     await loadHistory();
     return;
-  }}
+  }
 
-  if (data.status === "cancelled") {{
+  if (data.status === "cancelled") {
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("matchStatus").textContent = "Avbrutt";
     await loadHistory();
     return;
-  }}
+  }
 
-  if (data.status === "error") {{
+  if (data.status === "error") {
     document.getElementById("btnCancel").disabled = true;
     document.getElementById("matchStatus").textContent = "Feil: " + (data.error || "");
     await loadHistory();
     return;
-  }}
+  }
 
   setTimeout(pollProgress, 2500);
-}}
+}
 
-async function loadHistory() {{
+async function loadHistory() {
   const resp = await fetch("/history?limit=200");
   const data = await resp.json();
 
@@ -847,7 +847,7 @@ async function loadHistory() {{
   html += "<th>Tidspunkt (Oslo)</th><th>Filnavn</th><th>Status</th><th class='right'>Rader</th><th>Last ned</th><th>Avbryt</th>";
   html += "</tr></thead><tbody>";
 
-  for (const j of (data.jobs || [])) {{
+  for (const j of (data.jobs || [])) {
     const created = esc(formatOsloTime(j.created_at || ""));
     const fn = esc(j.input_filename || "");
     const st = esc(j.status || "");
@@ -855,37 +855,38 @@ async function loadHistory() {{
     const dl = j.status === "done" ? `<a href="/download/${esc(j.task_id)}">Last ned</a>` : "";
     const cancel = (j.status === "running" || j.status === "cancel_requested") ? `<button class="secondary" onclick="cancelJob('${esc(j.task_id)}')">Avbryt</button>` : "";
     html += `<tr><td>${created}</td><td>${fn}</td><td>${st}</td><td class='right'>${rows}</td><td>${dl}</td><td>${cancel}</td></tr>`;
-  }}
+  }
 
   html += "</tbody></table>";
   document.getElementById("history").innerHTML = html;
-}}
+}
 
-async function cancelJob(tid) {{
+async function cancelJob(tid) {
   if (!tid) return;
-  try {{
-    await fetch(`/cancel/${tid}`, {{ method: "POST" }});
-  }} catch (e) {{}}
-  if (tid === taskId) {{
+  try {
+    await fetch(`/cancel/${tid}`, { method: "POST" });
+  } catch (e) {}
+  if (tid === taskId) {
     document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-  }}
+  }
   setTimeout(loadHistory, 600);
-}}
+}
 
 document.getElementById("btnCatalog").addEventListener("click", uploadCatalog);
 document.getElementById("btnMatch").addEventListener("click", startMatch);
-document.getElementById("btnCancel").addEventListener("click", async () => {{
+document.getElementById("btnCancel").addEventListener("click", async () => {
   if (!taskId) return;
-  await fetch(`/cancel/${taskId}`, {{ method: "POST" }});
+  await fetch(`/cancel/${taskId}`, { method: "POST" });
   document.getElementById("matchStatus").textContent = "Avbryt forespurt…";
-}});
+});
 
 refreshCatalogInfo();
 loadHistory();
 </script>
 </body>
 </html>
-"""
+""".replace("__APP_TITLE__", APP_TITLE).replace("__APP_SUBTITLE__", APP_SUBTITLE or "")
+
 
 
 @app.get("/static/logo.png")
@@ -914,9 +915,7 @@ def template():
 
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return INDEX_HTML
-
-
+    return HTMLResponse(INDEX_HTML)
 @app.get("/admin")
 def admin_redirect():
     return RedirectResponse(url="/", status_code=302)
