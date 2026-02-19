@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Callable, Tuple, List
 
 import pandas as pd
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Depends, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+import secrets
 
 from matcher import Catalog, CancelledError
 
@@ -47,6 +49,55 @@ COMPETITOR_REGISTER_PATH = DATA_DIR / "competitor_price_register.xlsx"
 # APP STATE
 # ============================================================
 app = FastAPI(title=APP_TITLE, version=os.getenv("APP_VERSION", "2.6"))
+
+# ============================================================
+# BASIC AUTH (PASSORDBESKYTTELSE)
+# ============================================================
+BASIC_AUTH_USER = os.getenv("BASIC_AUTH_USER", "").strip()
+BASIC_AUTH_PASS = os.getenv("BASIC_AUTH_PASS", "").strip()
+security = HTTPBasic(auto_error=False)
+
+def _auth_enabled() -> bool:
+    return bool(BASIC_AUTH_USER and BASIC_AUTH_PASS)
+
+def verify_basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
+    """If BASIC_AUTH_USER/PASS are set, require HTTP Basic credentials."""
+    if not _auth_enabled():
+        return True
+    if credentials is None:
+        # No credentials provided
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    ok_user = secrets.compare_digest(credentials.username or "", BASIC_AUTH_USER)
+    ok_pass = secrets.compare_digest(credentials.password or "", BASIC_AUTH_PASS)
+    if not (ok_user and ok_pass):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+    return True
+
+# Middleware so we don't have to add Depends() on every route.
+@app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    if not _auth_enabled():
+        return await call_next(request)
+    # Allow health checks without auth (optional)
+    path = request.url.path or ""
+    if path in ("/health",):
+        return await call_next(request)
+    # Let docs be protected too (default) - no whitelist for /docs, /openapi.json
+    # Validate Authorization header using HTTPBasic
+    try:
+        creds = await security(request)
+        # security(request) returns None if missing and auto_error=False
+        verify_basic_auth(creds)
+    except Exception as e:
+        # If it's an HTTPException it'll be returned by FastAPI automatically if raised,
+        # but in middleware we need to build response.
+        from fastapi import HTTPException
+        if isinstance(e, HTTPException):
+            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Basic"})
+        return JSONResponse({"error": "Unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Basic"})
+    return await call_next(request)
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
