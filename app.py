@@ -106,24 +106,6 @@ def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security
     return True
 
 # (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
-    # Allow health checks without auth (optional)
-    path = request.url.path or ""
-    if path in ("/health",):
-        return await call_next(request)
-    # Let docs be protected too (default) - no whitelist for /docs, /openapi.json
-    # Validate Authorization header using HTTPBasic
-    try:
-        creds = await security(request)
-        # security(request) returns None if missing and auto_error=False
-        verify_basic_auth(creds)
-    except Exception as e:
-        # If it's an HTTPException it'll be returned by FastAPI automatically if raised,
-        # but in middleware we need to build response.
-        from fastapi import HTTPException
-        if isinstance(e, HTTPException):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Basic"})
-        return JSONResponse({"error": "Unauthorized"}, status_code=401, headers={"WWW-Authenticate": "Basic"})
-    return await call_next(request)
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
@@ -1051,25 +1033,28 @@ def catalog_status():
     return meta
 
 
-@app.post(\"/upload_catalog\")
+@app.post("/upload_catalog")
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
     filename = (file.filename or "input").lower()
-    # PDF faktura -> konverter til input-format i minne
     if filename.endswith('.pdf'):
         try:
             text = _extract_text_from_pdf(content)
             rows = _parse_invoice_text_heuristic(text)
             if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. (Hvis dette er en skannet faktura uten tekstlag, må den OCR'es.)"}, status_code=400)
+                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
             df = pd.DataFrame(rows)
             buf = BytesIO()
-            with pd.ExcelWriter(buf, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Input')
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
             content = buf.getvalue()
         except Exception as e:
             return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
+
 
     try:
         CATALOG_PATH.write_bytes(content)
