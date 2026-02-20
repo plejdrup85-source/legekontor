@@ -57,23 +57,37 @@ app = FastAPI(title=APP_TITLE, version=os.getenv("APP_VERSION", "2.6"))
 # ============================================================
 BASIC_AUTH_USER = os.getenv("BASIC_AUTH_USER", "").strip()
 BASIC_AUTH_PASS = os.getenv("BASIC_AUTH_PASS", "").strip()
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "1").strip().lower() in ("1","true","yes","on")
 security = HTTPBasic(auto_error=False)
 
 def _auth_enabled() -> bool:
-    return bool(BASIC_AUTH_USER and BASIC_AUTH_PASS)
+    return bool(REQUIRE_AUTH)
 
 def verify_basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    """If BASIC_AUTH_USER/PASS are set, require HTTP Basic credentials."""
+    """
+    Passordbeskyttelse via HTTP Basic Auth.
+
+    - Standard: aktiv (REQUIRE_AUTH=1).
+    - Krever at BASIC_AUTH_USER og BASIC_AUTH_PASS er satt i environment.
+    """
     if not _auth_enabled():
         return True
+
+    from fastapi import HTTPException
+
+    # Fail closed: Hvis auth er på men creds mangler, stopp med tydelig feil
+    if not (BASIC_AUTH_USER and BASIC_AUTH_PASS):
+        raise HTTPException(
+            status_code=500,
+            detail="Auth er aktiv (REQUIRE_AUTH=1) men BASIC_AUTH_USER/BASIC_AUTH_PASS er ikke satt i environment.",
+        )
+
     if credentials is None:
-        # No credentials provided
-        from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
+
     ok_user = secrets.compare_digest(credentials.username or "", BASIC_AUTH_USER)
     ok_pass = secrets.compare_digest(credentials.password or "", BASIC_AUTH_PASS)
     if not (ok_user and ok_pass):
-        from fastapi import HTTPException
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
@@ -751,6 +765,9 @@ def load_catalog_from_disk() -> None:
 
 @app.on_event("startup")
 def startup_event():
+    # Fail closed: hvis passordbeskyttelse er aktiv men credentials mangler, stopp oppstart
+    if _auth_enabled() and not (BASIC_AUTH_USER and BASIC_AUTH_PASS):
+        raise RuntimeError("REQUIRE_AUTH=1 men BASIC_AUTH_USER/BASIC_AUTH_PASS er ikke satt. Sett disse i Render Environment.")
     load_catalog_from_disk()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
@@ -1229,50 +1246,18 @@ def catalog_status(_ok: bool = Depends(verify_basic_auth)):
 
 @app.post("/upload_catalog")
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
+    """
+    Katalog-opplasting (kun .xlsx).
+    NB: Denne endpointen skal IKKE forsøke å parse PDF – det er kun for /match.
+    """
     global CATALOG_BUNDLE
+
     content = await file.read()
-
-    # Sniff filtype (noen ganger kan fil-extensions være feil)
-    input_is_pdf = _is_pdf_bytes(content) or (file.filename or "").lower().endswith(".pdf")
-    input_is_xlsx = _is_xlsx_bytes(content) or (file.filename or "").lower().endswith(".xlsx")
-
-    # Hvis PDF: parse til input-DataFrame og lag en intern xlsx-bytes
-    if input_is_pdf:
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-            input_filename = re.sub(r"\.pdf$", ".xlsx", (file.filename or "input.pdf"), flags=re.IGNORECASE)
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
-    else:
-        if not input_is_xlsx:
-            return JSONResponse({"error": "Ugyldig filformat. Last opp .xlsx (Excel) eller .pdf (faktura)."}, status_code=400)
-        input_filename = file.filename or "input.xlsx"
-    filename = (file.filename or "input").lower()
-    if filename.endswith('.pdf'):
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     filename = (file.filename or "").lower()
-    if not filename.endswith(".xlsx"):
-        return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
 
+    # Sniff: XLSX er zip (PK). Noen ganger kan filendelsen være feil, så vi sjekker begge.
+    if not (_is_xlsx_bytes(content) or filename.endswith(".xlsx")):
+        return JSONResponse({"error": "Katalog må være en Excel-fil (.xlsx)."}, status_code=400)
 
     try:
         CATALOG_PATH.write_bytes(content)
@@ -1287,13 +1272,52 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
     return {"ok": True, "items": CATALOG_BUNDLE.items_count() if CATALOG_BUNDLE else 0}
 
-
 @app.post("/match")
-async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
+async def match(
+    file: UploadFile = File(...),
+    prefer_own_brands: str = Form("1"),
+    _ok: bool = Depends(verify_basic_auth),
+):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
-    content = await file.read()
+    raw = await file.read()
+    orig_name = (file.filename or "input").strip() or "input"
+    input_filename = orig_name
+
+    # Sniff og normaliser input til XLSX-bytes som match_excel kan lese
+    is_pdf = _is_pdf_bytes(raw) or orig_name.lower().endswith(".pdf")
+    is_xlsx = _is_xlsx_bytes(raw) or orig_name.lower().endswith(".xlsx")
+
+    if is_pdf:
+        try:
+            text = _extract_text_from_pdf(raw)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse(
+                    {"error": "Fant ingen produktlinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es først."},
+                    status_code=400,
+                )
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
+            content = buf.getvalue()
+            # sørg for .xlsx i historikk
+            if input_filename.lower().endswith(".pdf"):
+                input_filename = re.sub(r"(?i)\.pdf$", ".xlsx", input_filename)
+            else:
+                input_filename = input_filename + ".xlsx"
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese/parse PDF: {e}"}, status_code=400)
+
+    elif is_xlsx:
+        content = raw
+        if not input_filename.lower().endswith(".xlsx"):
+            input_filename = input_filename + ".xlsx"
+    else:
+        return JSONResponse({"error": "Ugyldig filformat. Last opp .xlsx (Excel) eller .pdf (faktura)."}, status_code=400)
+
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1394,7 +1418,6 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
 
     threading.Thread(target=_worker, daemon=True).start()
     return {"ok": True, "task_id": task_id}
-
 
 @app.post("/cancel/{task_id}")
 def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
