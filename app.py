@@ -471,99 +471,171 @@ def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 10, dpi: int = 200) -> s
 
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
-    """Returner rows i samme format som input-template.
+    """Parse faktura-PDF tekst til varelinjer i input-template format.
 
-    Viktig: Unngå å ta med adresse-/footer-tekst fra faktura.
-    Denne parseren prøver først en "NorEngros/Ødegaard Engros"-aktig tabellstruktur
-    (art.nr først på linja, så beskrivelse, så antall/enhet, pris, ev. rabatt, beløp).
-    Hvis vi ikke klarer å finne minst én varelinje, faller vi tilbake til en veldig enkel heuristikk.
+    Mål: plukke ut *bare* varelinjer (ikke header, adresser, betingelser, totalsummer).
+    Strategi:
+      1) Finn tabell-område (mellom header og totals).
+      2) Parse varelinjer med flere regex-varianter (støtter ulike formater).
+      3) Håndter multilinjebeskrivelser (linjebrudd midt i beskrivelse).
+
+    Returnerer liste av dict med kolonnene:
+      - Konkurrent Navn
+      - Konkurrent Art.Nr
+      - Konkurrent Item Description
+      - Konkurrent Specification
+      - Konkurrent Pris   (enhetspris)
     """
     raw_lines = [(l or "") for l in (text or "").splitlines()]
     lines = [re.sub(r"\s+", " ", l).strip() for l in raw_lines]
     lines = [l for l in lines if l]
 
-    # ------------------------------------------------------------
-    # 1) Streng faktura-linje parser (NorEngros-lignende)
-    # ------------------------------------------------------------
-    # Mønstre vi ønsker å ignorere (header/footer/blokker)
-    IGNORE_PREFIX = (
-        "faktura", "fakturaadresse", "betaler", "betalings", "fakturadato", "fakturanummer",
-        "forfallsdato", "bank", "bankkontonr", "kid", "totalbeløp", "valuta", "mva",
-        "beløp ekskl", "totalbeløp inkl", "adresse", "telefon", "internett", "org.nr",
-        "iban", "swift", "ordre", "levering", "oppdragsgiver", "varemottaker",
-        "delsum", "side"
+    # ---- helpers -------------------------------------------------
+    def _norm(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").strip()).lower()
+
+    def _parse_money(s: str) -> float:
+        # "1.459,30" -> 1459.30, "1459.30" -> 1459.30
+        s = (s or "").strip()
+        s = s.replace("\u00a0", "").replace(" ", "")
+        # hvis det finnes både . og , så antar vi . er tusenskille
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
+        return float(s)
+
+    def _looks_like_money(s: str) -> bool:
+        s = (s or "").strip()
+        return bool(re.fullmatch(r"\d[\d\s\u00a0\.]*[\.,]\d{2}", s))
+
+    # Linjer vi ønsker å ignorere (støy)
+    IGNORE_CONTAINS = (
+        "org.nr", "organisasjons", "bank", "iban", "swift", "kid", "konto",
+        "faktura", "invoice", "forfall", "betal", "mva", "vat",
+        "adresse", "telefon", "email", "e-post", "postboks", "side",
+        "delsum", "subtotal", "sum", "total", "beløp", "amount due",
+        "levering", "delivery", "ordrenr", "ordre", "customer", "kunde",
     )
 
     def _is_noise(line: str) -> bool:
-        ll = line.lower().strip()
+        ll = _norm(line)
         if not ll:
             return True
-        # typiske "linjer" som bare er fakturanr / sidetall
-        if re.fullmatch(r"\d{7,12}", ll):
+        if any(k in ll for k in IGNORE_CONTAINS):
+            # NB: ikke ta "beløp"/"sum" for tidlig; totals håndteres separat også
             return True
-        if ll.startswith(IGNORE_PREFIX):
-            return True
-        # "GRANÅSEN LEGESENTER AS", adresser etc (mange store bokstaver)
-        if "legenter" in ll or "legesenter" in ll:
+        # rene sidetall / fakturanr
+        if re.fullmatch(r"\d{1,4}", ll):
             return True
         return False
 
-    def _parse_money(s: str) -> float:
-        # "1.459,30" -> 1459.30
-        s = (s or "").strip()
-        s = s.replace("\u00a0", "").replace(" ", "")
-        s = s.replace(".", "").replace(",", ".")
-        return float(s)
+    # Header som ofte finnes over varelinjene
+    header_re = re.compile(
+        r"(art\.?\s*nr|varenr|item\s*no|prod\.?\s*no).*(beskriv|description).*(antall|qty|quantity)",
+        flags=re.IGNORECASE,
+    )
+    # Totals-seksjon starter ofte her
+    totals_re = re.compile(r"^(delsum|subtotal|sum\s+eks|sum\s+inkl|mva|vat|total)\b", flags=re.IGNORECASE)
 
-    # En typisk varelinje:
-    # 408346 QuickVue ... 1,00 PK á 25 STK 1.459,30 PK 35,0 % 948,54 **
-    # 255994 Brevordner ... 2,00 STK 72,51 STK 10,0 % 130,52 **
-    item_re = re.compile(
-        r"^(?P<art>\d{5,9})\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<qty>\d+,\d{2})\s+"
-        r"(?P<unit>[A-ZÆØÅ]{2,5})"
-        r"(?:\s+á\s+\d+\s+[A-ZÆØÅ]{2,5})?\s+"
-        r"(?P<price>\d[\d\.]*,\d{2})\s+"
-        r"(?P<price_unit>[A-ZÆØÅ]{2,5})"
-        r"(?:\s+\d+,\d\s*%\s+\d[\d\.]*,\d{2})?"
-        r".*$"
+    # Vanlige varelinjer (flere formater)
+    # 1) artnr + desc + qty + unit + price + amount (rabatt kan forekomme)
+    item_re_a = re.compile(
+        r"^(?P<art>\d{4,10})\s+"                       # artnr
+        r"(?P<desc>.+?)\s+"                            # beskrivelse
+        r"(?P<qty>\d+(?:[\.,]\d+)?)\s+"             # antall
+        r"(?P<unit>[A-ZÆØÅa-zæøå]{1,8})\s+"             # enhet
+        r"(?P<price>\d[\d\s\u00a0\.]*[\.,]\d{2})" # pris
+        r"(?:\s+(?P<price_unit>[A-ZÆØÅa-zæøå]{1,8}))?"   # pris-enhet (valgfritt)
+        r"(?:\s+\d+[\.,]\d\s*%\s+\d[\d\s\u00a0\.]*[\.,]\d{2})?"  # rabatt (valgfritt)
+        r"(?:\s+(?P<amount>\d[\d\s\u00a0\.]*[\.,]\d{2}))?"             # beløp (valgfritt)
+        r"\s*(?:\*\*|\*)?\s*$",
+    )
+    # 2) artnr + desc + qty (uten unit eksplisitt) + price + amount (noen fakturaer)
+    item_re_b = re.compile(
+        r"^(?P<art>\d{4,10})\s+"                        # artnr
+        r"(?P<desc>.+?)\s+"                             # beskrivelse
+        r"(?P<qty>\d+(?:[\.,]\d+)?)\s+"              # antall
+        r"(?P<price>\d[\d\s\u00a0\.]*[\.,]\d{2})\s+"  # pris
+        r"(?P<amount>\d[\d\s\u00a0\.]*[\.,]\d{2})\s*$",
     )
 
+    # ---- finn relevant område -----------------------------------
+    # Vi prøver å finne starten på varelinjene.
+    start_idx = 0
+    for i, l in enumerate(lines):
+        if header_re.search(l):
+            start_idx = i + 1
+            break
+
+    # Hvis ingen header, finn første linje som ser ut som en varelinje
+    if start_idx == 0:
+        for i, l in enumerate(lines):
+            if item_re_a.match(l) or item_re_b.match(l):
+                start_idx = i
+                break
+
+    # Finn slutten (totals) etter start_idx
+    end_idx = len(lines)
+    for i in range(start_idx, len(lines)):
+        if totals_re.match(lines[i]):
+            end_idx = i
+            break
+
+    cand = lines[start_idx:end_idx]
+
+    # ---- parse ---------------------------------------------------
     rows: List[Dict[str, Any]] = []
+
     i = 0
-    while i < len(lines):
-        l = lines[i]
-        if _is_noise(l):
+    while i < len(cand):
+        l = cand[i]
+
+        # totals inne i vinduet (sikkerhet)
+        if totals_re.match(l):
+            break
+
+        # noise-filter: men ikke filtrer bort potensielle varelinjer
+        if _is_noise(l) and not re.match(r"^\d{4,10}\b", l):
             i += 1
             continue
 
-        # Ny varelinje starter typisk med art.nr (5-9 siffer)
-        if re.match(r"^\d{5,9}\b", l):
-            buf = l
-            # Noen beskrivelser brytes på flere linjer før antall/enhet kommer
-            # Vi limer på neste linje hvis:
-            # - buf mangler qty-pattern
-            # - neste linje ikke starter med nytt art.nr
-            # - neste linje ikke er noise/footer
-            while (i + 1) < len(lines):
-                if re.search(r"\b\d+,\d{2}\b", buf):
+        buf = l
+
+        # Håndter multilinjebeskrivelse: lim på neste linjer til vi får match,
+        # men stopp hvis neste linje starter med nytt artnr eller totals.
+        if re.match(r"^\d{4,10}\b", buf) and not (item_re_a.match(buf) or item_re_b.match(buf)):
+            j = i
+            while (j + 1) < len(cand):
+                nxt = cand[j + 1]
+                if totals_re.match(nxt):
                     break
-                nxt = lines[i + 1]
-                if _is_noise(nxt):
-                    i += 1
-                    continue
-                if re.match(r"^\d{5,9}\b", nxt):
+                if re.match(r"^\d{4,10}\b", nxt):
+                    break
+                # Hvis neste linje ser ut som footer/noise og vi allerede har litt buffer, stopp.
+                if _is_noise(nxt) and len(buf) > 10:
                     break
                 buf = (buf + " " + nxt).strip()
-                i += 1
+                j += 1
+                if item_re_a.match(buf) or item_re_b.match(buf):
+                    break
+            i = j
 
-            m = item_re.match(buf)
-            if m:
-                art = m.group("art").strip()
-                desc = m.group("desc").strip()
-                price = _parse_money(m.group("price"))
-                # Vi tar enhetspris som Konkurrent Pris (det er det matcheren forventer)
+        m = item_re_a.match(buf) or item_re_b.match(buf)
+        if m:
+            art = (m.groupdict().get("art") or "").strip()
+            desc = (m.groupdict().get("desc") or "").strip()
+
+            # pris: velg *første* money som ser ut som enhetspris, ikke beløp
+            price_raw = m.groupdict().get("price") or ""
+            try:
+                price = _parse_money(price_raw)
+            except Exception:
+                # siste forsøk: finn første money token i linja
+                toks = re.findall(r"\d[\d\s\u00a0\.]*[\.,]\d{2}", buf)
+                price = _parse_money(toks[0]) if toks else 0.0
+
+            if desc and price > 0:
                 rows.append({
                     "Konkurrent Navn": "",
                     "Konkurrent Art.Nr": art,
@@ -576,8 +648,8 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
 
         i += 1
 
-    if rows:
-        return rows
+    return rows
+
 
     # ------------------------------------------------------------
     # 2) Fallback: veldig enkel heuristikk (kun hvis vi fant 0 varer)
