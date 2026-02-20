@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import uuid
+import base64
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -106,6 +107,39 @@ def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security
     return True
 
 # (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
+
+# ============================================================
+# GLOBAL BASIC AUTH MIDDLEWARE
+# If BASIC_AUTH_USER/PASS are set, all routes require auth.
+# ============================================================
+@app.middleware("http")
+async def basic_auth_middleware(request: Request, call_next):
+    if not _auth_enabled():
+        return await call_next(request)
+
+    # Allow preflight
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    auth = request.headers.get("authorization") or ""
+    if auth.lower().startswith("basic "):
+        try:
+            b64 = auth.split(" ", 1)[1].strip()
+            raw = base64.b64decode(b64).decode("utf-8")
+            user, pwd = raw.split(":", 1)
+            ok_user = secrets.compare_digest(user or "", BASIC_AUTH_USER)
+            ok_pass = secrets.compare_digest(pwd or "", BASIC_AUTH_PASS)
+            if ok_user and ok_pass:
+                return await call_next(request)
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {"error": "Unauthorized"},
+        status_code=401,
+        headers={"WWW-Authenticate": "Basic"},
+    )
+
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
@@ -1144,20 +1178,6 @@ def catalog_status():
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
-    filename = (file.filename or "input").lower()
-    if filename.endswith('.pdf'):
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     filename = (file.filename or "").lower()
     if not filename.endswith(".xlsx"):
         return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
@@ -1183,6 +1203,28 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
     content = await file.read()
+    input_name = file.filename or "input"
+
+    # PDF -> Excel (Input-format) før matching
+    if (input_name or "").lower().endswith(".pdf"):
+        try:
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse(
+                    {"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."},
+                    status_code=400,
+                )
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
+            content = buf.getvalue()
+            # ensure output filename ends with .xlsx for history readability
+            input_name = (Path(input_name).stem or "input") + ".xlsx"
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
+
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1199,7 +1241,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": input_name or "input.xlsx",
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1209,7 +1251,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": input_name or "input.xlsx",
     })
 
     def progress(p: float):
@@ -1226,7 +1268,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(file.filename or "input.xlsx"),
+                input_filename=(input_name or "input.xlsx"),
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,
