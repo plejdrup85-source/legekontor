@@ -4,7 +4,6 @@ import os
 import re
 import threading
 import uuid
-import base64
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -36,24 +35,12 @@ APP_SUBTITLE = os.getenv("APP_SUBTITLE", "").strip()
 # PATHS / PERSISTENT STORAGE
 # ============================================================
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-except PermissionError:
-    # Fallback for environments where /var/data is not writable (e.g., local tests).
-    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "logo.png").resolve())))
 
 RESULTS_DIR = DATA_DIR / "results"
-try:
-    RESULTS_DIR.mkdir(exist_ok=True)
-except PermissionError:
-    # If something is off, fall back into /tmp as well.
-    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR = DATA_DIR / "results"
-    RESULTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
 
 CATALOG_PATH = DATA_DIR / "catalog.xlsx"
 JOBS_INDEX = DATA_DIR / "jobs.jsonl"
@@ -118,50 +105,7 @@ def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-# # ============================================================
-# AUTH MIDDLEWARE
-# Hvis BASIC_AUTH_USER/PASS er satt, låses hele løsningen bak passord.
-# Unntak: /health (for Render), samt API-dokumentasjon.
-# ============================================================
-
-def _basic_auth_challenge():
-    # 401 with browser login prompt
-    return JSONResponse(
-        status_code=401,
-        content={"detail": "Unauthorized"},
-        headers={"WWW-Authenticate": "Basic"},
-    )
-
-def _is_path_public(path: str) -> bool:
-    if path in ("/health",):
-        return True
-    # FastAPI docs / OpenAPI
-    if path.startswith("/docs") or path.startswith("/redoc") or path.startswith("/openapi.json"):
-        return True
-    return False
-
-def _validate_basic_auth_header(auth_header: str) -> bool:
-    try:
-        scheme, b64 = auth_header.split(" ", 1)
-        if scheme.lower() != "basic":
-            return False
-        raw = base64.b64decode(b64.strip()).decode("utf-8")
-        username, password = raw.split(":", 1)
-        return secrets.compare_digest(username, BASIC_AUTH_USER) and secrets.compare_digest(password, BASIC_AUTH_PASS)
-    except Exception:
-        return False
-
-@app.middleware("http")
-async def require_basic_auth_middleware(request: Request, call_next):
-    if _auth_enabled() and not _is_path_public(request.url.path):
-        auth_header = request.headers.get("authorization") or ""
-        if not auth_header or not _validate_basic_auth_header(auth_header):
-            return _basic_auth_challenge()
-    return await call_next(request)
-
-@app.get("/health")
-def health():
-    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+# (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
@@ -383,13 +327,8 @@ def embeddings_meta() -> Dict[str, Any]:
 # PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
 # ============================================================
 def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Trekk ut tekst fra PDF.
-
-    Primært: tekstlag via pypdf.extract_text().
-    Fallback: OCR hvis PDF er skannet (ingen/for lite tekst).
-    """
     reader = PdfReader(BytesIO(pdf_bytes))
-    parts: List[str] = []
+    parts = []
     for p in reader.pages:
         try:
             t = p.extract_text() or ""
@@ -397,395 +336,163 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
             t = ""
         if t:
             parts.append(t)
-
-    text = "\n".join(parts).strip()
-
-    # OCR fallback hvis vi ikke får noe meningsfullt tekstlag
-    if len(text) >= 40:
-        return text
-
-    # Forsøk OCR (valgfritt - krever ekstra deps i miljøet). Vi gjør best-effort.
-    try:
-        ocr_text = _ocr_pdf_to_text(pdf_bytes)
-        ocr_text = (ocr_text or "").strip()
-        if ocr_text:
-            return ocr_text
-    except Exception:
-        pass
-
-    return text
-
-
-
-def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 10, dpi: int = 200) -> str:
-    """OCR av PDF (for skannede PDF-er uten tekstlag).
-
-    Prøver først PyMuPDF (fitz) for å rendere sider til bilder.
-    Fallback: pdf2image hvis tilgjengelig.
-
-    Krever at miljøet har OCR-avhengigheter installert (pytesseract + tesseract-binary).
-    Hvis ikke, returneres tom streng.
-    """
-    text_parts: List[str] = []
-
-    # Importer OCR libs lazily så appen ikke crasher hvis deps mangler
-    try:
-        import pytesseract  # type: ignore
-    except Exception:
-        return ""
-
-    # 1) PyMuPDF (fitz) render
-    try:
-        import fitz  # type: ignore
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for i in range(min(max_pages, doc.page_count)):
-            page = doc.load_page(i)
-            pix = page.get_pixmap(dpi=dpi)
-            img_bytes = pix.tobytes("png")
-            try:
-                from PIL import Image  # type: ignore
-                from io import BytesIO as _BytesIO
-                img = Image.open(_BytesIO(img_bytes))
-                text_parts.append(pytesseract.image_to_string(img))
-            except Exception:
-                continue
-        doc.close()
-        out = "\n".join([t for t in text_parts if t]).strip()
-        if out:
-            return out
-    except Exception:
-        pass
-
-    # 2) pdf2image fallback (krever poppler i OS)
-    try:
-        from pdf2image import convert_from_bytes  # type: ignore
-        images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=min(max_pages, 9999))
-        for img in images:
-            try:
-                text_parts.append(pytesseract.image_to_string(img))
-            except Exception:
-                continue
-        return "\n".join([t for t in text_parts if t]).strip()
-    except Exception:
-        return ""
-
+    return "\n".join(parts)
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
 
-    Viktig: Unngå å ta med adresse-/footer-tekst fra faktura.
-    Denne parseren prøver først en "NorEngros/Ødegaard Engros"-aktig tabellstruktur
-    (art.nr først på linja, så beskrivelse, så antall/enhet, pris, ev. rabatt, beløp).
-    Hvis vi ikke klarer å finne minst én varelinje, faller vi tilbake til en veldig enkel heuristikk.
+    Viktig: Fakturaer kan ha mye 'støy' (adresser, vilkår, summer osv.). Vi prøver å hente ut *varelinjene*.
+    - NorEngros: typisk art.nr + beskrivelse + antall + enhet + pris + enhet + rabatt% + beløp
+      -> vi bruker nettopris per enhet = pris * (1 - rabatt/100) hvis rabatt finnes.
+    - Epion / andre: faller tilbake til en mer generell heuristikk.
     """
-    raw_lines = [(l or "") for l in (text or "").splitlines()]
-    lines = [re.sub(r"\s+", " ", l).strip() for l in raw_lines]
+    raw = text or ""
+    low = raw.lower()
+
+    # Normaliser linjer (bevarer rekkefølge, men komprimerer whitespace)
+    lines = [re.sub(r"\s+", " ", (l or "")).strip() for l in raw.splitlines()]
     lines = [l for l in lines if l]
 
-    # ------------------------------------------------------------
-    # 1) Streng faktura-linje parser (NorEngros-lignende)
-    # ------------------------------------------------------------
-    # Mønstre vi ønsker å ignorere (header/footer/blokker)
-    IGNORE_PREFIX = (
-        "faktura", "fakturaadresse", "betaler", "betalings", "fakturadato", "fakturanummer",
-        "forfallsdato", "bank", "bankkontonr", "kid", "totalbeløp", "valuta", "mva",
-        "beløp ekskl", "totalbeløp inkl", "adresse", "telefon", "internett", "org.nr",
-        "iban", "swift", "ordre", "levering", "oppdragsgiver", "varemottaker",
-        "delsum", "side"
-    )
+    def _parse_money_local(x: str) -> Optional[float]:
+        # støtter 1.234,56 / 1234,56 / 1234.56
+        if not x:
+            return None
+        s = str(x).strip().replace("\u00a0", " ")
+        s = s.replace(" ", "")
+        # hvis både punktum og komma: punktum = tusenskille, komma = desimal
+        if "," in s and "." in s:
+            s = s.replace(".", "").replace(",", ".")
+        else:
+            s = s.replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            return None
 
-    def _is_noise(line: str) -> bool:
-        ll = line.lower().strip()
-        if not ll:
-            return True
-        # typiske "linjer" som bare er fakturanr / sidetall
-        if re.fullmatch(r"\d{7,12}", ll):
-            return True
-        if ll.startswith(IGNORE_PREFIX):
-            return True
-        # "GRANÅSEN LEGESENTER AS", adresser etc (mange store bokstaver)
-        if "legenter" in ll or "legesenter" in ll:
-            return True
-        return False
+    def _looks_like_total(line_low: str) -> bool:
+        return any(k in line_low for k in [
+            "sum", "total", "mva", "å betale", "beløp å betale", "til betaling",
+            "delsum", "fakturasum", "sum eks", "sum inkl"
+        ])
 
-    def _parse_money(s: str) -> float:
-        # "1.459,30" -> 1459.30
-        s = (s or "").strip()
-        s = s.replace("\u00a0", "").replace(" ", "")
-        s = s.replace(".", "").replace(",", ".")
-        return float(s)
+    # -----------------------------
+    # 1) NorEngros-spesifikk parser
+    # -----------------------------
+    if "norengros" in low:
+        rows: List[Dict[str, Any]] = []
 
-    # En typisk varelinje:
-    # 408346 QuickVue ... 1,00 PK á 25 STK 1.459,30 PK 35,0 % 948,54 **
-    # 255994 Brevordner ... 2,00 STK 72,51 STK 10,0 % 130,52 **
-    item_re = re.compile(
-        r"^(?P<art>\d{5,9})\s+"
-        r"(?P<desc>.+?)\s+"
-        r"(?P<qty>\d+,\d{2})\s+"
-        r"(?P<unit>[A-ZÆØÅ]{2,5})"
-        r"(?:\s+á\s+\d+\s+[A-ZÆØÅ]{2,5})?\s+"
-        r"(?P<price>\d[\d\.]*,\d{2})\s+"
-        r"(?P<price_unit>[A-ZÆØÅ]{2,5})"
-        r"(?:\s+\d+,\d\s*%\s+\d[\d\.]*,\d{2})?"
-        r".*$"
-    )
+        # Eksempel (utdrag):
+        # 123456  PRODUKT NAVN ...  2,00  PK  199,00  STK  5,0 %  378,10
+        item_re = re.compile(
+            r"^(?P<art>\d{5,9})\s+"
+            r"(?P<desc>.+?)\s+"
+            r"(?P<qty>\d+,\d{2})\s+"
+            r"(?P<unit>[A-ZÆØÅ]{1,6})"
+            r"(?:\s+á\s+\d+\s+[A-ZÆØÅ]{1,6})?\s+"
+            r"(?P<price>\d[\d\.]*,\d{2})\s+"
+            r"(?P<price_unit>[A-ZÆØÅ]{1,6})"
+            r"(?:\s+(?P<rab>\d+,\d)\s*%\s+(?P<amount>\d[\d\.]*,\d{2}))?"
+            r".*$"
+        )
+
+        i = 0
+        while i < len(lines):
+            l = lines[i]
+            ll = l.lower()
+
+            if _looks_like_total(ll):
+                i += 1
+                continue
+
+            if re.match(r"^\d{5,9}\b", l):
+                buf = l
+                # lim på neste linje hvis beskrivelsen er brutt før antall/enhet dukker opp
+                while (i + 1) < len(lines):
+                    if re.search(r"\b\d+,\d{2}\b", buf):
+                        break
+                    nxt = lines[i + 1]
+                    if _looks_like_total(nxt.lower()):
+                        i += 1
+                        continue
+                    if re.match(r"^\d{5,9}\b", nxt):
+                        break
+                    buf = (buf + " " + nxt).strip()
+                    i += 1
+
+                m = item_re.match(buf)
+                if m:
+                    art = (m.group("art") or "").strip()
+                    desc = (m.group("desc") or "").strip()
+                    qty = _to_float(m.group("qty")) or 0.0
+                    unit = (m.group("unit") or "").strip()
+
+                    price = _parse_money(m.group("price"))  # enhetspris
+                    rab_raw = m.groupdict().get("rab")
+                    rab_pct = _to_float(rab_raw) if rab_raw else None
+
+                    net_price = price
+                    if price is not None and rab_pct is not None:
+                        net_price = round(float(price) * (1.0 - float(rab_pct) / 100.0), 4)
+
+                    rows.append({
+                        "Konkurrent Navn": "NorEngros",
+                        "Konkurrent Art.Nr": art,
+                        "Konkurrent Item Description": desc,
+                        "Konkurrent Specification": "",
+                        "Antall": qty if qty else "",
+                        "Konkurrent salgsenhet": unit,
+                        "Konkurrent Pris": net_price,
+                        # ekstra debug-felter (ignoreres hvis template ikke har dem)
+                        "Konkurrent Rabatt %": rab_pct if rab_pct is not None else "",
+                        "Konkurrent Pris før rabatt": price if price is not None else "",
+                    })
+            i += 1
+
+        # Hvis vi klarte å hente ut noe, returner nå (ingen fallback som blander inn støy)
+        if rows:
+            return rows
+
+    # -----------------------------
+    # 2) Generell faktura-heuristikk (fallback)
+    # -----------------------------
+    # Finn start på varelinjer hvis det finnes en header-linje
+    start_idx = 0
+    header_patterns = [
+        "beskrivelse antall", "antall pris", "varelinjer", "beskrivelse", "enhetspris", "beløp", "pris"
+    ]
+    for i, l in enumerate(lines[:250]):
+        ll = l.lower()
+        if any(h in ll for h in header_patterns):
+            start_idx = i + 1
+            break
 
     rows: List[Dict[str, Any]] = []
-    i = 0
-    while i < len(lines):
-        l = lines[i]
-        if _is_noise(l):
-            i += 1
-            continue
+    buf_desc = ""
 
-        # Ny varelinje starter typisk med art.nr (5-9 siffer)
-        if re.match(r"^\d{5,9}\b", l):
-            buf = l
-            # Noen beskrivelser brytes på flere linjer før antall/enhet kommer
-            # Vi limer på neste linje hvis:
-            # - buf mangler qty-pattern
-            # - neste linje ikke starter med nytt art.nr
-            # - neste linje ikke er noise/footer
-            while (i + 1) < len(lines):
-                if re.search(r"\b\d+,\d{2}\b", buf):
-                    break
-                nxt = lines[i + 1]
-                if _is_noise(nxt):
-                    i += 1
-                    continue
-                if re.match(r"^\d{5,9}\b", nxt):
-                    break
-                buf = (buf + " " + nxt).strip()
-                i += 1
-
-            m = item_re.match(buf)
-            if m:
-                art = m.group("art").strip()
-                desc = m.group("desc").strip()
-                price = _parse_money(m.group("price"))
-                # Vi tar enhetspris som Konkurrent Pris (det er det matcheren forventer)
-                rows.append({
-                    "Konkurrent Navn": "",
-                    "Konkurrent Art.Nr": art,
-                    "Konkurrent Item Description": desc,
-                    "Konkurrent Specification": "",
-                    "Konkurrent Pris": price,
-                })
-            i += 1
-            continue
-
-        i += 1
-
-
-
-
-    # ------------------------------------------------------------
-    # 2) Epion-lignende faktura (ingen art.nr-kolonne, men: Beskrivelse + Antall + priser)
-    # ------------------------------------------------------------
-    # pypdf kan noen ganger "flate" flere varelinjer inn på samme tekstlinje.
-    # Vi løser dette ved å parse *baklengs* fra høyre: finn de 4 siste beløpene, finn antall rett før disse,
-    # og bruk resten som beskrivelse. Gjenta til vi ikke finner flere varelinjer.
-    EPION_HEADER_RE = re.compile(r"\bBeskrivelse\b.*\bAntall\b", re.IGNORECASE)
-    EPION_STOP_RE = re.compile(r"^(Sum\b|Betales\b|Betales til\b|Total\b|Forfallsdato\b|KID\b)", re.IGNORECASE)
-
-    def _find_epion_table_bounds(lines_: List[str]) -> Tuple[int, int]:
-        start_idx = -1
-        for j, ll in enumerate(lines_):
-            if EPION_HEADER_RE.search(ll):
-                start_idx = j + 1
-                break
-        if start_idx < 0:
-            return (-1, -1)
-        end_idx = len(lines_)
-        for j in range(start_idx, len(lines_)):
-            if EPION_STOP_RE.search(lines_[j].strip()):
-                end_idx = j
-                break
-        return (start_idx, end_idx)
-
-    # "3 692,00" eller "3.692,00" eller "3692,00"
-    MONEY_RE = re.compile(r"\d{1,3}(?:[\s\.]\d{3})*,\d{2}")
-
-    def _clean_table_line(s: str) -> str:
-        s = (s or "").strip()
-        s = re.sub(r"\s+", " ", s)
-        return s
-
-    def _strip_epion_header_junk(desc: str) -> str:
-        d = (desc or "").strip()
-        # fjern typiske kolonne-overskrifter som kan havne foran første beskrivelse
-        d = re.sub(r"^(Beløp.*?\)\s*)+", "", d, flags=re.IGNORECASE)
-        d = re.sub(r"^Beløp\s+", "", d, flags=re.IGNORECASE)
-        d = re.sub(r"^(\(ekskl\.? mva\).*?\)\s*)+", "", d, flags=re.IGNORECASE)
-        d = d.strip(" - ")
-        d = re.sub(r"\(\s*$", "", d)
-        return d
-
-    def _parse_epion_items_from_text(text: str) -> List[Dict[str, Any]]:
-        t = _clean_table_line(text)
-        items_rev: List[Dict[str, Any]] = []
-
-        # parse fra høyre (siste varelinje først)
-        while True:
-            monies = list(MONEY_RE.finditer(t))
-            if len(monies) < 4:
-                break
-
-            m_in = monies[-1]
-            m_mva = monies[-2]
-            m_ex = monies[-3]
-            m_unit = monies[-4]
-
-            # Varelinja må ligge helt mot høyre (ellers er dette ofte totalsummer)
-            right_tail = t[m_in.end():].strip()
-            if right_tail and len(right_tail) > 3:
-                break
-
-            left = t[:m_unit.start()].rstrip()
-
-            # Antall er vanligvis siste heltall før unitprice-kolonnen,
-            # men noen PDF-er "flater" det slik at unitprice blir "2 267,00" (dvs qty=2 og unitprice=267,00).
-            qty = None
-            unitprice_text = m_unit.group(0)
-
-            # parse amount_ex først (brukes for validering)
-            try:
-                amount_ex_val = _parse_money(m_ex.group(0))
-            except Exception:
-                amount_ex_val = None
-
-            qty_match = None
-            for mm in re.finditer(r"\b\d{1,5}\b", left):
-                qty_match = mm
-
-            # Forsøk split: "<qty> <###,dd>" i unitprice-feltet
-            split_m = re.match(r"^(\d{1,5})\s(\d{3},\d{2})$", unitprice_text)
-            if split_m:
-                split_qty = int(split_m.group(1))
-                split_unit_text = split_m.group(2)
-                # bruk split hvis det gir mening (matcher beløp eks mva) eller hvis qty fra venstre mangler
-                ok_by_amount = False
-                if amount_ex_val is not None:
-                    try:
-                        ok_by_amount = abs((split_qty * _parse_money(split_unit_text)) - amount_ex_val) <= max(0.5, 0.02 * amount_ex_val)
-                    except Exception:
-                        ok_by_amount = False
-                if (qty_match is None) or ok_by_amount:
-                    qty = split_qty
-                    unitprice_text = split_unit_text
-
-            if qty is None:
-                if not qty_match:
-                    break
-                qty = int(qty_match.group(0))
-
-            # Beskrivelse er alt før qty i venstre-del (hvis qty kom fra split, tar vi hele venstre-del)
-            if qty_match:
-                desc_raw = left[:qty_match.start()].rstrip()
-            else:
-                desc_raw = left.rstrip()
-
-            desc = _strip_epion_header_junk(desc_raw)
-            if not desc:
-                break
-
-
-            if desc.lower().startswith("frakt"):
-                # ignorer frakt-linje som "vare"
-                # fjern denne linja og fortsett
-                start_guess = t.rfind(desc_raw, 0, m_unit.start())
-                t = t[:start_guess].rstrip() if start_guess > 0 else ""
-                continue
-
-            try:
-                unitprice = _parse_money(unitprice_text)
-            except Exception:
-                unitprice = 0.0
-
-            items_rev.append({
-                "Konkurrent Navn": "",
-                "Konkurrent Art.Nr": "",
-                "Konkurrent Item Description": desc,
-                "Konkurrent Specification": "",
-                "Konkurrent Pris": unitprice,
-            })
-
-            # kutt bort siste varelinje fra teksten for å finne neste (tidligere) linje
-            start_guess = t.rfind(desc_raw, 0, m_unit.start())
-            if start_guess <= 0:
-                break
-            t = t[:start_guess].rstrip()
-
-        return list(reversed(items_rev))
-
-    def _try_parse_epion(lines_: List[str]) -> List[Dict[str, Any]]:
-        s, e = _find_epion_table_bounds(lines_)
-        if s < 0:
-            return []
-
-        out: List[Dict[str, Any]] = []
-        buf = ""
-
-        for j in range(s, e):
-            ll = _clean_table_line(lines_[j])
-            if not ll:
-                continue
-
-            low = ll.lower()
-            if ("ekskl. mva" in low) or ("inkl. mva" in low) or low.startswith(("beskrivelse", "antall", "enh.pris")):
-                continue
-            if EPION_STOP_RE.search(ll):
-                break
-
-            cand = (buf + " " + ll).strip() if buf else ll
-            cand = _clean_table_line(cand)
-
-            parsed = _parse_epion_items_from_text(cand)
-            if parsed:
-                out.extend(parsed)
-                buf = ""
-            else:
-                # hold i buffer (beskrivelser kan være på flere linjer)
-                if len(cand) > 900:
-                    buf = ""
-                else:
-                    buf = cand
-
-        return out
-
-    epion_rows = _try_parse_epion(lines)
-    if epion_rows:
-        return epion_rows
-
-
-
-    if rows:
-        return rows
-
-    # ------------------------------------------------------------
-    # 2) Fallback: veldig enkel heuristikk (kun hvis vi fant 0 varer)
-    # ------------------------------------------------------------
-    # NB: Denne kan ta med støy - derfor brukes den kun som siste utvei.
     def parse_numbers_from_line(l: str):
+        # finner tall med komma/punktum
         nums = re.findall(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", l)
         clean = []
         for n in nums:
-            n2 = n.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
-            try:
-                clean.append(float(n2))
-            except Exception:
-                pass
+            v = _parse_money_local(n)
+            if v is not None:
+                clean.append(v)
         return clean
 
-    buf_desc = ""
-    for l in lines:
-        if _is_noise(l):
+    for l in lines[start_idx:]:
+        ll = l.lower()
+        if _looks_like_total(ll):
             continue
+
         nums = parse_numbers_from_line(l)
+
+        # Heuristikk: linjer med minst 2 tall har ofte enhetspris/beløp.
         if len(nums) >= 2:
             unit_price = nums[-2]
             desc = buf_desc.strip() or re.sub(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", "", l).strip()
-            if len(desc) >= 3:
+
+            # Filter: unngå å ta med rene "adresse/organisasjons"-linjer
+            if len(desc) >= 3 and not any(k in desc.lower() for k in ["org.nr", "kontonr", "bank", "adresse", "telefon", "e-post"]):
                 rows.append({
                     "Konkurrent Navn": "",
                     "Konkurrent Art.Nr": "",
@@ -795,6 +502,7 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 })
                 buf_desc = ""
                 continue
+
         if len(l) >= 3 and not re.match(r"^\d+$", l):
             buf_desc = (buf_desc + " " + l).strip()
 
@@ -921,11 +629,7 @@ def load_catalog_from_disk() -> None:
     art_col_full = _find_col(df_full, "Artikkelnummer", "Art.nr", "Art nr", "Article Number", "Item NO", "Item No")
 
     if not art_col_lk or not art_col_full:
-        err = "Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No)."
-        logger.error(err)
-        CATALOG_BUNDLE = None
-        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": err})
-        return
+        raise ValueError("Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No).")
 
     if not lk_price_col:
         logger.warning("Fant ikke 'Pris Etter Rabatt' i LK-arket. Priser fra LK kan bli tomme.")
@@ -955,15 +659,8 @@ def load_catalog_from_disk() -> None:
         price_lookup[art] = {"price": float(p), "source": "lk"}
 
     # Ikke bygg embeddings ved startup
-    try:
-        lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
-        full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
-    except Exception as e:
-        # Viktig: appen skal ikke dø på startup hvis katalogen er tom/feilformatert.
-        logger.error(f"Kunne ikke laste katalog ved oppstart: {e}")
-        CATALOG_BUNDLE = None
-        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": str(e)})
-        return
+    lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
+    full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
 
     CATALOG_BUNDLE = LegekontorCatalogBundle(lk_catalog=lk_cat, full_catalog=full_cat, price_lookup=price_lookup)
 
@@ -1198,7 +895,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx,.pdf" multiple/>
+        <input id="input" type="file" accept=".xlsx,.pdf"/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -1271,7 +968,7 @@ async function uploadCatalog() {
   document.getElementById("catStatus").textContent = "Laster opp katalog...";
 
   const fd = new FormData();
-  files.forEach(f => fd.append("files", f));
+  fd.append("file", file);
 
   const resp = await fetch("/upload_catalog", { method: "POST", body: fd });
   const data = await resp.json().catch(() => ({}));
@@ -1287,8 +984,8 @@ async function uploadCatalog() {
 }
 
 async function startMatch() {
-  const files = Array.from(document.getElementById("input").files || []);
-  if (!files.length) return alert("Velg en eller flere inputfiler (.xlsx eller .pdf)");
+  const file = document.getElementById("input").files[0];
+  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
@@ -1296,7 +993,7 @@ async function startMatch() {
   document.getElementById("bar").style.width = "1%";
 
   const fd = new FormData();
-  files.forEach(f => fd.append("files", f));
+  fd.append("file", file);
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
@@ -1403,7 +1100,7 @@ loadHistory();
 
 
 @app.get("/static/logo.png")
-def static_logo(_ok: bool = Depends(verify_basic_auth)):
+def static_logo():
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -1417,7 +1114,7 @@ def static_logo(_ok: bool = Depends(verify_basic_auth)):
 # ROUTES
 # ============================================================
 @app.get("/template")
-def template(_ok: bool = Depends(verify_basic_auth)):
+def template():
     xlsx = generate_input_template_bytes()
     return StreamingResponse(
         BytesIO(xlsx),
@@ -1427,7 +1124,7 @@ def template(_ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(_ok: bool = Depends(verify_basic_auth)):
+def index():
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
@@ -1435,7 +1132,7 @@ def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
 
 
 @app.get("/catalog_status")
-def catalog_status(_ok: bool = Depends(verify_basic_auth)):
+def catalog_status():
     meta = catalog_meta()
     meta["exists"] = CATALOG_PATH.exists()
     meta["loaded"] = CATALOG_BUNDLE is not None
@@ -1447,6 +1144,20 @@ def catalog_status(_ok: bool = Depends(verify_basic_auth)):
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
+    filename = (file.filename or "input").lower()
+    if filename.endswith('.pdf'):
+        try:
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
+            content = buf.getvalue()
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     filename = (file.filename or "").lower()
     if not filename.endswith(".xlsx"):
         return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
@@ -1467,50 +1178,11 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
+async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
-    dfs = []
-
-    # Les alle filer og bygg én samlet input-tabell
-    for f in (files or []):
-        content = await f.read()
-        filename = (f.filename or "input").lower()
-
-        if filename.endswith(".pdf"):
-            try:
-                text_pdf = _extract_text_from_pdf(content)
-                rows = _parse_invoice_text_heuristic(text_pdf)
-                if not rows:
-                    return JSONResponse(
-                        {"error": f"Fant ingen varelinjer i PDF: {f.filename}. Hvis dette er en skannet PDF uten tekstlag, må den OCR'es eller eksporteres som 'searchable PDF'."},
-                        status_code=400,
-                    )
-                df = pd.DataFrame(rows)
-            except Exception as e:
-                return JSONResponse({"error": f"Kunne ikke lese PDF {f.filename}: {e}"}, status_code=400)
-        else:
-            # Excel input
-            try:
-                df = pd.read_excel(BytesIO(content))
-            except Exception as e:
-                return JSONResponse({"error": f"Kunne ikke lese Excel {f.filename}: {e}"}, status_code=400)
-
-        # Spor kildefil i output for sporbarhet
-        if "SourceFile" not in df.columns:
-            df.insert(0, "SourceFile", f.filename or "input")
-        dfs.append(df)
-
-    if not dfs:
-        return JSONResponse({"error": "Ingen filer mottatt"}, status_code=400)
-
-    merged_df = pd.concat(dfs, ignore_index=True)
-    buf = BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        merged_df.to_excel(writer, index=False, sheet_name="Input")
-    content = buf.getvalue()
-
+    content = await file.read()
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1527,7 +1199,7 @@ async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Fo
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
+        "input_filename": file.filename or "input.xlsx",
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1537,7 +1209,7 @@ async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Fo
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
+        "input_filename": file.filename or "input.xlsx",
     })
 
     def progress(p: float):
@@ -1554,7 +1226,7 @@ async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Fo
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx"),
+                input_filename=(file.filename or "input.xlsx"),
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,
@@ -1614,7 +1286,7 @@ async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Fo
 
 
 @app.post("/cancel/{task_id}")
-def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def cancel(task_id: str):
     t = TASKS.get(task_id)
     if not t:
         return JSONResponse({"error": "Ukjent task_id"}, status_code=404)
@@ -1642,7 +1314,7 @@ def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/progress/{task_id}")
-def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def progress(task_id: str):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
@@ -1655,7 +1327,7 @@ def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/download/{task_id}")
-def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def download(task_id: str):
     path = RESULTS_DIR / f"{task_id}.xlsx"
     if not path.exists():
         return JSONResponse({"error": "Fil finnes ikke"}, status_code=404)
@@ -1676,5 +1348,5 @@ def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/history")
-def history(limit: int = 200, _ok: bool = Depends(verify_basic_auth)):
+def history(limit: int = 200):
     return {"jobs": load_jobs(limit=limit)}
