@@ -35,12 +35,24 @@ APP_SUBTITLE = os.getenv("APP_SUBTITLE", "").strip()
 # PATHS / PERSISTENT STORAGE
 # ============================================================
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+except PermissionError:
+    # Fallback for environments where /var/data is not writable (e.g., local tests).
+    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "logo.png").resolve())))
 
 RESULTS_DIR = DATA_DIR / "results"
-RESULTS_DIR.mkdir(exist_ok=True)
+try:
+    RESULTS_DIR.mkdir(exist_ok=True)
+except PermissionError:
+    # If something is off, fall back into /tmp as well.
+    DATA_DIR = Path(os.getenv("DATA_DIR_FALLBACK", "/tmp/produktmatching")).resolve()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    RESULTS_DIR = DATA_DIR / "results"
+    RESULTS_DIR.mkdir(exist_ok=True)
 
 CATALOG_PATH = DATA_DIR / "catalog.xlsx"
 JOBS_INDEX = DATA_DIR / "jobs.jsonl"
@@ -327,112 +339,208 @@ def embeddings_meta() -> Dict[str, Any]:
 # PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
 # ============================================================
 def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """
-    Leser tekst fra PDF. Først forsøkes tekstlag via pypdf. Hvis det gir lite/ingen tekst,
-    prøves OCR (Tesseract) som fallback dersom avhengigheter er installert i containeren.
-    """
-    # 1) Vanlig tekstuttrekk
-    try:
-        reader = PdfReader(BytesIO(pdf_bytes))
-        parts = []
-        for p in reader.pages:
-            try:
-                t = p.extract_text() or ""
-            except Exception:
-                t = ""
-            if t:
-                parts.append(t)
-        text = "\n".join(parts).strip()
-    except Exception:
-        text = ""
+    """Trekk ut tekst fra PDF.
 
-    # 2) OCR fallback dersom lite tekst
-    if len(text) >= 50:
+    Primært: tekstlag via pypdf.extract_text().
+    Fallback: OCR hvis PDF er skannet (ingen/for lite tekst).
+    """
+    reader = PdfReader(BytesIO(pdf_bytes))
+    parts: List[str] = []
+    for p in reader.pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""
+        if t:
+            parts.append(t)
+
+    text = "\n".join(parts).strip()
+
+    # OCR fallback hvis vi ikke får noe meningsfullt tekstlag
+    if len(text) >= 40:
         return text
 
-    ocr_text = _ocr_pdf_to_text(pdf_bytes)
-    if ocr_text:
-        return ocr_text.strip()
+    # Forsøk OCR (valgfritt - krever ekstra deps i miljøet). Vi gjør best-effort.
+    try:
+        ocr_text = _ocr_pdf_to_text(pdf_bytes)
+        ocr_text = (ocr_text or "").strip()
+        if ocr_text:
+            return ocr_text
+    except Exception:
+        pass
+
     return text
 
 
-def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 6) -> str:
+
+def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 10, dpi: int = 200) -> str:
+    """OCR av PDF (for skannede PDF-er uten tekstlag).
+
+    Prøver først PyMuPDF (fitz) for å rendere sider til bilder.
+    Fallback: pdf2image hvis tilgjengelig.
+
+    Krever at miljøet har OCR-avhengigheter installert (pytesseract + tesseract-binary).
+    Hvis ikke, returneres tom streng.
     """
-    Best-effort OCR. Krever at tesseract er installert i OS og at pytesseract + Pillow finnes i requirements.
-    Prøver først PyMuPDF (fitz). Fallback til pdf2image hvis tilgjengelig.
-    """
+    text_parts: List[str] = []
+
+    # Importer OCR libs lazily så appen ikke crasher hvis deps mangler
     try:
         import pytesseract  # type: ignore
-        from PIL import Image  # type: ignore
     except Exception:
         return ""
 
-    texts = []
-
-    # Try 1: PyMuPDF (fitz)
+    # 1) PyMuPDF (fitz) render
     try:
         import fitz  # type: ignore
-
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        page_count = min(len(doc), max_pages)
-        for i in range(page_count):
+        for i in range(min(max_pages, doc.page_count)):
             page = doc.load_page(i)
-            pix = page.get_pixmap(dpi=220)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            pix = page.get_pixmap(dpi=dpi)
+            img_bytes = pix.tobytes("png")
             try:
-                texts.append(pytesseract.image_to_string(img, lang="nor+eng"))
+                from PIL import Image  # type: ignore
+                from io import BytesIO as _BytesIO
+                img = Image.open(_BytesIO(img_bytes))
+                text_parts.append(pytesseract.image_to_string(img))
             except Exception:
-                texts.append(pytesseract.image_to_string(img))
+                continue
         doc.close()
-        out = "\n".join([t for t in texts if t and t.strip()])
-        if len(out.strip()) >= 20:
+        out = "\n".join([t for t in text_parts if t]).strip()
+        if out:
             return out
     except Exception:
         pass
 
-    # Try 2: pdf2image (poppler)
+    # 2) pdf2image fallback (krever poppler i OS)
     try:
         from pdf2image import convert_from_bytes  # type: ignore
-
-        images = convert_from_bytes(pdf_bytes, dpi=220, first_page=1, last_page=max_pages)
+        images = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=1, last_page=min(max_pages, 9999))
         for img in images:
             try:
-                texts.append(pytesseract.image_to_string(img, lang="nor+eng"))
+                text_parts.append(pytesseract.image_to_string(img))
             except Exception:
-                texts.append(pytesseract.image_to_string(img))
-        out = "\n".join([t for t in texts if t and t.strip()])
-        if len(out.strip()) >= 20:
-            return out
+                continue
+        return "\n".join([t for t in text_parts if t]).strip()
     except Exception:
-        pass
+        return ""
 
-    return ""
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
-    Heuristikk: plukker ut varelinjer med beløp/pris. Epion/NorEngros-lignende tabeller støttes best-effort.
+
+    Viktig: Unngå å ta med adresse-/footer-tekst fra faktura.
+    Denne parseren prøver først en "NorEngros/Ødegaard Engros"-aktig tabellstruktur
+    (art.nr først på linja, så beskrivelse, så antall/enhet, pris, ev. rabatt, beløp).
+    Hvis vi ikke klarer å finne minst én varelinje, faller vi tilbake til en veldig enkel heuristikk.
     """
-    lines = [re.sub(r"\s+", " ", (l or "")).strip() for l in (text or "").splitlines()]
+    raw_lines = [(l or "") for l in (text or "").splitlines()]
+    lines = [re.sub(r"\s+", " ", l).strip() for l in raw_lines]
     lines = [l for l in lines if l]
 
-    # Finn start på varelinjer
-    start_idx = 0
-    header_patterns = [
-        "beskrivelse antall", "antall pris", "varelinjer", "beskrivelse", "enhetspris", "beløp"
-    ]
-    for i, l in enumerate(lines[:200]):
-        ll = l.lower()
-        if any(h in ll for h in header_patterns):
-            start_idx = i + 1
-            break
+    # ------------------------------------------------------------
+    # 1) Streng faktura-linje parser (NorEngros-lignende)
+    # ------------------------------------------------------------
+    # Mønstre vi ønsker å ignorere (header/footer/blokker)
+    IGNORE_PREFIX = (
+        "faktura", "fakturaadresse", "betaler", "betalings", "fakturadato", "fakturanummer",
+        "forfallsdato", "bank", "bankkontonr", "kid", "totalbeløp", "valuta", "mva",
+        "beløp ekskl", "totalbeløp inkl", "adresse", "telefon", "internett", "org.nr",
+        "iban", "swift", "ordre", "levering", "oppdragsgiver", "varemottaker",
+        "delsum", "side"
+    )
 
-    rows = []
-    buf_desc = ""
+    def _is_noise(line: str) -> bool:
+        ll = line.lower().strip()
+        if not ll:
+            return True
+        # typiske "linjer" som bare er fakturanr / sidetall
+        if re.fullmatch(r"\d{7,12}", ll):
+            return True
+        if ll.startswith(IGNORE_PREFIX):
+            return True
+        # "GRANÅSEN LEGESENTER AS", adresser etc (mange store bokstaver)
+        if "legenter" in ll or "legesenter" in ll:
+            return True
+        return False
 
+    def _parse_money(s: str) -> float:
+        # "1.459,30" -> 1459.30
+        s = (s or "").strip()
+        s = s.replace("\u00a0", "").replace(" ", "")
+        s = s.replace(".", "").replace(",", ".")
+        return float(s)
+
+    # En typisk varelinje:
+    # 408346 QuickVue ... 1,00 PK á 25 STK 1.459,30 PK 35,0 % 948,54 **
+    # 255994 Brevordner ... 2,00 STK 72,51 STK 10,0 % 130,52 **
+    item_re = re.compile(
+        r"^(?P<art>\d{5,9})\s+"
+        r"(?P<desc>.+?)\s+"
+        r"(?P<qty>\d+,\d{2})\s+"
+        r"(?P<unit>[A-ZÆØÅ]{2,5})"
+        r"(?:\s+á\s+\d+\s+[A-ZÆØÅ]{2,5})?\s+"
+        r"(?P<price>\d[\d\.]*,\d{2})\s+"
+        r"(?P<price_unit>[A-ZÆØÅ]{2,5})"
+        r"(?:\s+\d+,\d\s*%\s+\d[\d\.]*,\d{2})?"
+        r".*$"
+    )
+
+    rows: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(lines):
+        l = lines[i]
+        if _is_noise(l):
+            i += 1
+            continue
+
+        # Ny varelinje starter typisk med art.nr (5-9 siffer)
+        if re.match(r"^\d{5,9}\b", l):
+            buf = l
+            # Noen beskrivelser brytes på flere linjer før antall/enhet kommer
+            # Vi limer på neste linje hvis:
+            # - buf mangler qty-pattern
+            # - neste linje ikke starter med nytt art.nr
+            # - neste linje ikke er noise/footer
+            while (i + 1) < len(lines):
+                if re.search(r"\b\d+,\d{2}\b", buf):
+                    break
+                nxt = lines[i + 1]
+                if _is_noise(nxt):
+                    i += 1
+                    continue
+                if re.match(r"^\d{5,9}\b", nxt):
+                    break
+                buf = (buf + " " + nxt).strip()
+                i += 1
+
+            m = item_re.match(buf)
+            if m:
+                art = m.group("art").strip()
+                desc = m.group("desc").strip()
+                price = _parse_money(m.group("price"))
+                # Vi tar enhetspris som Konkurrent Pris (det er det matcheren forventer)
+                rows.append({
+                    "Konkurrent Navn": "",
+                    "Konkurrent Art.Nr": art,
+                    "Konkurrent Item Description": desc,
+                    "Konkurrent Specification": "",
+                    "Konkurrent Pris": price,
+                })
+            i += 1
+            continue
+
+        i += 1
+
+    if rows:
+        return rows
+
+    # ------------------------------------------------------------
+    # 2) Fallback: veldig enkel heuristikk (kun hvis vi fant 0 varer)
+    # ------------------------------------------------------------
+    # NB: Denne kan ta med støy - derfor brukes den kun som siste utvei.
     def parse_numbers_from_line(l: str):
-        # finner tall med komma/punktum
         nums = re.findall(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", l)
-        # rens
         clean = []
         for n in nums:
             n2 = n.replace("\u00a0", " ").replace(" ", "").replace(",", ".")
@@ -442,17 +550,13 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 pass
         return clean
 
-    for l in lines[start_idx:]:
-        ll = l.lower()
-        if any(x in ll for x in ["sum", "total", "mva", "å betale", "beløp å betale"]):
+    buf_desc = ""
+    for l in lines:
+        if _is_noise(l):
             continue
-
         nums = parse_numbers_from_line(l)
-        # typisk: ... antall enhpris beløp ...
         if len(nums) >= 2:
-            # ta de to siste som (enhpris, beløp) eller (antall, pris). Vi bruker første plausible som enhetspris.
-            # Vi prioriterer "enhetspris" = nest siste, ellers siste.
-            unit_price = nums[-2] if len(nums) >= 2 else nums[-1]
+            unit_price = nums[-2]
             desc = buf_desc.strip() or re.sub(r"\d{1,3}(?:[ \u00a0]?\d{3})*(?:[\.,]\d+)?", "", l).strip()
             if len(desc) >= 3:
                 rows.append({
@@ -464,8 +568,6 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 })
                 buf_desc = ""
                 continue
-
-        # ellers: bygg opp beskrivelse over flere linjer
         if len(l) >= 3 and not re.match(r"^\d+$", l):
             buf_desc = (buf_desc + " " + l).strip()
 
@@ -592,7 +694,11 @@ def load_catalog_from_disk() -> None:
     art_col_full = _find_col(df_full, "Artikkelnummer", "Art.nr", "Art nr", "Article Number", "Item NO", "Item No")
 
     if not art_col_lk or not art_col_full:
-        raise ValueError("Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No).")
+        err = "Finner ikke artikkelnummer-kolonne i ett av arkene (trenger f.eks. Artikkelnummer / Art.nr / Item No)."
+        logger.error(err)
+        CATALOG_BUNDLE = None
+        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": err})
+        return
 
     if not lk_price_col:
         logger.warning("Fant ikke 'Pris Etter Rabatt' i LK-arket. Priser fra LK kan bli tomme.")
@@ -622,8 +728,15 @@ def load_catalog_from_disk() -> None:
         price_lookup[art] = {"price": float(p), "source": "lk"}
 
     # Ikke bygg embeddings ved startup
-    lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
-    full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
+    try:
+        lk_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=lk_sheet)
+        full_cat = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=False, sheet_name=full_sheet)
+    except Exception as e:
+        # Viktig: appen skal ikke dø på startup hvis katalogen er tom/feilformatert.
+        logger.error(f"Kunne ikke laste katalog ved oppstart: {e}")
+        CATALOG_BUNDLE = None
+        EMBEDDINGS_STATUS.update({"state": "error", "started_at": None, "finished_at": None, "error": str(e)})
+        return
 
     CATALOG_BUNDLE = LegekontorCatalogBundle(lk_catalog=lk_cat, full_catalog=full_cat, price_lookup=price_lookup)
 
@@ -678,36 +791,6 @@ OUTPUT_COLUMNS_LK = [
     "Pris per enhet",
 ]
 
-def _read_input_to_dataframe(*, content: bytes, input_filename: str) -> pd.DataFrame:
-    """
-    Leser inputfil til DataFrame.
-    - .xlsx -> pd.read_excel
-    - .pdf -> PDF tekst (inkl. OCR fallback) -> heuristisk parsing til rader
-    """
-    name = (input_filename or "").lower().strip()
-    is_pdf = name.endswith(".pdf") or content[:4] == b"%PDF"
-    if is_pdf:
-        text = _extract_text_from_pdf(content)
-        rows = _parse_invoice_text_heuristic(text)
-        df = pd.DataFrame(rows)
-        if df.empty:
-            # Gi mer hjelpsom feilmelding
-            raise ValueError("Fant ingen varelinjer i PDF. Hvis PDF er skannet bilde, må OCR være aktivert (tesseract-ocr i Dockerfile).")
-        return df
-
-    # Default: Excel
-    try:
-        return pd.read_excel(BytesIO(content), engine="openpyxl")
-    except Exception as e:
-        # Hvis bruker lastet opp feil filtype (f.eks. PDF) men uten .pdf i navn
-        if content[:4] == b"%PDF":
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            df = pd.DataFrame(rows)
-            if not df.empty:
-                return df
-        raise
-
 def match_excel(
     bundle: LegekontorCatalogBundle,
     content: bytes,
@@ -716,7 +799,7 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    df_in = _read_input_to_dataframe(content=content, input_filename=input_filename)
+    df_in = pd.read_excel(BytesIO(content), engine='openpyxl')
     total = len(df_in)
 
     # ensure input cols exist
@@ -888,7 +971,7 @@ INDEX_HTML = """
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
           <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
         </div>
-        <input id="input" type="file" accept=".xlsx,.pdf"/>
+        <input id="input" type="file" accept=".xlsx,.pdf" multiple/>
         <button id="btnMatch" disabled>Start matching</button>
         <button id="btnCancel" disabled class="secondary">Avbryt</button>
         <div id="matchStatus" class="muted"></div>
@@ -961,7 +1044,7 @@ async function uploadCatalog() {
   document.getElementById("catStatus").textContent = "Laster opp katalog...";
 
   const fd = new FormData();
-  fd.append("file", file);
+  files.forEach(f => fd.append("files", f));
 
   const resp = await fetch("/upload_catalog", { method: "POST", body: fd });
   const data = await resp.json().catch(() => ({}));
@@ -977,8 +1060,8 @@ async function uploadCatalog() {
 }
 
 async function startMatch() {
-  const file = document.getElementById("input").files[0];
-  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
+  const files = Array.from(document.getElementById("input").files || []);
+  if (!files.length) return alert("Velg en eller flere inputfiler (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
@@ -986,7 +1069,7 @@ async function startMatch() {
   document.getElementById("bar").style.width = "1%";
 
   const fd = new FormData();
-  fd.append("file", file);
+  files.forEach(f => fd.append("files", f));
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
@@ -1093,7 +1176,7 @@ loadHistory();
 
 
 @app.get("/static/logo.png")
-def static_logo():
+def static_logo(_ok: bool = Depends(verify_basic_auth)):
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -1107,7 +1190,7 @@ def static_logo():
 # ROUTES
 # ============================================================
 @app.get("/template")
-def template():
+def template(_ok: bool = Depends(verify_basic_auth)):
     xlsx = generate_input_template_bytes()
     return StreamingResponse(
         BytesIO(xlsx),
@@ -1117,7 +1200,7 @@ def template():
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(_ok: bool = Depends(verify_basic_auth)):
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
@@ -1125,7 +1208,7 @@ def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
 
 
 @app.get("/catalog_status")
-def catalog_status():
+def catalog_status(_ok: bool = Depends(verify_basic_auth)):
     meta = catalog_meta()
     meta["exists"] = CATALOG_PATH.exists()
     meta["loaded"] = CATALOG_BUNDLE is not None
@@ -1137,20 +1220,6 @@ def catalog_status():
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
-    filename = (file.filename or "input").lower()
-    if filename.endswith('.pdf'):
-        try:
-            text = _extract_text_from_pdf(content)
-            rows = _parse_invoice_text_heuristic(text)
-            if not rows:
-                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
-            df = pd.DataFrame(rows)
-            buf = BytesIO()
-            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-                df.to_excel(writer, index=False, sheet_name="Input")
-            content = buf.getvalue()
-        except Exception as e:
-            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
     filename = (file.filename or "").lower()
     if not filename.endswith(".xlsx"):
         return JSONResponse({"error": "Katalog må være .xlsx"}, status_code=400)
@@ -1171,11 +1240,50 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")):
+async def match(files: list[UploadFile] = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
-    content = await file.read()
+    dfs = []
+
+    # Les alle filer og bygg én samlet input-tabell
+    for f in (files or []):
+        content = await f.read()
+        filename = (f.filename or "input").lower()
+
+        if filename.endswith(".pdf"):
+            try:
+                text_pdf = _extract_text_from_pdf(content)
+                rows = _parse_invoice_text_heuristic(text_pdf)
+                if not rows:
+                    return JSONResponse(
+                        {"error": f"Fant ingen varelinjer i PDF: {f.filename}. Hvis dette er en skannet PDF uten tekstlag, må den OCR'es eller eksporteres som 'searchable PDF'."},
+                        status_code=400,
+                    )
+                df = pd.DataFrame(rows)
+            except Exception as e:
+                return JSONResponse({"error": f"Kunne ikke lese PDF {f.filename}: {e}"}, status_code=400)
+        else:
+            # Excel input
+            try:
+                df = pd.read_excel(BytesIO(content))
+            except Exception as e:
+                return JSONResponse({"error": f"Kunne ikke lese Excel {f.filename}: {e}"}, status_code=400)
+
+        # Spor kildefil i output for sporbarhet
+        if "SourceFile" not in df.columns:
+            df.insert(0, "SourceFile", f.filename or "input")
+        dfs.append(df)
+
+    if not dfs:
+        return JSONResponse({"error": "Ingen filer mottatt"}, status_code=400)
+
+    merged_df = pd.concat(dfs, ignore_index=True)
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        merged_df.to_excel(writer, index=False, sheet_name="Input")
+    content = buf.getvalue()
+
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1192,7 +1300,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1202,7 +1310,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": ", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx",
     })
 
     def progress(p: float):
@@ -1219,7 +1327,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(file.filename or "input.xlsx"),
+                input_filename=(", ".join([f.filename or "input" for f in (files or [])]) or "input.xlsx"),
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,
@@ -1279,7 +1387,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
 
 
 @app.post("/cancel/{task_id}")
-def cancel(task_id: str):
+def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return JSONResponse({"error": "Ukjent task_id"}, status_code=404)
@@ -1307,7 +1415,7 @@ def cancel(task_id: str):
 
 
 @app.get("/progress/{task_id}")
-def progress(task_id: str):
+def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
@@ -1320,7 +1428,7 @@ def progress(task_id: str):
 
 
 @app.get("/download/{task_id}")
-def download(task_id: str):
+def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     path = RESULTS_DIR / f"{task_id}.xlsx"
     if not path.exists():
         return JSONResponse({"error": "Fil finnes ikke"}, status_code=404)
@@ -1341,5 +1449,5 @@ def download(task_id: str):
 
 
 @app.get("/history")
-def history(limit: int = 200):
+def history(limit: int = 200, _ok: bool = Depends(verify_basic_auth)):
     return {"jobs": load_jobs(limit=limit)}
