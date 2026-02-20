@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import uuid
+import base64
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -117,7 +118,50 @@ def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security
         raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
     return True
 
-# (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
+# # ============================================================
+# AUTH MIDDLEWARE
+# Hvis BASIC_AUTH_USER/PASS er satt, låses hele løsningen bak passord.
+# Unntak: /health (for Render), samt API-dokumentasjon.
+# ============================================================
+
+def _basic_auth_challenge():
+    # 401 with browser login prompt
+    return JSONResponse(
+        status_code=401,
+        content={"detail": "Unauthorized"},
+        headers={"WWW-Authenticate": "Basic"},
+    )
+
+def _is_path_public(path: str) -> bool:
+    if path in ("/health",):
+        return True
+    # FastAPI docs / OpenAPI
+    if path.startswith("/docs") or path.startswith("/redoc") or path.startswith("/openapi.json"):
+        return True
+    return False
+
+def _validate_basic_auth_header(auth_header: str) -> bool:
+    try:
+        scheme, b64 = auth_header.split(" ", 1)
+        if scheme.lower() != "basic":
+            return False
+        raw = base64.b64decode(b64.strip()).decode("utf-8")
+        username, password = raw.split(":", 1)
+        return secrets.compare_digest(username, BASIC_AUTH_USER) and secrets.compare_digest(password, BASIC_AUTH_PASS)
+    except Exception:
+        return False
+
+@app.middleware("http")
+async def require_basic_auth_middleware(request: Request, call_next):
+    if _auth_enabled() and not _is_path_public(request.url.path):
+        auth_header = request.headers.get("authorization") or ""
+        if not auth_header or not _validate_basic_auth_header(auth_header):
+            return _basic_auth_challenge()
+    return await call_next(request)
+
+@app.get("/health")
+def health():
+    return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
