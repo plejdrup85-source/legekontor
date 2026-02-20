@@ -4,6 +4,7 @@ import os
 import re
 import threading
 import uuid
+import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
@@ -338,6 +339,14 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
             parts.append(t)
     return "\n".join(parts)
 
+
+def _is_pdf_bytes(b: bytes) -> bool:
+    return bool(b) and b[:4] == b"%PDF"
+
+def _is_xlsx_bytes(b: bytes) -> bool:
+    # XLSX is a ZIP container -> starts with PK
+    return bool(b) and b[:2] == b"PK"
+
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
 
@@ -376,6 +385,76 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
         ])
 
     # -----------------------------
+
+    # -----------------------------
+    # 0) Epion-spesifikk parser
+    # -----------------------------
+    if "epion" in low:
+        rows: List[Dict[str, Any]] = []
+
+        # Finn header-linje for varetabellen
+        start = 0
+        for i, l in enumerate(lines):
+            ll = l.lower()
+            if ("beskrivelse" in ll and "antall" in ll) or ("enh.pris" in ll and "beløp" in ll):
+                start = i + 1
+                break
+
+        item_re = re.compile(
+            r"^(?P<desc>.+?)\s+"
+            r"(?P<qty>\d+)\s+"
+            r"(?P<unit>\d[\d\.\s]*,\d{2})\s+"
+            r"(?P<amount_ex>\d[\d\.\s]*,\d{2})\s+"
+            r"(?P<mva>\d[\d\.\s]*,\d{2})\s+"
+            r"(?P<amount_inc>\d[\d\.\s]*,\d{2})\s*$"
+        )
+
+        buf_parts: List[str] = []
+
+        def _skip_line_epion(ll: str) -> bool:
+            return any(k in ll for k in [
+                "faktura", "fakturadato", "fakturanr", "kundenr", "forfallsdato", "kontonummer",
+                "kid", "betales", "betaling", "sum", "mva", "ordrenummer", "ordredato", "leveringsdato",
+                "leveringsadresse"
+            ])
+
+        for l in lines[start:]:
+            ll = l.lower()
+            if _skip_line_epion(ll):
+                continue
+
+            m2 = item_re.match(l)
+            if not m2:
+                # del av beskrivelse som er linjeskiftet i PDF
+                if len(l) >= 2:
+                    buf_parts.append(l)
+                continue
+
+            desc_core = (m2.group("desc") or "").strip()
+            qty = _to_float(m2.group("qty")) or 0.0
+            unit_price = _parse_money_local(m2.group("unit"))
+
+            # Kombiner evt buffer + desc
+            desc = " ".join([p.strip() for p in (buf_parts + [desc_core]) if p.strip()]).strip()
+            buf_parts = []
+
+            # Filter: ikke ta med frakt-linje / tomme beskrivelser
+            if not desc or desc.lower().startswith("frakt"):
+                continue
+
+            rows.append({
+                "Konkurrent Navn": "Epion",
+                "Konkurrent Art.Nr": "",
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Antall": qty if qty else "",
+                "Konkurrent salgsenhet": "",
+                "Konkurrent Pris": unit_price if unit_price is not None else "",
+            })
+
+        if rows:
+            return rows
+
     # 1) NorEngros-spesifikk parser
     # -----------------------------
     if "norengros" in low:
@@ -723,7 +802,15 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    df_in = pd.read_excel(BytesIO(content), engine='openpyxl')
+    try:
+        df_in = pd.read_excel(BytesIO(content), engine='openpyxl')
+    except zipfile.BadZipFile:
+        # Typisk når brukeren har lastet opp PDF/annen fil som ikke er XLSX
+        if _is_pdf_bytes(content):
+            raise ValueError("Input ser ut som PDF, men ble forsøkt lest som Excel. Last opp PDF i match (støttes) eller konverter til .xlsx.")
+        raise
+    except Exception as e:
+        raise ValueError(f"Kunne ikke lese input som Excel (.xlsx): {e}")
     total = len(df_in)
 
     # ensure input cols exist
@@ -1100,7 +1187,7 @@ loadHistory();
 
 
 @app.get("/static/logo.png")
-def static_logo():
+def static_logo(_ok: bool = Depends(verify_basic_auth)):
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -1114,7 +1201,7 @@ def static_logo():
 # ROUTES
 # ============================================================
 @app.get("/template")
-def template():
+def template(_ok: bool = Depends(verify_basic_auth)):
     xlsx = generate_input_template_bytes()
     return StreamingResponse(
         BytesIO(xlsx),
@@ -1124,7 +1211,7 @@ def template():
 
 
 @app.get("/", response_class=HTMLResponse)
-def index():
+def index(_ok: bool = Depends(verify_basic_auth)):
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
@@ -1132,7 +1219,7 @@ def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
 
 
 @app.get("/catalog_status")
-def catalog_status():
+def catalog_status(_ok: bool = Depends(verify_basic_auth)):
     meta = catalog_meta()
     meta["exists"] = CATALOG_PATH.exists()
     meta["loaded"] = CATALOG_BUNDLE is not None
@@ -1144,6 +1231,30 @@ def catalog_status():
 async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
     global CATALOG_BUNDLE
     content = await file.read()
+
+    # Sniff filtype (noen ganger kan fil-extensions være feil)
+    input_is_pdf = _is_pdf_bytes(content) or (file.filename or "").lower().endswith(".pdf")
+    input_is_xlsx = _is_xlsx_bytes(content) or (file.filename or "").lower().endswith(".xlsx")
+
+    # Hvis PDF: parse til input-DataFrame og lag en intern xlsx-bytes
+    if input_is_pdf:
+        try:
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            if not rows:
+                return JSONResponse({"error": "Fant ingen varelinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es."}, status_code=400)
+            df = pd.DataFrame(rows)
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name="Input")
+            content = buf.getvalue()
+            input_filename = re.sub(r"\.pdf$", ".xlsx", (file.filename or "input.pdf"), flags=re.IGNORECASE)
+        except Exception as e:
+            return JSONResponse({"error": f"Kunne ikke lese PDF: {e}"}, status_code=400)
+    else:
+        if not input_is_xlsx:
+            return JSONResponse({"error": "Ugyldig filformat. Last opp .xlsx (Excel) eller .pdf (faktura)."}, status_code=400)
+        input_filename = file.filename or "input.xlsx"
     filename = (file.filename or "input").lower()
     if filename.endswith('.pdf'):
         try:
@@ -1178,7 +1289,7 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")):
+async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
@@ -1199,7 +1310,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": input_filename,
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1209,7 +1320,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": file.filename or "input.xlsx",
+        "input_filename": input_filename,
     })
 
     def progress(p: float):
@@ -1226,7 +1337,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(file.filename or "input.xlsx"),
+                input_filename=input_filename,
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,
@@ -1286,7 +1397,7 @@ async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")
 
 
 @app.post("/cancel/{task_id}")
-def cancel(task_id: str):
+def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return JSONResponse({"error": "Ukjent task_id"}, status_code=404)
@@ -1314,7 +1425,7 @@ def cancel(task_id: str):
 
 
 @app.get("/progress/{task_id}")
-def progress(task_id: str):
+def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
@@ -1327,7 +1438,7 @@ def progress(task_id: str):
 
 
 @app.get("/download/{task_id}")
-def download(task_id: str):
+def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
     path = RESULTS_DIR / f"{task_id}.xlsx"
     if not path.exists():
         return JSONResponse({"error": "Fil finnes ikke"}, status_code=404)
@@ -1348,5 +1459,5 @@ def download(task_id: str):
 
 
 @app.get("/history")
-def history(limit: int = 200):
+def history(limit: int = 200, _ok: bool = Depends(verify_basic_auth)):
     return {"jobs": load_jobs(limit=limit)}
