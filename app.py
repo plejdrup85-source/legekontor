@@ -326,52 +326,17 @@ def embeddings_meta() -> Dict[str, Any]:
 # ============================================================
 # PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
 # ============================================================
-def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 5) -> str:
-    """OCR fallback for scanned PDFs (no text layer).
-
-    Tries PyMuPDF first (fast, no poppler needed for rendering). Falls back to pdf2image if available.
-    """
-    text_parts: List[str] = []
-
-    # 1) PyMuPDF rendering
-    try:
-        import fitz  # PyMuPDF
-        from PIL import Image
-        import pytesseract
-
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        n = min(len(doc), max_pages)
-        for i in range(n):
-            page = doc.load_page(i)
-            pix = page.get_pixmap(dpi=200)
-            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            t = pytesseract.image_to_string(img, lang=os.getenv("TESSERACT_LANG", "nor+eng"))
-            if t:
-                text_parts.append(t)
-        doc.close()
-        return "\n".join(text_parts).strip()
-    except Exception:
-        pass
-
-    # 2) pdf2image rendering (requires poppler-utils)
-    try:
-        from pdf2image import convert_from_bytes
-        import pytesseract
-        imgs = convert_from_bytes(pdf_bytes, dpi=200, first_page=1, last_page=max_pages)
-        for img in imgs:
-            t = pytesseract.image_to_string(img, lang=os.getenv("TESSERACT_LANG", "nor+eng"))
-            if t:
-                text_parts.append(t)
-        return "\n".join(text_parts).strip()
-    except Exception:
-        return ""
-
 
 def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    # First: try to extract embedded text layer
+    """Trekk tekst fra PDF.
+    1) Prøv innebygd tekstlag (pypdf)
+    2) Hvis nesten tomt: OCR fallback (pytesseract) via PyMuPDF/pdf2image hvis tilgjengelig
+    """
+    # 1) vanlig tekstuttrekk
+    text = ""
     try:
         reader = PdfReader(BytesIO(pdf_bytes))
-        parts = []
+        parts: List[str] = []
         for p in reader.pages:
             try:
                 t = p.extract_text() or ""
@@ -383,13 +348,56 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
     except Exception:
         text = ""
 
-    # If almost no text -> OCR fallback
-    if len(text) < 50:
-        ocr_text = _ocr_pdf_to_text(pdf_bytes, max_pages=int(os.getenv("OCR_MAX_PAGES", "5")))
-        if ocr_text:
-            return ocr_text
-    return text
+    # 2) OCR fallback hvis lite tekst
+    if len(text) >= 50:
+        return text
 
+    return _ocr_pdf_to_text(pdf_bytes) or text
+
+
+def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
+    """OCR PDF til tekst. Returnerer tom streng hvis deps mangler."""
+    try:
+        import pytesseract  # type: ignore
+        from PIL import Image  # type: ignore
+    except Exception:
+        return ""
+
+    pages_images = []
+    # Prøv PyMuPDF først (rask og robust)
+    try:
+        import fitz  # PyMuPDF type: ignore
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for page in doc:
+            pix = page.get_pixmap(dpi=200)
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            pages_images.append(img)
+    except Exception:
+        pages_images = []
+
+    # Fallback: pdf2image (krever poppler)
+    if not pages_images:
+        try:
+            from pdf2image import convert_from_bytes  # type: ignore
+
+            pages_images = convert_from_bytes(pdf_bytes, dpi=200)
+        except Exception:
+            pages_images = []
+
+    if not pages_images:
+        return ""
+
+    parts: List[str] = []
+    for img in pages_images[:25]:  # safety cap
+        try:
+            t = pytesseract.image_to_string(img, lang="eng+nor") or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            parts.append(t.strip())
+
+    return "\n\n".join(parts).strip()
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
     Heuristikk: plukker ut varelinjer med beløp/pris. Epion/NorEngros-lignende tabeller støttes best-effort.
@@ -617,11 +625,20 @@ def load_catalog_from_disk() -> None:
 
 @app.on_event("startup")
 def startup_event():
-    load_catalog_from_disk()
+    try:
+        load_catalog_from_disk()
+    except Exception as e:
+        logger.error(f"Startup: kunne ikke laste katalog fra disk (starter likevel): {e}")
+        # sørg for at appen starter selv om katalog er ugyldig
+        global CATALOG_BUNDLE
+        CATALOG_BUNDLE = None
+        try:
+            EMBEDDINGS_STATUS["state"] = "error"
+            EMBEDDINGS_STATUS["message"] = str(e)
+        except Exception:
+            pass
     threading.Thread(target=_watchdog_loop, daemon=True).start()
-    logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
-
-
+    logger.info("Startup complete. Ready to accept requests.")
 # ============================================================
 # COMPETITOR REGISTER
 # ============================================================
@@ -913,7 +930,7 @@ async function uploadCatalog() {
   document.getElementById("catStatus").textContent = "Laster opp katalog...";
 
   const fd = new FormData();
-  files.forEach(f => fd.append("files", f));
+  fd.append("file", file);
 
   const resp = await fetch("/upload_catalog", { method: "POST", body: fd });
   const data = await resp.json().catch(() => ({}));
@@ -929,8 +946,8 @@ async function uploadCatalog() {
 }
 
 async function startMatch() {
-  const files = Array.from(document.getElementById("input").files || []);
-  if (!files.length) return alert("Velg en eller flere inputfiler (.xlsx eller .pdf)");
+  const file = document.getElementById("input").files[0];
+  if (!file) return alert("Velg en inputfil (.xlsx eller .pdf)");
 
   document.getElementById("matchStatus").textContent = "Starter matching...";
   document.getElementById("btnCancel").disabled = false;
@@ -938,7 +955,7 @@ async function startMatch() {
   document.getElementById("bar").style.width = "1%";
 
   const fd = new FormData();
-  files.forEach(f => fd.append("files", f));
+  fd.append("file", file);
   const pref = document.querySelector("input[name=prefer]:checked");
   fd.append("prefer_own_brands", pref ? pref.value : "1");
 
@@ -1123,65 +1140,11 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/match")
-async def match(files: List[UploadFile] = File(...), prefer_own_brands: str = Form("1"), _ok: bool = Depends(verify_basic_auth)):
+async def match(file: UploadFile = File(...), prefer_own_brands: str = Form("1")):
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
-    # Read & merge multiple input files into one Input-sheet
-    def _xlsx_bytes_from_df(df: pd.DataFrame) -> bytes:
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="Input")
-        return buf.getvalue()
-
-    def _read_excel_to_df(b: bytes) -> pd.DataFrame:
-        bio = BytesIO(b)
-        obj = pd.read_excel(bio, sheet_name=None)
-        if isinstance(obj, dict):
-            if "Input" in obj:
-                return obj["Input"]
-            first = next(iter(obj.values()))
-            return first
-        return obj  # type: ignore
-
-    merged_rows: List[pd.DataFrame] = []
-    source_names: List[str] = []
-
-    for f in files:
-        fname = (f.filename or "input").strip()
-        source_names.append(fname)
-        b = await f.read()
-
-        lower = fname.lower()
-        if lower.endswith(".pdf"):
-            try:
-                text = _extract_text_from_pdf(b)
-                rows = _parse_invoice_text_heuristic(text)
-                if not rows:
-                    return JSONResponse({"error": f"Fant ingen varelinjer i PDF ({fname}). Hvis dette er en skannet PDF uten tekstlag må OCR være tilgjengelig."}, status_code=400)
-                df = pd.DataFrame(rows)
-            except Exception as e:
-                return JSONResponse({"error": f"Kunne ikke lese PDF ({fname}): {e}"}, status_code=400)
-        elif lower.endswith(".xlsx"):
-            try:
-                df = _read_excel_to_df(b)
-            except Exception as e:
-                return JSONResponse({"error": f"Kunne ikke lese Excel ({fname}): {e}"}, status_code=400)
-        else:
-            return JSONResponse({"error": f"Ugyldig filtype: {fname} (kun .xlsx eller .pdf)"}, status_code=400)
-
-        if "SourceFile" not in df.columns:
-            df.insert(0, "SourceFile", fname)
-        merged_rows.append(df)
-
-    if not merged_rows:
-        return JSONResponse({"error": "Ingen filer mottatt"}, status_code=400)
-
-    merged_df = pd.concat(merged_rows, ignore_index=True)
-    content = _xlsx_bytes_from_df(merged_df)
-    input_filename = " + ".join(source_names)
-
-
+    content = await file.read()
     task_id = uuid.uuid4().hex
     output_path = RESULTS_DIR / f"{task_id}.xlsx"
 
@@ -1198,7 +1161,7 @@ async def match(files: List[UploadFile] = File(...), prefer_own_brands: str = Fo
         "created_at": now_iso,
         "started_at": now_iso,
         "finished_at": None,
-        "input_filename": input_filename or "input.xlsx",
+        "input_filename": file.filename or "input.xlsx",
         "rows_out": None,
         "last_progress_ts": now_ts,
         "started_ts": now_ts,
@@ -1208,7 +1171,7 @@ async def match(files: List[UploadFile] = File(...), prefer_own_brands: str = Fo
         "task_id": task_id,
         "created_at": now_iso,
         "status": "running",
-        "input_filename": input_filename or "input.xlsx",
+        "input_filename": file.filename or "input.xlsx",
     })
 
     def progress(p: float):
@@ -1225,7 +1188,7 @@ async def match(files: List[UploadFile] = File(...), prefer_own_brands: str = Fo
             out_xlsx, meta = match_excel(
                 bundle=CATALOG_BUNDLE,
                 content=content,
-                input_filename=(input_filename or "input.xlsx"),
+                input_filename=(file.filename or "input.xlsx"),
                 progress_cb=progress,
                 cancel_event=cancel_event,
                 prefer_own_brands=prefer,

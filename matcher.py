@@ -258,6 +258,15 @@ def _alc_bonus(item: "_CatalogItem") -> float:
 
 
 
+def _norm_key(s: str) -> str:
+    """Normaliser kolonnenavn for robust matching."""
+    s = (s or "").strip().lower()
+    # Bytt ut vanlige skilletegn med mellomrom
+    s = re.sub(r"[\u00a0\t\r\n]+", " ", s)
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def _norm(s: Any) -> str:
     if s is None:
         return ""
@@ -895,150 +904,103 @@ def _fill_catalog_fields(out_row: Dict[str, Any], best: Optional[_CatalogItem]) 
     out_row["Katalog: ALC"] = _norm(cat.get("Katalog: ALC", cat.get("ALC", cat.get("alc", cat.get("Alc", "")))))
 
 
-def _safe_str_cell(v) -> str:
-    """Convert excel cell values to string without turning 123.0 into '1230'."""
-    if v is None:
-        return ""
-    try:
-        import numpy as _np  # type: ignore
-        if isinstance(v, (_np.integer,)):
-            return str(int(v))
-        if isinstance(v, (_np.floating,)):
-            fv = float(v)
-            return str(int(fv)) if fv.is_integer() else str(fv)
-    except Exception:
-        pass
-    if isinstance(v, bool):
-        return "1" if v else "0"
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        return str(int(v)) if v.is_integer() else str(v)
-    return str(v)
 
-
-def _load_catalog_excel(path: str, sheet_name: Optional[str] = None) -> List[_CatalogItem]:
-    """Load catalog from Excel.
-
-    Accepts an optional sheet_name. If None, uses the first sheet.
-    Tries to detect the article number column across common variants.
+def _load_catalog_excel(path: str, sheet_name: str | int | None = None, **_kwargs) -> List[_CatalogItem]:
+    """Les katalog fra Excel og bygg items.
+    - sheet_name: valgfritt; hvis None leses første ark.
+    - **_kwargs: ignoreres for bakoverkompatibilitet.
     """
-    # Read excel
+    # Pandas: sheet_name=None => dict av ark; vi vil ha første ark i så fall
     try:
-        cat = pd.read_excel(path, sheet_name=sheet_name if sheet_name else 0)
-    except ValueError:
-        # sheet not found -> fall back to first
-        cat = pd.read_excel(path, sheet_name=0)
+        cat_obj = pd.read_excel(path, sheet_name=sheet_name, engine="openpyxl")
+    except TypeError:
+        # engine kan feile i noen miljø; prøv uten
+        cat_obj = pd.read_excel(path, sheet_name=sheet_name)
 
-    # Normalize columns -> internal names
-    rename_map: Dict[str, str] = {}
+    if isinstance(cat_obj, dict):
+        # velg første ark hvis sheet_name=None
+        if not cat_obj:
+            raise ValueError("Katalogfila inneholder ingen ark.")
+        cat = next(iter(cat_obj.values()))
+    else:
+        cat = cat_obj
 
-    # Artikkelnummer candidates (wide net)
-    artnr_candidates = [
-        "Katalog: Artikkelnummer",
-        "Artikkelnummer",
-        "Art.nr",
-        "Art nr",
-        "Artnr",
-        "Artikkelnr",
-        "Artikkel nr",
-        "Artikelnummer",
-        "Artikel nr",
-        "Article Number",
-        "Article No",
-        "Item No",
-        "Item number",
-        "Item Number",
-        "ItemNo",
-        "Product Number",
-        "Produktnr",
-        "Produkt nr",
-        "Varenr",
-        "Vare nr",
-        "Var nr",
-        "ItemID",
-        "Item ID",
-        "SKU",
-    ]
-    if "Katalog: Artikkelnummer" not in cat.columns:
-        # try exact / contains match
-        col = None
-        cols = list(cat.columns)
-        norm_map = {_norm_key(str(c)): str(c) for c in cols}
-        for cand in artnr_candidates:
-            k = _norm_key(cand)
-            if k in norm_map:
-                col = norm_map[k]
+    if cat is None or getattr(cat, "empty", False):
+        raise ValueError("Katalogfila ga 0 rader.")
+
+    # Bygg normert kolonnenavn-mapping
+    cols = list(cat.columns)
+    norm_map = {_norm_key(str(c)): str(c) for c in cols}
+
+    def pick_col(candidates: List[str]) -> str | None:
+        for cand in candidates:
+            key = _norm_key(cand)
+            if key in norm_map:
+                return norm_map[key]
+        return None
+
+    # Finn artikkelnummer-kolonne robust
+    art_col = pick_col([
+        "Katalog: Artikkelnummer", "Artikkelnummer", "Art.nr", "Art nr", "Artikkel nr",
+        "Varenr", "Varenummer", "Produktnr", "Produkt nr", "Item NO", "Item No", "ItemNo",
+        "Article Number", "SKU", "SkU", "Item number"
+    ])
+    if not art_col:
+        # fallback: prøv å finne noe som inneholder art/varenr/itemno
+        for c in cols:
+            nk = _norm_key(str(c))
+            if any(tok in nk for tok in ["art", "varenr", "varenummer", "item no", "itemno", "sku", "article number", "produktnr"]):
+                art_col = str(c)
                 break
-        if col is None:
-            for cand in artnr_candidates:
-                k = _norm_key(cand)
-                for nk, orig in norm_map.items():
-                    if k and k in nk:
-                        col = orig
-                        break
-                if col:
-                    break
-        if col:
-            rename_map[str(col)] = "Katalog: Artikkelnummer"
 
-    # Standardfelter
-    if "Item Description" in cat.columns and "Katalog: Item Description" not in cat.columns:
-        rename_map["Item Description"] = "Katalog: Item Description"
-    if "Specification" in cat.columns and "Katalog: Specification" not in cat.columns:
-        rename_map["Specification"] = "Katalog: Specification"
-    if "Producer Name" in cat.columns and "Katalog: Producer Name" not in cat.columns:
-        rename_map["Producer Name"] = "Katalog: Producer Name"
-    if "Producer Item Number" in cat.columns and "Katalog: Producer Item Number" not in cat.columns:
-        rename_map["Producer Item Number"] = "Katalog: Producer Item Number"
-    if "Procuser Item Number" in cat.columns and "Katalog: Producer Item Number" not in cat.columns:
-        rename_map["Procuser Item Number"] = "Katalog: Producer Item Number"
+    if not art_col:
+        raise ValueError("Fant ikke kolonne for artikkelnummer (Art.nr / Artikkelnummer / Varenr / Item No).")
 
-    # Nye felt
-    if "Storage instruction" in cat.columns and "Katalog: Storage instruction" not in cat.columns:
-        rename_map["Storage instruction"] = "Katalog: Storage instruction"
-    if "Storage Instruction" in cat.columns and "Katalog: Storage instruction" not in cat.columns:
-        rename_map["Storage Instruction"] = "Katalog: Storage instruction"
+    # Standardiser navn (uten å ødelegge eksisterende 'Katalog:'-kolonner)
+    rename_map: Dict[str, str] = {}
+    if art_col != "Katalog: Artikkelnummer" and "Katalog: Artikkelnummer" not in cat.columns:
+        rename_map[art_col] = "Katalog: Artikkelnummer"
 
-    if "Item group" in cat.columns and "Katalog: Item group" not in cat.columns:
-        rename_map["Item group"] = "Katalog: Item group"
-    if "Item Group" in cat.columns and "Katalog: Item group" not in cat.columns:
-        rename_map["Item Group"] = "Katalog: Item group"
+    def map_if_exists(src_candidates: List[str], dst: str):
+        if dst in cat.columns:
+            return
+        c = pick_col([dst] + src_candidates)
+        if c and c in cat.columns:
+            rename_map[c] = dst
 
-    if "Web Title" in cat.columns and "Katalog: Web Title" not in cat.columns:
-        rename_map["Web Title"] = "Katalog: Web Title"
-    if "Web title" in cat.columns and "Katalog: Web Title" not in cat.columns:
-        rename_map["Web title"] = "Katalog: Web Title"
-
-    if "Web Text" in cat.columns and "Katalog: Web Text" not in cat.columns:
-        rename_map["Web Text"] = "Katalog: Web Text"
-    if "Web text" in cat.columns and "Katalog: Web Text" not in cat.columns:
-        rename_map["Web text"] = "Katalog: Web Text"
-
-    if "ALC" in cat.columns and "Katalog: ALC" not in cat.columns:
-        rename_map["ALC"] = "Katalog: ALC"
-    if "alc" in cat.columns and "Katalog: ALC" not in cat.columns:
-        rename_map["alc"] = "Katalog: ALC"
-    if "Alc" in cat.columns and "Katalog: ALC" not in cat.columns:
-        rename_map["Alc"] = "Katalog: ALC"
+    map_if_exists(["Item Description", "Beskrivelse", "Description", "Varetekst"], "Katalog: Item Description")
+    map_if_exists(["Specification", "Spesifikasjon", "Spec", "Produktspesifikasjon"], "Katalog: Specification")
+    map_if_exists(["Producer Name", "Produsent", "Leverandør", "Brand", "Merke"], "Katalog: Producer Name")
+    map_if_exists(["Producer Item Number", "Produsentnr", "Produsent nr", "Mpn", "MPN"], "Katalog: Producer Item Number")
+    map_if_exists(["Storage instruction", "Storage Instruction", "Lagring", "Oppbevaring"], "Katalog: Storage instruction")
+    map_if_exists(["Item group", "Item Group", "Produktgruppe", "Varegruppe"], "Katalog: Item group")
+    map_if_exists(["Web Title", "Web title", "Tittel"], "Katalog: Web Title")
+    map_if_exists(["Web Text", "Web text", "Webtekst"], "Katalog: Web Text")
+    map_if_exists(["ALC", "alc", "Alc"], "Katalog: ALC")
 
     if rename_map:
         cat = cat.rename(columns=rename_map)
 
     items: List[_CatalogItem] = []
     for _, r in cat.iterrows():
-        raw_art = r.get("Katalog: Artikkelnummer", "")
-        artnr = _norm(_safe_str_cell(raw_art))
-        if not artnr:
+        artnr_raw = r.get("Katalog: Artikkelnummer", "")
+        artnr = _norm(artnr_raw)
+
+        # håndter excel-tall som 123.0
+        if isinstance(artnr_raw, (int, float)) and not pd.isna(artnr_raw):
+            try:
+                artnr_int = int(float(artnr_raw))
+                artnr = str(artnr_int)
+            except Exception:
+                pass
+
+        if not artnr or str(artnr).lower() == "nan":
             continue
 
-        row_dict = {}
-        for k in cat.columns:
-            v = r.get(k)
-            if pd.isna(v):
-                row_dict[k] = ""
-            else:
-                row_dict[k] = v
+        row_dict = {k: ("" if pd.isna(r.get(k)) else r.get(k)) for k in cat.columns}
+        # sørg for at artnr ligger i row også
+        row_dict["Katalog: Artikkelnummer"] = artnr
+
         text = _build_candidate_text(row_dict)
         toks = _tokenize(text)
         it = _CatalogItem(artnr=artnr, row=row_dict, text=text, toks=toks)
@@ -1046,10 +1008,8 @@ def _load_catalog_excel(path: str, sheet_name: Optional[str] = None) -> List[_Ca
         items.append(it)
 
     if not items:
-        raise ValueError("Katalogfila ga 0 gyldige produkter. Sjekk at arket har en kolonne med artikkelnummer (f.eks. Art.nr / Artikkelnummer / Item No).")
+        raise ValueError("Katalogfila ga 0 gyldige produkter.")
     return items
-
-
 def _near_identical_gate(
     row: Dict[str, Any],
     top_item: _CatalogItem,
@@ -1233,7 +1193,11 @@ class Catalog:
 
     @classmethod
     def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: str | int | None = None) -> "Catalog":
-        items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
+        try:
+            items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
+        except TypeError:
+            # bakoverkompatibilitet hvis loader ikke støtter sheet_name
+            items = _load_catalog_excel(catalog_path)
         return cls(items, use_embeddings=use_embeddings)
 
     def match_row(self, row: Dict[str, Any], top_n: int = 30, prefer_own_brands: bool = True) -> Tuple[str, str, Optional[Dict[str, Any]], str]:
