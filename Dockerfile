@@ -1,31 +1,36 @@
+# Bruk offisiell Python image
 FROM python:3.11-slim
 
-WORKDIR /app
+# Unngå buffering i logs
+ENV PYTHONUNBUFFERED=1
 
-# Install minimal system deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Installer systemavhengigheter
+RUN apt-get update && apt-get install -y \
     build-essential \
     tesseract-ocr \
+    tesseract-ocr-nor \
+    tesseract-ocr-eng \
     poppler-utils \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip
-RUN pip install --no-cache-dir --upgrade pip
+# Sett arbeidsmappe
+WORKDIR /app
 
-# Install CPU-only PyTorch (NO CUDA / NVIDIA)
-RUN pip install --no-cache-dir \
-    --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.4.1
-
-# Install rest of dependencies (IMPORTANT: torch must NOT be in requirements.txt)
+# Kopier requirements først (for caching)
 COPY requirements.txt .
+
+# Installer Python-avhengigheter
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Kopier resten av applikasjonen
 COPY . .
 
-# Render expects you to bind to $PORT at runtime (often 10000)
+# Eksponer port (Render bruker 10000)
 EXPOSE 10000
 
-# Use python -m uvicorn (more robust than relying on PATH for uvicorn)
-CMD ["sh", "-c", "python -m uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Start FastAPI med uvicorn
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
