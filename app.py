@@ -326,17 +326,15 @@ def embeddings_meta() -> Dict[str, Any]:
 # ============================================================
 # PDF INPUT (FAKTURA) - enkel tekstuttrekk + linjeheuristikk
 # ============================================================
-
 def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    """Trekk tekst fra PDF.
-    1) Prøv innebygd tekstlag (pypdf)
-    2) Hvis nesten tomt: OCR fallback (pytesseract) via PyMuPDF/pdf2image hvis tilgjengelig
     """
-    # 1) vanlig tekstuttrekk
-    text = ""
+    Leser tekst fra PDF. Først forsøkes tekstlag via pypdf. Hvis det gir lite/ingen tekst,
+    prøves OCR (Tesseract) som fallback dersom avhengigheter er installert i containeren.
+    """
+    # 1) Vanlig tekstuttrekk
     try:
         reader = PdfReader(BytesIO(pdf_bytes))
-        parts: List[str] = []
+        parts = []
         for p in reader.pages:
             try:
                 t = p.extract_text() or ""
@@ -348,56 +346,68 @@ def _extract_text_from_pdf(pdf_bytes: bytes) -> str:
     except Exception:
         text = ""
 
-    # 2) OCR fallback hvis lite tekst
+    # 2) OCR fallback dersom lite tekst
     if len(text) >= 50:
         return text
 
-    return _ocr_pdf_to_text(pdf_bytes) or text
+    ocr_text = _ocr_pdf_to_text(pdf_bytes)
+    if ocr_text:
+        return ocr_text.strip()
+    return text
 
 
-def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
-    """OCR PDF til tekst. Returnerer tom streng hvis deps mangler."""
+def _ocr_pdf_to_text(pdf_bytes: bytes, max_pages: int = 6) -> str:
+    """
+    Best-effort OCR. Krever at tesseract er installert i OS og at pytesseract + Pillow finnes i requirements.
+    Prøver først PyMuPDF (fitz). Fallback til pdf2image hvis tilgjengelig.
+    """
     try:
         import pytesseract  # type: ignore
         from PIL import Image  # type: ignore
     except Exception:
         return ""
 
-    pages_images = []
-    # Prøv PyMuPDF først (rask og robust)
+    texts = []
+
+    # Try 1: PyMuPDF (fitz)
     try:
-        import fitz  # PyMuPDF type: ignore
+        import fitz  # type: ignore
 
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        for page in doc:
-            pix = page.get_pixmap(dpi=200)
+        page_count = min(len(doc), max_pages)
+        for i in range(page_count):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=220)
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            pages_images.append(img)
+            try:
+                texts.append(pytesseract.image_to_string(img, lang="nor+eng"))
+            except Exception:
+                texts.append(pytesseract.image_to_string(img))
+        doc.close()
+        out = "\n".join([t for t in texts if t and t.strip()])
+        if len(out.strip()) >= 20:
+            return out
     except Exception:
-        pages_images = []
+        pass
 
-    # Fallback: pdf2image (krever poppler)
-    if not pages_images:
-        try:
-            from pdf2image import convert_from_bytes  # type: ignore
+    # Try 2: pdf2image (poppler)
+    try:
+        from pdf2image import convert_from_bytes  # type: ignore
 
-            pages_images = convert_from_bytes(pdf_bytes, dpi=200)
-        except Exception:
-            pages_images = []
+        images = convert_from_bytes(pdf_bytes, dpi=220, first_page=1, last_page=max_pages)
+        for img in images:
+            try:
+                texts.append(pytesseract.image_to_string(img, lang="nor+eng"))
+            except Exception:
+                texts.append(pytesseract.image_to_string(img))
+        out = "\n".join([t for t in texts if t and t.strip()])
+        if len(out.strip()) >= 20:
+            return out
+    except Exception:
+        pass
 
-    if not pages_images:
-        return ""
+    return ""
 
-    parts: List[str] = []
-    for img in pages_images[:25]:  # safety cap
-        try:
-            t = pytesseract.image_to_string(img, lang="eng+nor") or ""
-        except Exception:
-            t = ""
-        if t.strip():
-            parts.append(t.strip())
-
-    return "\n\n".join(parts).strip()
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
     Heuristikk: plukker ut varelinjer med beløp/pris. Epion/NorEngros-lignende tabeller støttes best-effort.
@@ -625,20 +635,11 @@ def load_catalog_from_disk() -> None:
 
 @app.on_event("startup")
 def startup_event():
-    try:
-        load_catalog_from_disk()
-    except Exception as e:
-        logger.error(f"Startup: kunne ikke laste katalog fra disk (starter likevel): {e}")
-        # sørg for at appen starter selv om katalog er ugyldig
-        global CATALOG_BUNDLE
-        CATALOG_BUNDLE = None
-        try:
-            EMBEDDINGS_STATUS["state"] = "error"
-            EMBEDDINGS_STATUS["message"] = str(e)
-        except Exception:
-            pass
+    load_catalog_from_disk()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
-    logger.info("Startup complete. Ready to accept requests.")
+    logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
+
+
 # ============================================================
 # COMPETITOR REGISTER
 # ============================================================
@@ -677,6 +678,36 @@ OUTPUT_COLUMNS_LK = [
     "Pris per enhet",
 ]
 
+def _read_input_to_dataframe(*, content: bytes, input_filename: str) -> pd.DataFrame:
+    """
+    Leser inputfil til DataFrame.
+    - .xlsx -> pd.read_excel
+    - .pdf -> PDF tekst (inkl. OCR fallback) -> heuristisk parsing til rader
+    """
+    name = (input_filename or "").lower().strip()
+    is_pdf = name.endswith(".pdf") or content[:4] == b"%PDF"
+    if is_pdf:
+        text = _extract_text_from_pdf(content)
+        rows = _parse_invoice_text_heuristic(text)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            # Gi mer hjelpsom feilmelding
+            raise ValueError("Fant ingen varelinjer i PDF. Hvis PDF er skannet bilde, må OCR være aktivert (tesseract-ocr i Dockerfile).")
+        return df
+
+    # Default: Excel
+    try:
+        return pd.read_excel(BytesIO(content), engine="openpyxl")
+    except Exception as e:
+        # Hvis bruker lastet opp feil filtype (f.eks. PDF) men uten .pdf i navn
+        if content[:4] == b"%PDF":
+            text = _extract_text_from_pdf(content)
+            rows = _parse_invoice_text_heuristic(text)
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                return df
+        raise
+
 def match_excel(
     bundle: LegekontorCatalogBundle,
     content: bytes,
@@ -685,7 +716,7 @@ def match_excel(
     cancel_event: Optional[threading.Event] = None,
     prefer_own_brands: bool = True,
 ) -> Tuple[bytes, Dict[str, Any]]:
-    df_in = pd.read_excel(BytesIO(content), engine='openpyxl')
+    df_in = _read_input_to_dataframe(content=content, input_filename=input_filename)
     total = len(df_in)
 
     # ensure input cols exist
