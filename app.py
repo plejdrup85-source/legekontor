@@ -361,6 +361,46 @@ def _is_xlsx_bytes(b: bytes) -> bool:
     # XLSX is a ZIP container -> starts with PK
     return bool(b) and b[:2] == b"PK"
 
+
+# Minimumstekst (tegn) som kreves for at vanlig tekstuttrekk regnes som tilstrekkelig
+_OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "80"))
+_OCR_MIN_WORDS = int(os.getenv("OCR_MIN_WORDS", "15"))
+
+
+def _needs_ocr(text: str) -> bool:
+    """Returner True hvis tekstuttrekket er tomt/utilstrekkelig og OCR bør prøves."""
+    if not text or not text.strip():
+        return True
+    stripped = text.strip()
+    if len(stripped) < _OCR_MIN_CHARS:
+        return True
+    words = [w for w in re.split(r"\s+", stripped) if len(w) >= 2]
+    if len(words) < _OCR_MIN_WORDS:
+        return True
+    return False
+
+
+def _ocr_pdf_fallback(pdf_bytes: bytes) -> str:
+    """Gjør OCR på PDF-sider via PyMuPDF + pytesseract. Returnerer samlet tekst."""
+    import fitz  # PyMuPDF
+    import pytesseract
+    from PIL import Image
+    from io import BytesIO as _BytesIO
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    parts = []
+    try:
+        for page in doc:
+            mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for bedre OCR-kvalitet
+            pix = page.get_pixmap(matrix=mat)
+            img = Image.open(_BytesIO(pix.tobytes("png")))
+            t = pytesseract.image_to_string(img, lang="nor+eng")
+            if t:
+                parts.append(t)
+    finally:
+        doc.close()
+    return "\n".join(parts)
+
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
 
@@ -1292,10 +1332,16 @@ async def match(
     if is_pdf:
         try:
             text = _extract_text_from_pdf(raw)
+            if _needs_ocr(text):
+                logger.info("PDF mangler tilstrekkelig tekst – prøver OCR som fallback.")
+                try:
+                    text = _ocr_pdf_fallback(raw)
+                except Exception as ocr_err:
+                    logger.warning(f"OCR-fallback feilet: {ocr_err}")
             rows = _parse_invoice_text_heuristic(text)
             if not rows:
                 return JSONResponse(
-                    {"error": "Fant ingen produktlinjer i PDF. Hvis dette er en skannet faktura uten tekstlag, må den OCR'es først."},
+                    {"error": "Fant ingen produktlinjer i PDF. Tekstuttrekk og OCR ga ikke nok innhold til å tolke fakturaen."},
                     status_code=400,
                 )
             df = pd.DataFrame(rows)
