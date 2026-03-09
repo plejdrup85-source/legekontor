@@ -362,13 +362,11 @@ def _is_xlsx_bytes(b: bytes) -> bool:
     return bool(b) and b[:2] == b"PK"
 
 
-# Minimumstekst som kreves for at vanlig tekstuttrekk regnes som tilstrekkelig
 _OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "80"))
 _OCR_MIN_WORDS = int(os.getenv("OCR_MIN_WORDS", "15"))
 
 
 def _needs_ocr(text: str) -> bool:
-    """Returner True hvis tekstuttrekket er tomt/utilstrekkelig og OCR bor proves."""
     if not text or not text.strip():
         return True
     stripped = text.strip()
@@ -381,12 +379,10 @@ def _needs_ocr(text: str) -> bool:
 
 
 def _ocr_pdf_fallback(pdf_bytes: bytes) -> str:
-    """Gjor OCR pa PDF-sider via PyMuPDF + pytesseract. Returnerer samlet tekst."""
-    import fitz  # PyMuPDF
+    import fitz
     import pytesseract
     from PIL import Image
     from io import BytesIO as _BytesIO
-
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     parts = []
     try:
@@ -404,18 +400,18 @@ def _ocr_pdf_fallback(pdf_bytes: bytes) -> str:
 
 def _parse_invoice_with_claude(text: str) -> list:
     """
-    Bruk Claude til a trekke ut produktlinjer fra PDF-tekst.
+    Bruk Claude til å trekke ut produktlinjer fra PDF-tekst.
     Returnerer tom liste ved feil eller hvis Claude ikke er tilgjengelig.
-    Skal IKKE kalles for NorEngros (se match()) -- heuristikken beregner rabatt korrekt der.
+    Skal IKKE kalles for NorEngros -- heuristikken beregner rabatt korrekt der.
     """
-    import json as _json
-    import re as _re
     api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     if not api_key:
         return []
     try:
         import anthropic
-        client = anthropic.Anthropic(api_key=api_key, timeout=45, max_retries=1)
+        import json as _json
+        import re as _re
+        client = anthropic.Anthropic(api_key=api_key, timeout=60, max_retries=1)
         system = (
             "Du er en presis dataekstraktor for norske medisinske bestillingslister og fakturaer. "
             "Returner KUN gyldig JSON, ingen annen tekst, ingen markdown-blokker."
@@ -423,18 +419,16 @@ def _parse_invoice_with_claude(text: str) -> list:
         user = (
             "Trekk ut alle produktlinjer fra dokumentteksten nedenfor.\n\n"
             "Dokumentet kan vaere en faktura (med priser) eller en bestillingsliste (uten priser).\n"
-            "Ignorer overskrifter, adresser, summer, mva-linjer, sideinformasjon og annen stoy.\n\n"
-            "Returner et JSON-objekt med nokkel \"rows\" som inneholder en liste av objekter med:\n"
-            "- \"art\": varenummer (streng, tom hvis mangler)\n"
-            "- \"desc\": produktbeskrivelse inkl. antall/storrelse (f.eks. \"(15 STK)\")\n"
-            "- \"qty\": antall som tall (0 hvis ikke oppgitt)\n"
-            "- \"unit\": salgsenhet (f.eks. \"STK\", \"PK\", tom hvis mangler)\n"
-            "- \"price\": enhetspris som tall (0 hvis ikke oppgitt)\n\n"
-            f"Dokumenttekst:\n{text[:6000]}"
+            "Ignorer overskrifter, adresser, summer, mva-linjer, sideinformasjon og stoytekst.\n\n"
+            "Returner JSON med nokkel \"rows\" som liste av objekter med feltene:\n"
+            "art (varenr, tom hvis mangler), desc (produktbeskrivelse inkl antall/storrelse),\n"
+            "qty (antall som tall, 0 hvis mangler), unit (salgsenhet, tom hvis mangler),\n"
+            "price (enhetspris som tall, 0 hvis mangler).\n\n"
+            f"Dokumenttekst:\n{text[:12000]}"
         )
         msg = client.messages.create(
             model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
-            max_tokens=4000,
+            max_tokens=8000,
             temperature=0,
             system=system,
             messages=[{"role": "user", "content": user}],
@@ -1416,8 +1410,7 @@ async def match(
                     text = _ocr_pdf_fallback(raw)
                 except Exception as ocr_err:
                     logger.warning(f"OCR-fallback feilet: {ocr_err}")
-            # NorEngros-fakturaer: bruk alltid heuristikken direkte fordi den beregner
-            # nettopris etter rabatt. Claude brukes for alle andre dokumenttyper.
+            # NorEngros: bruk heuristikken direkte da den beregner nettopris etter rabatt
             if "norengros" in text.lower():
                 rows = _parse_invoice_text_heuristic(text)
             else:
