@@ -361,45 +361,103 @@ def _is_xlsx_bytes(b: bytes) -> bool:
     # XLSX is a ZIP container -> starts with PK
     return bool(b) and b[:2] == b"PK"
 
+def _parse_invoice_with_claude(text: str) -> List[Dict[str, Any]]:
+    """
+    Bruk Claude til å trekke ut produktlinjer fra PDF-tekst (faktura eller bestillingsliste).
+    Returnerer liste av rader i samme format som _parse_invoice_text_heuristic.
+    Returnerer tom liste ved feil eller hvis Claude ikke er tilgjengelig – da brukes heuristikk som fallback.
+    """
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return []
 
-# Minimumstekst (tegn) som kreves for at vanlig tekstuttrekk regnes som tilstrekkelig
-_OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "80"))
-_OCR_MIN_WORDS = int(os.getenv("OCR_MIN_WORDS", "15"))
-
-
-def _needs_ocr(text: str) -> bool:
-    """Returner True hvis tekstuttrekket er tomt/utilstrekkelig og OCR bør prøves."""
-    if not text or not text.strip():
-        return True
-    stripped = text.strip()
-    if len(stripped) < _OCR_MIN_CHARS:
-        return True
-    words = [w for w in re.split(r"\s+", stripped) if len(w) >= 2]
-    if len(words) < _OCR_MIN_WORDS:
-        return True
-    return False
-
-
-def _ocr_pdf_fallback(pdf_bytes: bytes) -> str:
-    """Gjør OCR på PDF-sider via PyMuPDF + pytesseract. Returnerer samlet tekst."""
-    import fitz  # PyMuPDF
-    import pytesseract
-    from PIL import Image
-    from io import BytesIO as _BytesIO
-
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
     try:
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)  # 2x zoom for bedre OCR-kvalitet
-            pix = page.get_pixmap(matrix=mat)
-            img = Image.open(_BytesIO(pix.tobytes("png")))
-            t = pytesseract.image_to_string(img, lang="nor+eng")
-            if t:
-                parts.append(t)
-    finally:
-        doc.close()
-    return "\n".join(parts)
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key, timeout=45, max_retries=1)
+
+        system = (
+            "Du er en presis dataekstraktor for norske medisinske bestillingslister og fakturaer. "
+            "Returner KUN gyldig JSON, ingen annen tekst, ingen markdown-blokker."
+        )
+
+        user = f"""Trekk ut alle produktlinjer fra dokumentteksten nedenfor.
+
+Dokumentet kan være en faktura (med priser) eller en bestillingsliste (uten priser).
+Ignorer overskrifter, adresser, summer, mva-linjer, sideinformasjon og annen støytekst.
+
+Returner et JSON-objekt med én nøkkel "rows" som inneholder en liste av objekter med disse feltene:
+- "art": varenummer/artikkelnummer (streng, tom streng hvis mangler)
+- "desc": produktbeskrivelse inkludert antall/størrelse-info (f.eks. "(15 STK)") hvis den finnes
+- "qty": antall som tall (0 hvis ikke oppgitt)
+- "unit": salgsenhet (f.eks. "STK", "PK", "RLL", tom streng hvis mangler)
+- "price": enhetspris som tall (0 hvis ikke oppgitt eller bestillingsliste uten priser)
+
+Eksempel output:
+{{"rows": [
+  {{"art": "390250", "desc": "Afinion HbA1c test (15 STK)", "qty": 0, "unit": "", "price": 0}},
+  {{"art": "111247", "desc": "Engangshanske nitril S upudret hvit (200 STK)", "qty": 0, "unit": "STK", "price": 0}}
+]}}
+
+Dokumenttekst:
+{text[:6000]}"""
+
+        msg = client.messages.create(
+            model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
+            max_tokens=4000,
+            temperature=0,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+
+        out_text = "".join(
+            block.text for block in msg.content if getattr(block, "type", None) == "text"
+        )
+
+        # Strip eventuelle markdown-blokker fra output
+        out_text = out_text.strip()
+        if out_text.startswith("```"):
+            out_text = re.sub(r"^```(?:json)?\s*", "", out_text)
+            out_text = re.sub(r"\s*```\s*$", "", out_text)
+
+        data = json.loads(out_text)
+        raw_rows = data.get("rows", [])
+        if not isinstance(raw_rows, list):
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        for r in raw_rows:
+            if not isinstance(r, dict):
+                continue
+            desc = str(r.get("desc") or "").strip()
+            art = str(r.get("art") or "").strip()
+            if not desc and not art:
+                continue
+            price_val = r.get("price", 0)
+            try:
+                price_float = float(price_val) if price_val else 0.0
+            except (TypeError, ValueError):
+                price_float = 0.0
+            qty_val = r.get("qty", 0)
+            try:
+                qty_float = float(qty_val) if qty_val else 0.0
+            except (TypeError, ValueError):
+                qty_float = 0.0
+            rows.append({
+                "Konkurrent Navn": "",
+                "Konkurrent Art.Nr": art,
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Antall": qty_float if qty_float else "",
+                "Konkurrent salgsenhet": str(r.get("unit") or "").strip(),
+                "Konkurrent Pris": price_float if price_float else "",
+            })
+
+        return rows
+
+    except Exception as e:
+        logger.warning(f"Claude PDF-parsing feilet, faller tilbake til heuristikk: {e}")
+        return []
+
 
 def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     """Returner rows i samme format som input-template.
@@ -1338,7 +1396,10 @@ async def match(
                     text = _ocr_pdf_fallback(raw)
                 except Exception as ocr_err:
                     logger.warning(f"OCR-fallback feilet: {ocr_err}")
-            rows = _parse_invoice_text_heuristic(text)
+            rows = _parse_invoice_with_claude(text)
+            if not rows:
+                logger.info("Claude PDF-parsing ga ingen rader, prøver heuristikk.")
+                rows = _parse_invoice_text_heuristic(text)
             if not rows:
                 return JSONResponse(
                     {"error": "Fant ingen produktlinjer i PDF. Tekstuttrekk og OCR ga ikke nok innhold til å tolke fakturaen."},
