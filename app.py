@@ -411,7 +411,7 @@ def _parse_invoice_with_claude(text: str) -> list:
         import anthropic
         import json as _json
         import re as _re
-        client = anthropic.Anthropic(api_key=api_key, timeout=60, max_retries=1)
+        client = anthropic.Anthropic(api_key=api_key, timeout=120, max_retries=1)
         system = (
             "Du er en presis dataekstraktor for norske medisinske bestillingslister og fakturaer. "
             "Returner KUN gyldig JSON, ingen annen tekst, ingen markdown-blokker."
