@@ -36,15 +36,21 @@ def _build_record(row: Dict[str, Any], job_id: str, committed_at: str) -> Dict[s
     candidates = row.get("candidates", [])
     cand = candidates[sel_idx] if (sel_idx is not None and 0 <= sel_idx < len(candidates)) else None
 
-    source_file = row.get("source_file", "")
-    if isinstance(source_file, list):
-        source_file = ", ".join(source_file)
+    # Normalize source_file(s) — always store the full list and a display string
+    raw_source = row.get("source_file", "")
+    if isinstance(raw_source, list):
+        source_files = raw_source
+    elif raw_source:
+        source_files = [raw_source]
+    else:
+        source_files = []
 
     return {
         "job_id": job_id,
         "dedup_idx": row.get("dedup_idx"),
         "committed_at": committed_at,
-        "source_file": source_file,
+        "source_file": ", ".join(source_files),
+        "source_files": source_files,
         "competitor": row.get("competitor", ""),
         "competitor_artnr": row.get("competitor_artnr", ""),
         "description": row.get("description", ""),
@@ -59,8 +65,11 @@ def _build_record(row: Dict[str, Any], job_id: str, committed_at: str) -> Dict[s
         "our_comparable_line_price": row.get("our_comparable_line_price"),
         "savings_amount": row.get("savings_amount"),
         "review_status": row.get("review_status", "pending"),
+        "comment": row.get("comment", ""),
         "strategy": row.get("strategy", ""),
         "merge_warning": bool(row.get("merge_warning", False)),
+        "merged_from_count": row.get("merged_from_count", 1),
+        "inconsistent_fields": row.get("inconsistent_fields", []),
     }
 
 

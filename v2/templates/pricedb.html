@@ -106,6 +106,7 @@ function renderPage() {
   html += '<th class="right">Vart belop</th>';
   html += '<th class="right">Besparelse</th>';
   html += '<th>Strategi</th>';
+  html += '<th>Kommentar</th>';
   html += '<th></th>';
   html += '</tr></thead><tbody>';
 
@@ -124,7 +125,9 @@ function renderPage() {
     html += '<td class="right">' + money(r.our_comparable_line_price) + '</td>';
     html += '<td class="right">' + savingsHtml(r.savings_amount) + '</td>';
     html += '<td>' + esc(r.strategy) + '</td>';
+    html += '<td class="muted">' + esc(r.comment || '') + '</td>';
     html += '<td>';
+    if (r.merged_from_count > 1) html += '<span class="badge" style="background:#f3e8ff;color:#7c3aed;">' + r.merged_from_count + ' slatt sammen</span> ';
     if (r.merge_warning) html += '<span class="badge badge-warn">Avvik</span>';
     html += '</td>';
     html += '</tr>';
