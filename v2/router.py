@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import APIRouter, UploadFile, File
+from fastapi import APIRouter, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from v2.parsing import classify_file, parse_file
 from v2.normalize import deduplicate
 from v2.matching import match_deduped_rows
+from v2 import persistence as rv
 
 logger = logging.getLogger(__name__)
 
@@ -393,15 +394,24 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
         except Exception as e:
             logger.warning(f"V2: Kunne ikke lagre matched rows: {e}")
 
+        # Initialize review data
+        try:
+            review_rows = rv.init_review(job_id, matched)
+            rv.save_review(job_id, review_rows)
+            task["status"] = "review"
+        except Exception as e:
+            logger.warning(f"V2: Kunne ikke initialisere review: {e}")
+            # Fall back to matched status — review can be retried
+
         _append_v2_job({
             "job_id": job_id,
-            "status": "matched",
+            "status": task["status"],
             "matched_count": len(matched),
             "matched_ok": matched_ok,
             "no_match": no_match,
         })
 
-        logger.info(f"V2 matching ferdig: job={job_id}, matched={matched_ok}, no_match={no_match}")
+        logger.info(f"V2 matching ferdig: job={job_id}, matched={matched_ok}, no_match={no_match}, status={task['status']}")
 
     except Exception as e:
         logger.exception(f"V2 matching feilet for job={job_id}")
@@ -436,6 +446,198 @@ def v2_matched_rows(job_id: str):
         "no_match": t.get("no_match", 0),
         "rows": rows,
     }
+
+
+# ============================================================
+# V2 REVIEW ROUTES
+# ============================================================
+
+def _require_review_job(job_id: str) -> tuple:
+    """Validate job exists and is in review state. Returns (task, error_response)."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t.get("status") not in ("review", "matched"):
+        return None, JSONResponse(
+            {"error": f"Jobb er ikke i review-modus (status: {t.get('status')})"},
+            status_code=400,
+        )
+    if rv.is_locked(job_id):
+        return None, JSONResponse({"error": "Jobben er låst"}, status_code=423)
+    return t, None
+
+
+@v2_router.get("/review/{job_id}")
+def v2_review(job_id: str):
+    """Get full review data with all overrides applied."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t.get("status") not in ("review", "matched"):
+        return JSONResponse(
+            {"error": f"Review ikke tilgjengelig (status: {t.get('status')})"},
+            status_code=400,
+        )
+
+    review_rows = rv.load_review(job_id)
+    if review_rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+
+    rows = rv.apply_overrides(review_rows, job_id)
+    lock = rv.get_lock_info(job_id)
+
+    # Summary counts
+    approved = sum(1 for r in rows if r.get("review_status") == "approved")
+    rejected = sum(1 for r in rows if r.get("review_status") == "rejected")
+    pending = sum(1 for r in rows if r.get("review_status") == "pending")
+
+    return {
+        "job_id": job_id,
+        "status": t.get("status"),
+        "lock": lock,
+        "count": len(rows),
+        "summary": {"approved": approved, "rejected": rejected, "pending": pending},
+        "rows": rows,
+    }
+
+
+@v2_router.post("/review/{job_id}/select")
+async def v2_select_candidate(job_id: str, request: Request):
+    """Select a candidate for one row. Body: {dedup_idx: int, candidate_idx: int}"""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    candidate_idx = body.get("candidate_idx")
+    if dedup_idx is None or candidate_idx is None:
+        return JSONResponse({"error": "dedup_idx og candidate_idx er påkrevd"}, status_code=400)
+
+    rv.save_selection(job_id, int(dedup_idx), int(candidate_idx))
+    return {"ok": True, "dedup_idx": dedup_idx, "candidate_idx": candidate_idx}
+
+
+@v2_router.post("/review/{job_id}/batch-select")
+async def v2_batch_select(job_id: str, request: Request):
+    """Auto-select best candidate for all rows that have a match.
+
+    Body: {override_existing: bool} — whether to override rows that already have a selection.
+    """
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    override = body.get("override_existing", False)
+    review_rows = rv.load_review(job_id)
+    if not review_rows:
+        return JSONResponse({"error": "Ingen review-data"}, status_code=404)
+
+    sels = rv.load_selections(job_id)
+    count = 0
+
+    for row in review_rows:
+        idx_str = str(row.get("dedup_idx", ""))
+        if not override and idx_str in sels:
+            continue
+        best = row.get("best_candidate_idx")
+        if best is not None:
+            sels[idx_str] = best
+            count += 1
+
+    rv.save_selections(job_id, sels)
+    return {"ok": True, "selected_count": count}
+
+
+@v2_router.post("/review/{job_id}/decide")
+async def v2_decide(job_id: str, request: Request):
+    """Set review status for one row. Body: {dedup_idx: int, status: 'approved'|'rejected'|'pending'}"""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    status = body.get("status")
+    if dedup_idx is None or status not in ("approved", "rejected", "pending"):
+        return JSONResponse(
+            {"error": "dedup_idx og status ('approved'|'rejected'|'pending') er påkrevd"},
+            status_code=400,
+        )
+
+    rv.save_decision(job_id, int(dedup_idx), status)
+    return {"ok": True, "dedup_idx": dedup_idx, "status": status}
+
+
+@v2_router.post("/review/{job_id}/bulk-decide")
+async def v2_bulk_decide(job_id: str, request: Request):
+    """Set review status for multiple rows. Body: {dedup_indices: [int], status: str}"""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    indices = body.get("dedup_indices", [])
+    status = body.get("status")
+    if not indices or status not in ("approved", "rejected", "pending"):
+        return JSONResponse({"error": "dedup_indices og status er påkrevd"}, status_code=400)
+
+    decs = rv.load_decisions(job_id)
+    now = _utc_now_iso()
+    for idx in indices:
+        decs[str(idx)] = {"status": status, "decided_at": now}
+    rv.save_decisions(job_id, decs)
+
+    return {"ok": True, "count": len(indices), "status": status}
+
+
+@v2_router.post("/review/{job_id}/extras")
+async def v2_extras(job_id: str, request: Request):
+    """Update comment and/or strategy for one row.
+
+    Body: {dedup_idx: int, comment?: str, strategy?: str}
+    """
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    if dedup_idx is None:
+        return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
+
+    rv.save_extra(
+        job_id,
+        int(dedup_idx),
+        comment=body.get("comment"),
+        strategy=body.get("strategy"),
+    )
+    return {"ok": True, "dedup_idx": dedup_idx}
+
+
+@v2_router.post("/review/{job_id}/lock")
+async def v2_lock(job_id: str, request: Request):
+    """Lock the job to prevent further edits."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    rv.set_lock(job_id, True, locked_by=body.get("locked_by", ""))
+    return {"ok": True, "locked": True}
+
+
+@v2_router.post("/review/{job_id}/unlock")
+def v2_unlock(job_id: str):
+    """Unlock the job to allow edits."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    rv.set_lock(job_id, False)
+    return {"ok": True, "locked": False}
 
 
 # ============================================================
@@ -597,6 +799,7 @@ function statusLabel(s) {
     'partial_error': 'Delvis feil',
     'matching': 'Matcher...',
     'matched': 'Matchet',
+    'review': 'Klar for review',
     'error': 'Feil',
   };
   return map[s] || s;
