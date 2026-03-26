@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, UploadFile, File, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -33,13 +33,102 @@ V2_UPLOADS_DIR.mkdir(exist_ok=True)
 V2_JOBS_INDEX = V2_DIR / "jobs.jsonl"
 
 # ============================================================
-# V2 IN-MEMORY TASK STATE
+# V2 IN-MEMORY TASK STATE + REHYDRATION
 # ============================================================
 V2_TASKS: Dict[str, Dict[str, Any]] = {}
 
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _get_task(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get task from memory, or rehydrate from disk if missing."""
+    t = V2_TASKS.get(job_id)
+    if t is not None:
+        return t
+    return _rehydrate_task(job_id)
+
+
+def _rehydrate_task(job_id: str) -> Optional[Dict[str, Any]]:
+    """Reconstruct a V2 task from on-disk data after restart."""
+    # 1) Check jobs.jsonl for metadata
+    job_meta = _load_job_meta(job_id)
+    if not job_meta:
+        return None
+
+    task: Dict[str, Any] = dict(job_meta)
+    task["job_id"] = job_id
+
+    job_upload_dir = V2_UPLOADS_DIR / job_id
+
+    # 2) Load persisted row data if available
+    deduped = _read_json_file(job_upload_dir / "deduped_rows.json")
+    if deduped is not None:
+        task["deduped_rows"] = deduped
+        task["deduped_count"] = len(deduped)
+
+    matched = _read_json_file(job_upload_dir / "matched_rows.json")
+    if matched is not None:
+        task["matched_rows"] = matched
+        task["matched_count"] = len(matched)
+
+    raw_rows = _read_json_file(job_upload_dir / "parsed_rows.json")
+    if raw_rows is not None:
+        task["rows"] = raw_rows
+        task["total_rows"] = len(raw_rows)
+
+    # 3) Determine best status from what's on disk
+    review_exists = rv.load_review(job_id) is not None
+    status = task.get("status", "unknown")
+
+    if review_exists and status in ("matched", "review", "matching"):
+        task["status"] = "review"
+    elif matched is not None and status in ("matching", "matched", "review"):
+        task["status"] = "review" if review_exists else "matched"
+    elif deduped is not None and status in ("parsing", "parsed", "partial_error"):
+        task["status"] = status if status in ("parsed", "partial_error") else "parsed"
+
+    # Cache in memory
+    V2_TASKS[job_id] = task
+    logger.info(f"V2: Rehydrated job {job_id} (status={task.get('status')})")
+    return task
+
+
+def _load_job_meta(job_id: str) -> Optional[Dict[str, Any]]:
+    """Load merged metadata for a single job from jobs.jsonl."""
+    if not V2_JOBS_INDEX.exists():
+        return None
+    result: Optional[Dict[str, Any]] = None
+    try:
+        with open(V2_JOBS_INDEX, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                    if e.get("job_id") == job_id:
+                        if result is None:
+                            result = e
+                        else:
+                            result.update(e)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return result
+
+
+def _read_json_file(path: Path) -> Optional[Any]:
+    """Read a JSON file, return None if missing or corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
 
 
 def _append_v2_job(event: Dict[str, Any]) -> None:
@@ -271,7 +360,7 @@ def _parse_job_files(job_id: str) -> None:
 @v2_router.get("/status/{job_id}")
 def v2_status(job_id: str):
     """Get status for a V2 job, including per-file parse results."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     return {
@@ -296,7 +385,7 @@ def v2_status(job_id: str):
 @v2_router.get("/rows/{job_id}")
 def v2_rows(job_id: str, deduped: bool = True):
     """Get rows for a V2 job. Use ?deduped=false for raw parsed rows."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t["status"] == "parsing":
@@ -327,7 +416,7 @@ def _get_catalog_bundle():
 @v2_router.post("/match/{job_id}")
 def v2_start_matching(job_id: str, prefer_own_brands: bool = True):
     """Start matching for a parsed V2 job."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
 
@@ -426,7 +515,7 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
 @v2_router.get("/matched/{job_id}")
 def v2_matched_rows(job_id: str):
     """Get matched rows with candidates for a V2 job."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t["status"] == "matching":
@@ -457,7 +546,7 @@ def v2_matched_rows(job_id: str):
 
 def _require_review_job(job_id: str) -> tuple:
     """Validate job exists and is in review state. Returns (task, error_response)."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t.get("status") not in ("review", "matched"):
@@ -473,7 +562,7 @@ def _require_review_job(job_id: str) -> tuple:
 @v2_router.get("/review/{job_id}")
 def v2_review(job_id: str):
     """Get full review data with all overrides applied."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t.get("status") not in ("review", "matched"):
@@ -622,7 +711,7 @@ async def v2_extras(job_id: str, request: Request):
 @v2_router.post("/review/{job_id}/lock")
 async def v2_lock(job_id: str, request: Request):
     """Lock the job to prevent further edits."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     try:
@@ -636,7 +725,7 @@ async def v2_lock(job_id: str, request: Request):
 @v2_router.post("/review/{job_id}/unlock")
 def v2_unlock(job_id: str):
     """Unlock the job to allow edits."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     rv.set_lock(job_id, False)
@@ -646,7 +735,7 @@ def v2_unlock(job_id: str):
 @v2_router.get("/review/{job_id}/ui", response_class=HTMLResponse)
 def v2_review_ui(job_id: str):
     """Serve the review UI page."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     html_path = Path(__file__).parent / "templates" / "review.html"
@@ -664,7 +753,7 @@ V2_EXPORTS_DIR.mkdir(exist_ok=True)
 @v2_router.get("/export/{job_id}")
 def v2_export(job_id: str):
     """Generate and download Excel export from review state."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t.get("status") not in ("review", "matched"):
@@ -707,7 +796,7 @@ def v2_export(job_id: str):
 @v2_router.post("/pricedb/commit/{job_id}")
 def v2_pricedb_commit(job_id: str):
     """Commit approved review rows to the price database."""
-    t = V2_TASKS.get(job_id)
+    t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t.get("status") not in ("review", "matched"):
