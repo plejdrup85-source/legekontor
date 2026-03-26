@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 
 from v2.parsing import classify_file, parse_file
 from v2.normalize import deduplicate
+from v2.matching import match_deduped_rows
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,10 @@ def v2_status(job_id: str):
         "parse_error_files": t.get("parse_error_files"),
         "total_rows": t.get("total_rows", 0),
         "deduped_count": t.get("deduped_count"),
+        "match_progress": t.get("match_progress"),
+        "matched_ok": t.get("matched_ok"),
+        "no_match": t.get("no_match"),
+        "match_error": t.get("match_error"),
     }
 
 
@@ -303,6 +308,134 @@ def v2_rows(job_id: str, deduped: bool = True):
 def v2_jobs(limit: int = 50):
     """List V2 jobs (most recent first)."""
     return {"jobs": _load_v2_jobs(limit=limit)}
+
+
+# ============================================================
+# V2 MATCHING
+# ============================================================
+
+def _get_catalog_bundle():
+    """Lazy import of CATALOG_BUNDLE from app to avoid circular imports."""
+    import app as _app
+    return _app.CATALOG_BUNDLE
+
+
+@v2_router.post("/match/{job_id}")
+def v2_start_matching(job_id: str, prefer_own_brands: bool = True):
+    """Start matching for a parsed V2 job."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+
+    if t["status"] not in ("parsed", "partial_error"):
+        return JSONResponse(
+            {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed'."},
+            status_code=400,
+        )
+
+    bundle = _get_catalog_bundle()
+    if bundle is None:
+        return JSONResponse({"error": "Katalog ikke lastet. Last opp katalog først."}, status_code=400)
+
+    t["status"] = "matching"
+    _append_v2_job({"job_id": job_id, "status": "matching"})
+
+    threading.Thread(
+        target=_run_matching,
+        args=(job_id, bundle, prefer_own_brands),
+        daemon=True,
+    ).start()
+
+    return {"ok": True, "job_id": job_id, "status": "matching"}
+
+
+def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
+    """Background worker: run matching on deduplicated rows."""
+    task = V2_TASKS.get(job_id)
+    if not task:
+        return
+
+    deduped = task.get("deduped_rows", [])
+    if not deduped:
+        task["status"] = "error"
+        task["match_error"] = "Ingen dedupliserte rader å matche"
+        _append_v2_job({"job_id": job_id, "status": "error", "match_error": task["match_error"]})
+        return
+
+    def progress_cb(p: float):
+        task["match_progress"] = round(p, 3)
+
+    try:
+        matched = match_deduped_rows(
+            deduped_rows=deduped,
+            bundle=bundle,
+            top_n=5,
+            prefer_own_brands=prefer_own_brands,
+            progress_cb=progress_cb,
+        )
+
+        task["matched_rows"] = matched
+        task["matched_count"] = len(matched)
+        task["match_progress"] = 1.0
+
+        matched_ok = sum(1 for r in matched if r.get("match_status") == "matched")
+        no_match = sum(1 for r in matched if r.get("match_status") == "no_match")
+        task["matched_ok"] = matched_ok
+        task["no_match"] = no_match
+
+        task["status"] = "matched"
+
+        # Persist matched rows
+        job_dir = V2_UPLOADS_DIR / job_id
+        try:
+            with open(job_dir / "matched_rows.json", "w", encoding="utf-8") as f:
+                json.dump(matched, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"V2: Kunne ikke lagre matched rows: {e}")
+
+        _append_v2_job({
+            "job_id": job_id,
+            "status": "matched",
+            "matched_count": len(matched),
+            "matched_ok": matched_ok,
+            "no_match": no_match,
+        })
+
+        logger.info(f"V2 matching ferdig: job={job_id}, matched={matched_ok}, no_match={no_match}")
+
+    except Exception as e:
+        logger.exception(f"V2 matching feilet for job={job_id}")
+        task["status"] = "error"
+        task["match_error"] = str(e)
+        _append_v2_job({"job_id": job_id, "status": "error", "match_error": str(e)})
+
+
+@v2_router.get("/matched/{job_id}")
+def v2_matched_rows(job_id: str):
+    """Get matched rows with candidates for a V2 job."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t["status"] == "matching":
+        return {
+            "job_id": job_id,
+            "status": "matching",
+            "match_progress": t.get("match_progress", 0),
+        }
+    if t["status"] not in ("matched",):
+        return JSONResponse(
+            {"error": f"Matching ikke kjørt ennå (status: {t['status']})"},
+            status_code=400,
+        )
+    rows = t.get("matched_rows", [])
+    return {
+        "job_id": job_id,
+        "status": "matched",
+        "count": len(rows),
+        "matched_ok": t.get("matched_ok", 0),
+        "no_match": t.get("no_match", 0),
+        "rows": rows,
+    }
 
 
 # ============================================================
@@ -357,6 +490,10 @@ V2_INDEX_HTML = """<!doctype html>
       <div><b>Jobb-ID:</b> <code id="resultJobId"></code></div>
       <div><b>Status:</b> <span id="resultStatus"></span></div>
       <div id="resultFiles" class="file-list"></div>
+      <div id="matchActions" style="margin-top:12px;display:none;">
+        <button id="btnMatch" onclick="startMatching()">Start matching</button>
+        <span id="matchStatus" class="muted" style="margin-left:12px;"></span>
+      </div>
     </div>
 
     <hr style="border:none;border-top:1px solid #eee;margin:24px 0;"/>
@@ -424,24 +561,28 @@ btnUpload.addEventListener('click', async () => {
   btnUpload.disabled = false;
 });
 
+let currentJobId = null;
+
 async function pollParseStatus(jobId) {
+  currentJobId = jobId;
   try {
     const resp = await fetch('/v2/status/' + jobId);
     const data = await resp.json();
-    let label = statusLabel(data.status);
-    if (data.total_rows > 0) {
-      label += ' (' + data.total_rows + ' rader';
-      if (data.deduped_count != null && data.deduped_count !== data.total_rows)
-        label += ', ' + data.deduped_count + ' unike';
-      label += ')';
-    }
-    document.getElementById('resultStatus').textContent = label;
+    updateStatusDisplay(data);
     showDetailedFileResults(data.files || []);
 
     if (data.status === 'parsing') {
       setTimeout(() => pollParseStatus(jobId), 1500);
       return;
     }
+
+    // Show match button when parsing is done
+    if (data.status === 'parsed' || data.status === 'partial_error') {
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('btnMatch').disabled = false;
+      document.getElementById('matchStatus').textContent = '';
+    }
+
     loadJobs();
   } catch (e) {
     document.getElementById('resultStatus').textContent = 'Polling feilet';
@@ -454,9 +595,69 @@ function statusLabel(s) {
     'parsing': 'Analyserer...',
     'parsed': 'Ferdig analysert',
     'partial_error': 'Delvis feil',
+    'matching': 'Matcher...',
+    'matched': 'Matchet',
     'error': 'Feil',
   };
   return map[s] || s;
+}
+
+function updateStatusDisplay(data) {
+  let label = statusLabel(data.status);
+  if (data.total_rows > 0) {
+    label += ' (' + data.total_rows + ' rader';
+    if (data.deduped_count != null && data.deduped_count !== data.total_rows)
+      label += ', ' + data.deduped_count + ' unike';
+    label += ')';
+  }
+  if (data.status === 'matching' && data.match_progress != null) {
+    label += ' ' + Math.round(data.match_progress * 100) + '%';
+  }
+  if (data.status === 'matched') {
+    label += ' — ' + (data.matched_ok || 0) + ' treff, ' + (data.no_match || 0) + ' uten';
+  }
+  if (data.match_error) {
+    label += ' — Feil: ' + data.match_error;
+  }
+  document.getElementById('resultStatus').textContent = label;
+}
+
+async function startMatching() {
+  if (!currentJobId) return;
+  document.getElementById('btnMatch').disabled = true;
+  document.getElementById('matchStatus').textContent = 'Starter matching...';
+
+  try {
+    const resp = await fetch('/v2/match/' + currentJobId, { method: 'POST' });
+    const data = await resp.json();
+    if (!resp.ok) {
+      document.getElementById('matchStatus').textContent = 'Feil: ' + (data.error || 'ukjent');
+      document.getElementById('btnMatch').disabled = false;
+      return;
+    }
+    document.getElementById('matchStatus').textContent = '';
+    pollMatchStatus(currentJobId);
+  } catch (e) {
+    document.getElementById('matchStatus').textContent = 'Nettverksfeil: ' + e.message;
+    document.getElementById('btnMatch').disabled = false;
+  }
+}
+
+async function pollMatchStatus(jobId) {
+  try {
+    const resp = await fetch('/v2/status/' + jobId);
+    const data = await resp.json();
+    updateStatusDisplay(data);
+
+    if (data.status === 'matching') {
+      setTimeout(() => pollMatchStatus(jobId), 2000);
+      return;
+    }
+    document.getElementById('matchActions').style.display = 'none';
+    loadJobs();
+  } catch (e) {
+    document.getElementById('matchStatus').textContent = 'Polling feilet';
+  }
 }
 
 function showFileResults(files) {
@@ -531,15 +732,18 @@ async function loadJobs() {
       document.getElementById('jobsList').innerHTML = '<p class="muted">Ingen V2-jobber enda.</p>';
       return;
     }
-    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th class="right">Rader</th><th>Jobb-ID</th></tr></thead><tbody>';
+    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th class="right">Rader</th><th class="right">Match</th><th>Jobb-ID</th></tr></thead><tbody>';
     for (const j of jobs) {
       const st = statusLabel(j.status);
       html += '<tr><td>' + esc(formatOsloTime(j.created_at)) + '</td><td>' + esc(st) +
         '</td><td class="right">' + esc(j.uploaded_files || 0) + ' lastet opp';
       if (j.parsed_files != null) html += ', ' + esc(j.parsed_files) + ' analysert';
       if (j.parse_error_files) html += ', ' + esc(j.parse_error_files) + ' feil';
-      html += '</td><td class="right">' + esc(j.total_rows || 0) +
-        '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
+      html += '</td><td class="right">' + esc(j.total_rows || 0);
+      html += '</td><td class="right">';
+      if (j.matched_ok != null) html += esc(j.matched_ok) + ' treff';
+      if (j.no_match) html += ', ' + esc(j.no_match) + ' uten';
+      html += '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
     }
     html += '</tbody></table>';
     document.getElementById('jobsList').innerHTML = html;
