@@ -432,7 +432,7 @@ def v2_matched_rows(job_id: str):
             "status": "matching",
             "match_progress": t.get("match_progress", 0),
         }
-    if t["status"] not in ("matched",):
+    if t["status"] not in ("matched", "review"):
         return JSONResponse(
             {"error": f"Matching ikke kjørt ennå (status: {t['status']})"},
             status_code=400,

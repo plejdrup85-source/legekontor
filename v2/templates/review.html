@@ -43,6 +43,8 @@
     .cand-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 5px; font-size: 12px; cursor: pointer; }
     .cand-row:hover { background: #f3f4f6; }
     .cand-row.selected { background: #eff6ff; border: 1px solid #3b82f6; }
+    .cand-row.disabled { cursor: default; opacity: 0.7; }
+    .cand-row.disabled:hover { background: transparent; }
     .cand-row .artnr { font-weight: 600; min-width: 70px; }
     .cand-row .desc { flex: 1; color: #374151; }
     .cand-row .price { min-width: 70px; text-align: right; }
@@ -92,9 +94,9 @@
     </select>
     <span class="muted" id="filterCount"></span>
     <span style="flex:1;"></span>
-    <button class="sm success" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
-    <button class="sm danger" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
-    <button class="sm secondary" onclick="batchSelect()">Auto-velg beste</button>
+    <button class="sm success" id="btnBulkApprove" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
+    <button class="sm danger" id="btnBulkReject" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
+    <button class="sm secondary" id="btnBatchSelect" onclick="batchSelect()">Auto-velg beste</button>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
   </div>
 
@@ -139,9 +141,13 @@ function updateSummary(s) {
 function updateLockUI() {
   document.getElementById('lockBar').style.display = locked ? 'flex' : 'none';
   document.getElementById('lockBtn').textContent = locked ? 'Las opp' : 'Las';
+  // Disable/enable toolbar batch buttons
+  document.getElementById('btnBulkApprove').disabled = locked;
+  document.getElementById('btnBulkReject').disabled = locked;
+  document.getElementById('btnBatchSelect').disabled = locked;
 }
 
-function applyFilters() {
+function applyFilters(preservePage) {
   const search = (document.getElementById('searchInput').value || '').toLowerCase();
   const statusF = document.getElementById('statusFilter').value;
   const matchF = document.getElementById('matchFilter').value;
@@ -160,7 +166,14 @@ function applyFilters() {
   });
 
   document.getElementById('filterCount').textContent = filteredRows.length + ' av ' + allRows.length + ' rader';
-  currentPage = 0;
+
+  // Only reset page when filters actually change, not on in-page actions
+  if (!preservePage) currentPage = 0;
+
+  // Clamp page to valid range
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE));
+  if (currentPage >= totalPages) currentPage = totalPages - 1;
+
   renderPage();
 }
 
@@ -185,7 +198,7 @@ function renderCard(r) {
   const warnCls = r.merge_warning ? ' warn' : '';
   const selIdx = r.selected_candidate_idx;
   const cands = r.candidates || [];
-  const selCand = (selIdx != null && cands[selIdx]) ? cands[selIdx] : null;
+  const dis = locked ? 'disabled' : '';
 
   let html = '<div class="card ' + st + warnCls + '" id="card-' + idx + '">';
 
@@ -196,9 +209,9 @@ function renderCard(r) {
     html += '<span class="merged-info">Slatt sammen fra ' + r.merged_from_count + ' rader</span>';
   }
   html += '</div><div class="decision-btns">';
-  html += '<button class="sm ' + (st === 'approved' ? 'success' : 'secondary') + '" onclick="decide(' + idx + ',\'approved\')" ' + (locked ? 'disabled' : '') + '>Godkjenn</button>';
-  html += '<button class="sm ' + (st === 'rejected' ? 'danger' : 'secondary') + '" onclick="decide(' + idx + ',\'rejected\')" ' + (locked ? 'disabled' : '') + '>Avvis</button>';
-  html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + (locked ? 'disabled' : '') + '>Pending</button>';
+  html += '<button class="sm ' + (st === 'approved' ? 'success' : 'secondary') + '" onclick="decide(' + idx + ',\'approved\')" ' + dis + '>Godkjenn</button>';
+  html += '<button class="sm ' + (st === 'rejected' ? 'danger' : 'secondary') + '" onclick="decide(' + idx + ',\'rejected\')" ' + dis + '>Avvis</button>';
+  html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + dis + '>Pending</button>';
   html += '</div></div>';
 
   // Meta grid
@@ -227,7 +240,8 @@ function renderCard(r) {
     html += '<div class="muted" style="margin-bottom:4px;">Kandidater:</div>';
     for (const c of cands) {
       const isSel = c.candidate_idx === selIdx;
-      html += '<div class="cand-row' + (isSel ? ' selected' : '') + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
+      const candCls = 'cand-row' + (isSel ? ' selected' : '') + (locked ? ' disabled' : '');
+      html += '<div class="' + candCls + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
       html += '<span class="artnr">' + esc(c.our_artnr) + '</span>';
       html += '<span class="desc">' + esc(c.our_description || '') + '</span>';
       html += '<span class="price">' + money(c.our_unit_price) + '/enh</span>';
@@ -242,8 +256,8 @@ function renderCard(r) {
 
   // Extras
   html += '<div class="extras">';
-  html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value,null)" oninput="debounceExtra(' + idx + ',this.value,null)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
-  html += '<input type="text" placeholder="Strategi..." value="' + escAttr(r.strategy || '') + '" onchange="saveExtra(' + idx + ',null,this.value)" oninput="debounceExtra(' + idx + ',null,this.value)"' + (locked ? ' disabled' : '') + '/>';
+  html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value,null)" oninput="debounceExtra(\'comment\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
+  html += '<input type="text" placeholder="Strategi..." value="' + escAttr(r.strategy || '') + '" onchange="saveExtra(' + idx + ',null,this.value)" oninput="debounceExtra(\'strategy\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '/>';
   html += '</div>';
 
   html += '</div>';
@@ -272,8 +286,9 @@ function goPage(p) {
 
 async function selectCandidate(dedupIdx, candidateIdx) {
   if (locked) return;
-  await postJson('/v2/review/' + JOB_ID + '/select', { dedup_idx: dedupIdx, candidate_idx: candidateIdx });
-  // Update local state immediately
+  const resp = await postJson('/v2/review/' + JOB_ID + '/select', { dedup_idx: dedupIdx, candidate_idx: candidateIdx });
+  if (!resp.ok) return;
+  // Update local state
   const row = allRows.find(r => r.dedup_idx === dedupIdx);
   if (row) {
     row.selected_candidate_idx = candidateIdx;
@@ -284,16 +299,17 @@ async function selectCandidate(dedupIdx, candidateIdx) {
       row.savings_amount = cand.savings_amount;
     }
   }
-  applyFilters();
+  applyFilters(true);
 }
 
 async function decide(dedupIdx, status) {
   if (locked) return;
-  await postJson('/v2/review/' + JOB_ID + '/decide', { dedup_idx: dedupIdx, status: status });
+  const resp = await postJson('/v2/review/' + JOB_ID + '/decide', { dedup_idx: dedupIdx, status: status });
+  if (!resp.ok) return;
   const row = allRows.find(r => r.dedup_idx === dedupIdx);
   if (row) row.review_status = status;
   updateSummaryFromRows();
-  applyFilters();
+  applyFilters(true);
 }
 
 async function bulkDecide(status) {
@@ -301,25 +317,30 @@ async function bulkDecide(status) {
   const indices = filteredRows.map(r => r.dedup_idx);
   if (!indices.length) return;
   if (!confirm('Sett ' + indices.length + ' rader til "' + status + '"?')) return;
-  await postJson('/v2/review/' + JOB_ID + '/bulk-decide', { dedup_indices: indices, status: status });
+  const resp = await postJson('/v2/review/' + JOB_ID + '/bulk-decide', { dedup_indices: indices, status: status });
+  if (!resp.ok) return;
   for (const r of allRows) {
     if (indices.includes(r.dedup_idx)) r.review_status = status;
   }
   updateSummaryFromRows();
-  applyFilters();
+  applyFilters(true);
 }
 
 async function batchSelect() {
   if (locked) return;
   await postJson('/v2/review/' + JOB_ID + '/batch-select', { override_existing: false });
-  // Reload to get updated selections
+  // Full reload to get updated selections and recalculated prices
   await loadReview();
 }
 
-function debounceExtra(dedupIdx, comment, strategy) {
-  const key = 'extra-' + dedupIdx;
+function debounceExtra(field, dedupIdx, value) {
+  // Separate debounce keys for comment vs strategy to avoid cancelling each other
+  const key = field + '-' + dedupIdx;
   if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
-  debounceTimers[key] = setTimeout(() => saveExtra(dedupIdx, comment, strategy), 800);
+  debounceTimers[key] = setTimeout(() => {
+    if (field === 'comment') saveExtra(dedupIdx, value, null);
+    else saveExtra(dedupIdx, null, value);
+  }, 800);
 }
 
 async function saveExtra(dedupIdx, comment, strategy) {
@@ -345,7 +366,7 @@ async function toggleLock() {
     locked = true;
   }
   updateLockUI();
-  applyFilters();
+  applyFilters(true);
 }
 
 function updateSummaryFromRows() {
@@ -361,27 +382,34 @@ async function postJson(url, body) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    return await resp.json();
+    const data = await resp.json();
+    data.ok = resp.ok;
+    return data;
   } catch (e) {
     console.error('API error:', e);
-    return {};
+    return { ok: false };
   }
 }
 
 // --- Formatting ---
 
-function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 function fmt(v) { return v != null ? String(v) : '-'; }
 function money(v) {
   if (v == null) return '<span class="muted">-</span>';
-  return v.toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' kr';
+  const n = Number(v);
+  if (isNaN(n)) return '<span class="muted">-</span>';
+  return n.toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' kr';
 }
 function savingsHtml(v) {
   if (v == null) return '<span class="muted">-</span>';
-  if (v > 0) return '<span class="savings-pos">+' + money(v) + '</span>';
-  if (v < 0) return '<span class="savings-neg">' + money(v) + '</span>';
-  return money(v);
+  const n = Number(v);
+  if (isNaN(n)) return '<span class="muted">-</span>';
+  const formatted = Math.abs(n).toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' kr';
+  if (n > 0) return '<span class="savings-pos">+' + formatted + '</span>';
+  if (n < 0) return '<span class="savings-neg">-' + formatted + '</span>';
+  return formatted;
 }
 
 // --- Init ---
