@@ -1,0 +1,391 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>V2 Review</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px 24px; color: #1a1a1a; background: #f8f9fa; }
+    a { color: #1F4E79; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { background: #1F4E79; color: white; border: 0; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #6b7280; }
+    button.danger { background: #dc2626; }
+    button.success { background: #16a34a; }
+    button.sm { padding: 4px 8px; font-size: 12px; }
+    select, input[type=text], textarea { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 13px; font-family: inherit; }
+    .muted { color: #666; font-size: 13px; }
+    .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
+    .header h2 { margin: 0; }
+    .summary { display: flex; gap: 16px; flex-wrap: wrap; font-size: 13px; }
+    .summary .badge { display: inline-block; padding: 3px 10px; border-radius: 12px; font-weight: 600; }
+    .badge-approved { background: #dcfce7; color: #166534; }
+    .badge-rejected { background: #fee2e2; color: #991b1b; }
+    .badge-pending { background: #fef3c7; color: #92400e; }
+    .badge-warn { background: #fff7ed; color: #c2410c; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 12px; background: white; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .toolbar input[type=text] { width: 220px; }
+    .toolbar select { min-width: 120px; }
+    .lock-bar { padding: 8px 14px; background: #fef3c7; border: 1px solid #fbbf24; border-radius: 8px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .card { background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 14px 16px; margin-bottom: 10px; }
+    .card.approved { border-left: 4px solid #16a34a; }
+    .card.rejected { border-left: 4px solid #dc2626; }
+    .card.pending { border-left: 4px solid #f59e0b; }
+    .card.warn { background: #fffbeb; }
+    .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
+    .card-title { font-weight: 600; font-size: 14px; }
+    .card-meta { font-size: 12px; color: #6b7280; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 6px 16px; font-size: 13px; margin-bottom: 8px; }
+    .card-grid dt { color: #6b7280; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .card-grid dd { margin: 0 0 4px 0; font-weight: 500; }
+    .candidates { margin-top: 8px; }
+    .cand-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 5px; font-size: 12px; cursor: pointer; }
+    .cand-row:hover { background: #f3f4f6; }
+    .cand-row.selected { background: #eff6ff; border: 1px solid #3b82f6; }
+    .cand-row .artnr { font-weight: 600; min-width: 70px; }
+    .cand-row .desc { flex: 1; color: #374151; }
+    .cand-row .price { min-width: 70px; text-align: right; }
+    .cand-row .savings { min-width: 80px; text-align: right; }
+    .savings-pos { color: #16a34a; font-weight: 600; }
+    .savings-neg { color: #dc2626; font-weight: 600; }
+    .extras { display: flex; gap: 10px; margin-top: 8px; }
+    .extras textarea { flex: 1; min-height: 32px; resize: vertical; }
+    .extras input[type=text] { flex: 1; }
+    .decision-btns { display: flex; gap: 4px; }
+    .pager { display: flex; justify-content: center; gap: 8px; margin: 16px 0; align-items: center; }
+    .merged-info { font-size: 11px; color: #9333ea; margin-left: 8px; }
+    .warn-box { font-size: 11px; color: #c2410c; background: #fff7ed; padding: 4px 8px; border-radius: 4px; margin-top: 4px; }
+    .no-match { color: #9ca3af; font-style: italic; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div>
+      <a href="/v2/">&larr; Tilbake til V2</a>
+      <h2>Review: <code id="jobIdDisplay"></code></h2>
+    </div>
+    <div class="summary" id="summary"></div>
+  </div>
+
+  <div id="lockBar" class="lock-bar" style="display:none;">
+    <span>Jobben er last. Endringer er deaktivert.</span>
+    <button class="sm secondary" onclick="toggleLock()">Las opp</button>
+  </div>
+
+  <div class="toolbar">
+    <input type="text" id="searchInput" placeholder="Sok i beskrivelse / art.nr..." oninput="applyFilters()"/>
+    <select id="statusFilter" onchange="applyFilters()">
+      <option value="">Alle statuser</option>
+      <option value="pending">Pending</option>
+      <option value="approved">Godkjent</option>
+      <option value="rejected">Avvist</option>
+    </select>
+    <select id="matchFilter" onchange="applyFilters()">
+      <option value="">Alle match</option>
+      <option value="matched">Har treff</option>
+      <option value="no_match">Uten treff</option>
+    </select>
+    <select id="warnFilter" onchange="applyFilters()">
+      <option value="">Alle</option>
+      <option value="warn">Kun med varsel</option>
+    </select>
+    <span class="muted" id="filterCount"></span>
+    <span style="flex:1;"></span>
+    <button class="sm success" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
+    <button class="sm danger" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
+    <button class="sm secondary" onclick="batchSelect()">Auto-velg beste</button>
+    <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
+  </div>
+
+  <div id="rows"></div>
+
+  <div class="pager" id="pager"></div>
+
+<script>
+const JOB_ID = location.pathname.split('/review/')[1]?.split('/')[0] || '';
+let allRows = [];
+let filteredRows = [];
+let locked = false;
+const PAGE_SIZE = 25;
+let currentPage = 0;
+let debounceTimers = {};
+
+async function loadReview() {
+  const resp = await fetch('/v2/review/' + JOB_ID);
+  if (!resp.ok) {
+    document.getElementById('rows').innerHTML = '<p class="muted">Kunne ikke laste review-data.</p>';
+    return;
+  }
+  const data = await resp.json();
+  allRows = data.rows || [];
+  locked = data.lock?.locked || false;
+
+  document.getElementById('jobIdDisplay').textContent = JOB_ID.substring(0, 12) + '...';
+  updateSummary(data.summary);
+  updateLockUI();
+  applyFilters();
+}
+
+function updateSummary(s) {
+  if (!s) return;
+  document.getElementById('summary').innerHTML =
+    '<span class="badge badge-approved">' + s.approved + ' godkjent</span>' +
+    '<span class="badge badge-rejected">' + s.rejected + ' avvist</span>' +
+    '<span class="badge badge-pending">' + s.pending + ' pending</span>' +
+    '<span class="muted">' + allRows.length + ' rader totalt</span>';
+}
+
+function updateLockUI() {
+  document.getElementById('lockBar').style.display = locked ? 'flex' : 'none';
+  document.getElementById('lockBtn').textContent = locked ? 'Las opp' : 'Las';
+}
+
+function applyFilters() {
+  const search = (document.getElementById('searchInput').value || '').toLowerCase();
+  const statusF = document.getElementById('statusFilter').value;
+  const matchF = document.getElementById('matchFilter').value;
+  const warnF = document.getElementById('warnFilter').value;
+
+  filteredRows = allRows.filter(r => {
+    if (statusF && r.review_status !== statusF) return false;
+    if (matchF === 'matched' && r.match_status !== 'matched') return false;
+    if (matchF === 'no_match' && r.match_status !== 'no_match') return false;
+    if (warnF === 'warn' && !r.merge_warning) return false;
+    if (search) {
+      const hay = ((r.description || '') + ' ' + (r.competitor_artnr || '') + ' ' + (r.competitor || '')).toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  document.getElementById('filterCount').textContent = filteredRows.length + ' av ' + allRows.length + ' rader';
+  currentPage = 0;
+  renderPage();
+}
+
+function renderPage() {
+  const start = currentPage * PAGE_SIZE;
+  const page = filteredRows.slice(start, start + PAGE_SIZE);
+  const container = document.getElementById('rows');
+
+  if (page.length === 0) {
+    container.innerHTML = '<p class="muted">Ingen rader matcher filteret.</p>';
+    document.getElementById('pager').innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = page.map(r => renderCard(r)).join('');
+  renderPager();
+}
+
+function renderCard(r) {
+  const idx = r.dedup_idx;
+  const st = r.review_status || 'pending';
+  const warnCls = r.merge_warning ? ' warn' : '';
+  const selIdx = r.selected_candidate_idx;
+  const cands = r.candidates || [];
+  const selCand = (selIdx != null && cands[selIdx]) ? cands[selIdx] : null;
+
+  let html = '<div class="card ' + st + warnCls + '" id="card-' + idx + '">';
+
+  // Header
+  html += '<div class="card-header"><div>';
+  html += '<span class="card-title">' + esc(r.description || '(ingen beskrivelse)') + '</span>';
+  if (r.merged_from_count > 1) {
+    html += '<span class="merged-info">Slatt sammen fra ' + r.merged_from_count + ' rader</span>';
+  }
+  html += '</div><div class="decision-btns">';
+  html += '<button class="sm ' + (st === 'approved' ? 'success' : 'secondary') + '" onclick="decide(' + idx + ',\'approved\')" ' + (locked ? 'disabled' : '') + '>Godkjenn</button>';
+  html += '<button class="sm ' + (st === 'rejected' ? 'danger' : 'secondary') + '" onclick="decide(' + idx + ',\'rejected\')" ' + (locked ? 'disabled' : '') + '>Avvis</button>';
+  html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + (locked ? 'disabled' : '') + '>Pending</button>';
+  html += '</div></div>';
+
+  // Meta grid
+  html += '<div class="card-grid">';
+  html += '<div><dt>Konkurrent</dt><dd>' + esc(r.competitor || '') + '</dd></div>';
+  html += '<div><dt>Konk. art.nr</dt><dd>' + esc(r.competitor_artnr || '') + '</dd></div>';
+  html += '<div><dt>Kvt.</dt><dd>' + fmt(r.quantity_purchased) + '</dd></div>';
+  html += '<div><dt>Pakning</dt><dd>' + esc(r.packaging_text || '-') + ' (' + (r.packaging_count || 1) + ')</dd></div>';
+  html += '<div><dt>Totalt enheter</dt><dd>' + fmt(r.total_units) + '</dd></div>';
+  html += '<div><dt>Konk. linjebelop</dt><dd>' + money(r.competitor_line_amount) + '</dd></div>';
+  html += '<div><dt>Var pris/enhet</dt><dd>' + money(r.our_unit_price) + '</dd></div>';
+  html += '<div><dt>Vart linjebelop</dt><dd>' + money(r.our_comparable_line_price) + '</dd></div>';
+  html += '<div><dt>Besparelse</dt><dd>' + savingsHtml(r.savings_amount) + '</dd></div>';
+  html += '</div>';
+
+  // Merge warning
+  if (r.merge_warning && r.inconsistent_fields?.length) {
+    html += '<div class="warn-box">Avvik i sammenslatte rader: ' +
+      r.inconsistent_fields.map(f => esc(f.field) + ' (' + f.values.map(v => esc(String(v))).join(' vs ') + ')').join(', ') +
+      '</div>';
+  }
+
+  // Candidates
+  if (cands.length > 0) {
+    html += '<div class="candidates">';
+    html += '<div class="muted" style="margin-bottom:4px;">Kandidater:</div>';
+    for (const c of cands) {
+      const isSel = c.candidate_idx === selIdx;
+      html += '<div class="cand-row' + (isSel ? ' selected' : '') + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
+      html += '<span class="artnr">' + esc(c.our_artnr) + '</span>';
+      html += '<span class="desc">' + esc(c.our_description || '') + '</span>';
+      html += '<span class="price">' + money(c.our_unit_price) + '/enh</span>';
+      html += '<span class="savings">' + savingsHtml(c.savings_amount) + '</span>';
+      html += '<span class="muted">' + esc(c.match_quality || '') + '</span>';
+      html += '</div>';
+    }
+    html += '</div>';
+  } else {
+    html += '<div class="no-match">Ingen kandidater funnet</div>';
+  }
+
+  // Extras
+  html += '<div class="extras">';
+  html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value,null)" oninput="debounceExtra(' + idx + ',this.value,null)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
+  html += '<input type="text" placeholder="Strategi..." value="' + escAttr(r.strategy || '') + '" onchange="saveExtra(' + idx + ',null,this.value)" oninput="debounceExtra(' + idx + ',null,this.value)"' + (locked ? ' disabled' : '') + '/>';
+  html += '</div>';
+
+  html += '</div>';
+  return html;
+}
+
+function renderPager() {
+  const totalPages = Math.ceil(filteredRows.length / PAGE_SIZE);
+  if (totalPages <= 1) { document.getElementById('pager').innerHTML = ''; return; }
+  let html = '';
+  html += '<button class="sm secondary" onclick="goPage(' + (currentPage - 1) + ')" ' + (currentPage === 0 ? 'disabled' : '') + '>&laquo; Forrige</button>';
+  html += '<span class="muted">Side ' + (currentPage + 1) + ' av ' + totalPages + '</span>';
+  html += '<button class="sm secondary" onclick="goPage(' + (currentPage + 1) + ')" ' + (currentPage >= totalPages - 1 ? 'disabled' : '') + '>Neste &raquo;</button>';
+  document.getElementById('pager').innerHTML = html;
+}
+
+function goPage(p) {
+  const totalPages = Math.ceil(filteredRows.length / PAGE_SIZE);
+  if (p < 0 || p >= totalPages) return;
+  currentPage = p;
+  renderPage();
+  window.scrollTo(0, 0);
+}
+
+// --- API calls ---
+
+async function selectCandidate(dedupIdx, candidateIdx) {
+  if (locked) return;
+  await postJson('/v2/review/' + JOB_ID + '/select', { dedup_idx: dedupIdx, candidate_idx: candidateIdx });
+  // Update local state immediately
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) {
+    row.selected_candidate_idx = candidateIdx;
+    const cand = (row.candidates || [])[candidateIdx];
+    if (cand) {
+      row.our_unit_price = cand.our_unit_price;
+      row.our_comparable_line_price = cand.our_comparable_line_price;
+      row.savings_amount = cand.savings_amount;
+    }
+  }
+  applyFilters();
+}
+
+async function decide(dedupIdx, status) {
+  if (locked) return;
+  await postJson('/v2/review/' + JOB_ID + '/decide', { dedup_idx: dedupIdx, status: status });
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) row.review_status = status;
+  updateSummaryFromRows();
+  applyFilters();
+}
+
+async function bulkDecide(status) {
+  if (locked) return;
+  const indices = filteredRows.map(r => r.dedup_idx);
+  if (!indices.length) return;
+  if (!confirm('Sett ' + indices.length + ' rader til "' + status + '"?')) return;
+  await postJson('/v2/review/' + JOB_ID + '/bulk-decide', { dedup_indices: indices, status: status });
+  for (const r of allRows) {
+    if (indices.includes(r.dedup_idx)) r.review_status = status;
+  }
+  updateSummaryFromRows();
+  applyFilters();
+}
+
+async function batchSelect() {
+  if (locked) return;
+  await postJson('/v2/review/' + JOB_ID + '/batch-select', { override_existing: false });
+  // Reload to get updated selections
+  await loadReview();
+}
+
+function debounceExtra(dedupIdx, comment, strategy) {
+  const key = 'extra-' + dedupIdx;
+  if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
+  debounceTimers[key] = setTimeout(() => saveExtra(dedupIdx, comment, strategy), 800);
+}
+
+async function saveExtra(dedupIdx, comment, strategy) {
+  if (locked) return;
+  const body = { dedup_idx: dedupIdx };
+  if (comment !== null) body.comment = comment;
+  if (strategy !== null) body.strategy = strategy;
+  await postJson('/v2/review/' + JOB_ID + '/extras', body);
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) {
+    if (comment !== null) row.comment = comment;
+    if (strategy !== null) row.strategy = strategy;
+  }
+}
+
+async function toggleLock() {
+  if (locked) {
+    await postJson('/v2/review/' + JOB_ID + '/unlock', {});
+    locked = false;
+  } else {
+    if (!confirm('Las jobben? Endringer deaktiveres.')) return;
+    await postJson('/v2/review/' + JOB_ID + '/lock', {});
+    locked = true;
+  }
+  updateLockUI();
+  applyFilters();
+}
+
+function updateSummaryFromRows() {
+  const s = { approved: 0, rejected: 0, pending: 0 };
+  for (const r of allRows) s[r.review_status || 'pending']++;
+  updateSummary(s);
+}
+
+async function postJson(url, body) {
+  try {
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    return await resp.json();
+  } catch (e) {
+    console.error('API error:', e);
+    return {};
+  }
+}
+
+// --- Formatting ---
+
+function esc(s) { return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
+function fmt(v) { return v != null ? String(v) : '-'; }
+function money(v) {
+  if (v == null) return '<span class="muted">-</span>';
+  return v.toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' kr';
+}
+function savingsHtml(v) {
+  if (v == null) return '<span class="muted">-</span>';
+  if (v > 0) return '<span class="savings-pos">+' + money(v) + '</span>';
+  if (v < 0) return '<span class="savings-neg">' + money(v) + '</span>';
+  return money(v);
+}
+
+// --- Init ---
+loadReview();
+</script>
+</body>
+</html>

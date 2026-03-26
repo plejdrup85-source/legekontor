@@ -640,6 +640,16 @@ def v2_unlock(job_id: str):
     return {"ok": True, "locked": False}
 
 
+@v2_router.get("/review/{job_id}/ui", response_class=HTMLResponse)
+def v2_review_ui(job_id: str):
+    """Serve the review UI page."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    html_path = Path(__file__).parent / "templates" / "review.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
 # ============================================================
 # V2 FRONTEND
 # ============================================================
@@ -857,6 +867,11 @@ async function pollMatchStatus(jobId) {
       return;
     }
     document.getElementById('matchActions').style.display = 'none';
+    // Show review link when matching is done
+    if (data.status === 'review' || data.status === 'matched') {
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('matchActions').innerHTML = '<a href="/v2/review/' + jobId + '/ui"><button>Apne review</button></a>';
+    }
     loadJobs();
   } catch (e) {
     document.getElementById('matchStatus').textContent = 'Polling feilet';
@@ -935,7 +950,7 @@ async function loadJobs() {
       document.getElementById('jobsList').innerHTML = '<p class="muted">Ingen V2-jobber enda.</p>';
       return;
     }
-    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th class="right">Rader</th><th class="right">Match</th><th>Jobb-ID</th></tr></thead><tbody>';
+    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th class="right">Rader</th><th class="right">Match</th><th></th><th>Jobb-ID</th></tr></thead><tbody>';
     for (const j of jobs) {
       const st = statusLabel(j.status);
       html += '<tr><td>' + esc(formatOsloTime(j.created_at)) + '</td><td>' + esc(st) +
@@ -946,6 +961,8 @@ async function loadJobs() {
       html += '</td><td class="right">';
       if (j.matched_ok != null) html += esc(j.matched_ok) + ' treff';
       if (j.no_match) html += ', ' + esc(j.no_match) + ' uten';
+      html += '</td><td>';
+      if (j.status === 'review' || j.status === 'matched') html += '<a href="/v2/review/' + esc(j.job_id) + '/ui">Review</a>';
       html += '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
     }
     html += '</tbody></table>';
