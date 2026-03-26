@@ -331,9 +331,9 @@ def v2_start_matching(job_id: str, prefer_own_brands: bool = True):
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
 
-    if t["status"] not in ("parsed", "partial_error"):
+    if t["status"] not in ("parsed", "partial_error", "error"):
         return JSONResponse(
-            {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed'."},
+            {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed' eller 'error'."},
             status_code=400,
         )
 
@@ -927,7 +927,7 @@ function updateStatusDisplay(data) {
   if (data.status === 'matching' && data.match_progress != null) {
     label += ' ' + Math.round(data.match_progress * 100) + '%';
   }
-  if (data.status === 'matched') {
+  if (data.status === 'matched' || data.status === 'review') {
     label += ' — ' + (data.matched_ok || 0) + ' treff, ' + (data.no_match || 0) + ' uten';
   }
   if (data.match_error) {
@@ -967,11 +967,16 @@ async function pollMatchStatus(jobId) {
       setTimeout(() => pollMatchStatus(jobId), 2000);
       return;
     }
-    document.getElementById('matchActions').style.display = 'none';
     // Show review link when matching is done
     if (data.status === 'review' || data.status === 'matched') {
       document.getElementById('matchActions').style.display = 'block';
       document.getElementById('matchActions').innerHTML = '<a href="/v2/review/' + jobId + '/ui"><button>Apne review</button></a>';
+    } else if (data.status === 'error') {
+      // Re-enable match button so user can retry
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('btnMatch').disabled = false;
+    } else {
+      document.getElementById('matchActions').style.display = 'none';
     }
     loadJobs();
   } catch (e) {

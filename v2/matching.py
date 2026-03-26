@@ -169,6 +169,10 @@ def _match_single_row(
     except Exception as e:
         logger.warning(f"V2 matching combined feilet for rad {row.get('dedup_idx')}: {e}")
 
+    # Default best_candidate_idx to first candidate if we have any but combined match failed
+    if best_candidate_idx is None and candidates:
+        best_candidate_idx = 0
+
     # Trim to top_n
     candidates = candidates[:top_n]
 
