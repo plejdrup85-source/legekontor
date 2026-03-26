@@ -279,21 +279,9 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
     amount_raw = m.groupdict().get("amount")
     line_amount = _parse_money(amount_raw) if amount_raw else None
 
-    # === CRITICAL: calculated_unit_price ===
-    # This is the price per INDIVIDUAL UNIT (not per package).
-    #
-    # Formula:
-    #   calculated_unit_price = (price_before_discount * (1 - discount_pct/100)) / packaging_count
-    #
-    # - price_before_discount: list price per price_unit
-    # - discount_pct: discount percentage (e.g. 5.0 means 5%)
-    # - packaging_count: items per package (from "á 25 STK" → 25)
-    #
-    # If packaging info is absent, packaging_count defaults to 1,
-    # so the formula simplifies to: price * (1 - discount/100).
-    #
-    # quantity_purchased (Kvt.) is NOT used here — it's only how many
-    # packages were ordered, not the packaging size.
+    # === calculated_unit_price (support field) ===
+    # Price per individual unit, derived from NorEngros price fields.
+    # Useful for reference but NOT the primary comparison basis.
     calculated_unit_price = None
     if price_before_discount is not None:
         discount_factor = 1.0
@@ -303,6 +291,31 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
             price_before_discount * discount_factor / packaging_count,
             4,
         )
+
+    # === total_units ===
+    # Total individual units purchased across all packages.
+    #   total_units = quantity_purchased (Kvt.) × packaging_count
+    # Example: Kvt.=4, packaging="á 30 STK" → 4 × 30 = 120 units
+    total_units = quantity_purchased * packaging_count
+
+    # === competitor_line_amount ===
+    # The authoritative NorEngros line total (Beløp from invoice).
+    # This is the ground truth for what the competitor charges.
+    # If line_amount is missing, fall back to calculation from fields.
+    competitor_line_amount = line_amount
+    if competitor_line_amount is None and price_before_discount is not None:
+        discount_factor = 1.0
+        if discount_pct is not None:
+            discount_factor = 1.0 - (discount_pct / 100.0)
+        competitor_line_amount = round(
+            price_before_discount * discount_factor * quantity_purchased,
+            2,
+        )
+
+    # === Comparison fields (populated during matching) ===
+    # our_unit_price: our catalog price per unit (set during matching)
+    # our_comparable_line_price: total_units × our_unit_price
+    # savings_amount: competitor_line_amount - our_comparable_line_price
 
     return {
         "source_file": source_file,
@@ -318,6 +331,12 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
         "discount_pct": discount_pct,
         "line_amount": line_amount,
         "calculated_unit_price": calculated_unit_price,
+        "total_units": total_units,
+        "competitor_line_amount": competitor_line_amount,
+        # Placeholders — set during matching step:
+        "our_unit_price": None,
+        "our_comparable_line_price": None,
+        "savings_amount": None,
     }
 
 
@@ -351,12 +370,18 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
         price = _to_float(row_dict.get("Konkurrent Pris"))
         qty = _to_float(row_dict.get("Antall"))
 
+        qty_val = qty if qty else 0.0
+        # For generic XLSX: no packaging info, so total_units = quantity
+        total_units = qty_val * 1  # packaging_count = 1
+        # competitor_line_amount: qty × price if available
+        competitor_line_amount = round(qty_val * price, 2) if (price is not None and qty_val) else None
+
         rows.append({
             "source_file": source_file,
             "competitor": str(row_dict.get("Konkurrent Navn", "") or "").strip(),
             "competitor_artnr": art,
             "description": desc,
-            "quantity_purchased": qty if qty else 0.0,
+            "quantity_purchased": qty_val,
             "packaging_text": "",
             "packaging_count": 1,
             "unit": str(row_dict.get("Konkurrent salgsenhet", "") or "").strip(),
@@ -364,7 +389,12 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
             "price_before_discount": price,
             "discount_pct": None,
             "line_amount": None,
-            "calculated_unit_price": price,  # no discount/packaging for generic XLSX
+            "calculated_unit_price": price,
+            "total_units": total_units,
+            "competitor_line_amount": competitor_line_amount,
+            "our_unit_price": None,
+            "our_comparable_line_price": None,
+            "savings_amount": None,
         })
 
     return rows
