@@ -18,6 +18,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 import secrets
 
 from matcher import Catalog, CancelledError
+from v2.router import v2_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -51,6 +52,7 @@ COMPETITOR_REGISTER_PATH = DATA_DIR / "competitor_price_register.xlsx"
 # APP STATE
 # ============================================================
 app = FastAPI(title=APP_TITLE, version=os.getenv("APP_VERSION", "2.6"))
+app.include_router(v2_router, prefix="/v2")
 
 # ============================================================
 # BASIC AUTH (PASSORDBESKYTTELSE)
@@ -1092,6 +1094,7 @@ INDEX_HTML = """
 <body>
   <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" style="max-height:110px; width:auto;" onerror="this.style.display='none';"/></div>
   <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">__APP_SUBTITLE__</div>
+  <div style="margin-bottom:12px;"><a href="/v2/">Prisammenligning V2 &rarr;</a></div>
   <div class="card">
     <div class="row">
       <div class="col">
