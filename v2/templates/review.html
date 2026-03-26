@@ -97,6 +97,7 @@
     <button class="sm success" id="btnBulkApprove" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
     <button class="sm danger" id="btnBulkReject" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
     <button class="sm secondary" id="btnBatchSelect" onclick="batchSelect()">Auto-velg beste</button>
+    <a id="exportLink" style="display:none;"><button class="sm" type="button">Last ned Excel</button></a>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
   </div>
 
@@ -124,6 +125,9 @@ async function loadReview() {
   locked = data.lock?.locked || false;
 
   document.getElementById('jobIdDisplay').textContent = JOB_ID.substring(0, 12) + '...';
+  const exportEl = document.getElementById('exportLink');
+  exportEl.href = '/v2/export/' + JOB_ID;
+  exportEl.style.display = 'inline';
   updateSummary(data.summary);
   updateLockUI();
   applyFilters();

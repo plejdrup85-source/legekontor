@@ -3,16 +3,18 @@ import logging
 import threading
 import uuid
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
 
 from fastapi import APIRouter, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from v2.parsing import classify_file, parse_file
 from v2.normalize import deduplicate
 from v2.matching import match_deduped_rows
 from v2 import persistence as rv
+from v2.export import generate_export_xlsx
 
 logger = logging.getLogger(__name__)
 
@@ -648,6 +650,53 @@ def v2_review_ui(job_id: str):
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     html_path = Path(__file__).parent / "templates" / "review.html"
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+# ============================================================
+# V2 EXPORT
+# ============================================================
+
+V2_EXPORTS_DIR = V2_DIR / "exports"
+V2_EXPORTS_DIR.mkdir(exist_ok=True)
+
+
+@v2_router.get("/export/{job_id}")
+def v2_export(job_id: str):
+    """Generate and download Excel export from review state."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t.get("status") not in ("review", "matched"):
+        return JSONResponse(
+            {"error": f"Eksport ikke tilgjengelig (status: {t.get('status')})"},
+            status_code=400,
+        )
+
+    review_rows = rv.load_review(job_id)
+    if review_rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+
+    rows = rv.apply_overrides(review_rows, job_id)
+
+    try:
+        xlsx_bytes = generate_export_xlsx(rows)
+    except Exception as e:
+        logger.exception(f"V2 eksport feilet for job={job_id}")
+        return JSONResponse({"error": f"Eksport feilet: {e}"}, status_code=500)
+
+    # Persist export to disk
+    export_path = V2_EXPORTS_DIR / f"{job_id}.xlsx"
+    try:
+        export_path.write_bytes(xlsx_bytes)
+    except Exception as e:
+        logger.warning(f"V2: Kunne ikke lagre eksport til disk: {e}")
+
+    filename = f"V2_prissammenligning_{job_id[:12]}.xlsx"
+    return StreamingResponse(
+        BytesIO(xlsx_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ============================================================
