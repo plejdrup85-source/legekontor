@@ -10,6 +10,7 @@ from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 
 from v2.parsing import classify_file, parse_file
+from v2.normalize import deduplicate
 
 logger = logging.getLogger(__name__)
 
@@ -212,9 +213,12 @@ def _parse_job_files(job_id: str) -> None:
             entry["parse_error"] = str(e)
             parse_error_count += 1
 
-    # Assign sequential row_idx across all files
+    # Assign sequential row_idx across all raw rows
     for idx, row in enumerate(all_rows):
         row["row_idx"] = idx
+
+    # Deduplicate
+    deduped_rows = deduplicate(all_rows)
 
     # Update overall job status
     if parsed_count == 0 and parse_error_count > 0:
@@ -228,14 +232,21 @@ def _parse_job_files(job_id: str) -> None:
     task["parse_error_files"] = parse_error_count
     task["total_rows"] = len(all_rows)
     task["rows"] = all_rows
+    task["deduped_rows"] = deduped_rows
+    task["deduped_count"] = len(deduped_rows)
 
-    # Persist parsed rows to disk
-    rows_path = V2_UPLOADS_DIR / job_id / "parsed_rows.json"
+    # Persist both raw and deduped rows to disk
+    job_dir = V2_UPLOADS_DIR / job_id
     try:
-        with open(rows_path, "w", encoding="utf-8") as f:
+        with open(job_dir / "parsed_rows.json", "w", encoding="utf-8") as f:
             json.dump(all_rows, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"V2: Kunne ikke lagre parsed rows: {e}")
+    try:
+        with open(job_dir / "deduped_rows.json", "w", encoding="utf-8") as f:
+            json.dump(deduped_rows, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"V2: Kunne ikke lagre deduped rows: {e}")
 
     _append_v2_job({
         "job_id": job_id,
@@ -243,9 +254,13 @@ def _parse_job_files(job_id: str) -> None:
         "parsed_files": parsed_count,
         "parse_error_files": parse_error_count,
         "total_rows": len(all_rows),
+        "deduped_count": len(deduped_rows),
     })
 
-    logger.info(f"V2 parsing ferdig: job={job_id}, parsed={parsed_count}, errors={parse_error_count}, rows={len(all_rows)}")
+    logger.info(
+        f"V2 parsing ferdig: job={job_id}, parsed={parsed_count}, errors={parse_error_count}, "
+        f"rows={len(all_rows)}, deduped={len(deduped_rows)}"
+    )
 
 
 @v2_router.get("/status/{job_id}")
@@ -265,18 +280,23 @@ def v2_status(job_id: str):
         "parsed_files": t.get("parsed_files"),
         "parse_error_files": t.get("parse_error_files"),
         "total_rows": t.get("total_rows", 0),
+        "deduped_count": t.get("deduped_count"),
     }
 
 
 @v2_router.get("/rows/{job_id}")
-def v2_rows(job_id: str):
-    """Get parsed rows for a V2 job."""
+def v2_rows(job_id: str, deduped: bool = True):
+    """Get rows for a V2 job. Use ?deduped=false for raw parsed rows."""
     t = V2_TASKS.get(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     if t["status"] == "parsing":
         return JSONResponse({"error": "Parsing pågår fortsatt"}, status_code=409)
-    return {"job_id": job_id, "total_rows": t.get("total_rows", 0), "rows": t.get("rows", [])}
+    if deduped:
+        rows = t.get("deduped_rows", [])
+        return {"job_id": job_id, "type": "deduped", "count": len(rows), "rows": rows}
+    rows = t.get("rows", [])
+    return {"job_id": job_id, "type": "raw", "count": len(rows), "rows": rows}
 
 
 @v2_router.get("/jobs")
@@ -409,7 +429,12 @@ async function pollParseStatus(jobId) {
     const resp = await fetch('/v2/status/' + jobId);
     const data = await resp.json();
     let label = statusLabel(data.status);
-    if (data.total_rows > 0) label += ' (' + data.total_rows + ' rader totalt)';
+    if (data.total_rows > 0) {
+      label += ' (' + data.total_rows + ' rader';
+      if (data.deduped_count != null && data.deduped_count !== data.total_rows)
+        label += ', ' + data.deduped_count + ' unike';
+      label += ')';
+    }
     document.getElementById('resultStatus').textContent = label;
     showDetailedFileResults(data.files || []);
 
