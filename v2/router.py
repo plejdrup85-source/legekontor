@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -7,6 +8,8 @@ from typing import Any, Dict, List
 
 from fastapi import APIRouter, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
+
+from v2.parsing import classify_file, parse_file
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +83,7 @@ def v2_index():
 
 @v2_router.post("/upload")
 async def v2_upload(files: List[UploadFile] = File(...)):
-    """Accept one or more PDF/XLSX files, create a V2 job."""
+    """Accept one or more PDF/XLSX files, create a V2 job, and start parsing."""
     job_id = uuid.uuid4().hex
     now = _utc_now_iso()
 
@@ -96,22 +99,19 @@ async def v2_upload(files: List[UploadFile] = File(...)):
         try:
             content = await f.read()
             if not content:
-                entry["status"] = "error"
+                entry["upload_status"] = "error"
                 entry["error"] = "Tom fil"
                 file_results.append(entry)
                 continue
 
-            lower = filename.lower()
-            is_pdf = lower.endswith(".pdf") or (len(content) >= 4 and content[:4] == b"%PDF")
-            is_xlsx = lower.endswith(".xlsx") or (len(content) >= 2 and content[:2] == b"PK")
+            file_type = classify_file(filename, content)
 
-            if not (is_pdf or is_xlsx):
-                entry["status"] = "error"
+            if file_type == "unknown":
+                entry["upload_status"] = "error"
                 entry["error"] = "Ugyldig filformat. Kun .xlsx og .pdf er støttet."
                 file_results.append(entry)
                 continue
 
-            file_type = "pdf" if is_pdf else "xlsx"
             entry["type"] = file_type
             entry["size_bytes"] = len(content)
 
@@ -120,19 +120,18 @@ async def v2_upload(files: List[UploadFile] = File(...)):
             dest = job_upload_dir / safe_name
             dest.write_bytes(content)
             entry["stored_as"] = safe_name
-            entry["status"] = "uploaded"
+            entry["upload_status"] = "uploaded"
 
         except Exception as e:
-            entry["status"] = "error"
+            entry["upload_status"] = "error"
             entry["error"] = str(e)
 
         file_results.append(entry)
 
-    uploaded_count = sum(1 for fr in file_results if fr.get("status") == "uploaded")
-    error_count = sum(1 for fr in file_results if fr.get("status") == "error")
+    uploaded_count = sum(1 for fr in file_results if fr.get("upload_status") == "uploaded")
+    error_count = sum(1 for fr in file_results if fr.get("upload_status") == "error")
 
     if uploaded_count == 0:
-        # Clean up empty directory
         try:
             job_upload_dir.rmdir()
         except Exception:
@@ -142,11 +141,11 @@ async def v2_upload(files: List[UploadFile] = File(...)):
             status_code=400,
         )
 
-    # Register job
+    # Register job as uploaded, then start background parsing
     task_entry = {
         "job_id": job_id,
         "created_at": now,
-        "status": "uploaded",
+        "status": "parsing",
         "files": file_results,
         "total_files": len(file_results),
         "uploaded_files": uploaded_count,
@@ -156,12 +155,81 @@ async def v2_upload(files: List[UploadFile] = File(...)):
     V2_TASKS[job_id] = task_entry
     _append_v2_job(task_entry)
 
+    # Start parsing in background thread
+    threading.Thread(target=_parse_job_files, args=(job_id,), daemon=True).start()
+
     return {"ok": True, "job_id": job_id, "files": file_results}
+
+
+def _parse_job_files(job_id: str) -> None:
+    """Background worker: parse each uploaded file and update job status."""
+    task = V2_TASKS.get(job_id)
+    if not task:
+        return
+
+    job_upload_dir = V2_UPLOADS_DIR / job_id
+    parsed_count = 0
+    parse_error_count = 0
+
+    for entry in task["files"]:
+        if entry.get("upload_status") != "uploaded":
+            continue
+
+        stored_as = entry.get("stored_as")
+        if not stored_as:
+            continue
+
+        filepath = job_upload_dir / stored_as
+        if not filepath.exists():
+            entry["parse_status"] = "error"
+            entry["parse_error"] = "Fil ikke funnet på disk"
+            parse_error_count += 1
+            continue
+
+        try:
+            content = filepath.read_bytes()
+            parse_result = parse_file(entry["filename"], content)
+
+            entry["parse_status"] = parse_result.get("parse_status", "error")
+            entry["parse_meta"] = {
+                k: v for k, v in parse_result.items()
+                if k not in ("parse_status", "error")
+            }
+            if parse_result.get("error"):
+                entry["parse_error"] = parse_result["error"]
+                parse_error_count += 1
+            else:
+                parsed_count += 1
+
+        except Exception as e:
+            entry["parse_status"] = "error"
+            entry["parse_error"] = str(e)
+            parse_error_count += 1
+
+    # Update overall job status
+    if parsed_count == 0 and parse_error_count > 0:
+        task["status"] = "error"
+    elif parse_error_count > 0:
+        task["status"] = "partial_error"
+    else:
+        task["status"] = "parsed"
+
+    task["parsed_files"] = parsed_count
+    task["parse_error_files"] = parse_error_count
+
+    _append_v2_job({
+        "job_id": job_id,
+        "status": task["status"],
+        "parsed_files": parsed_count,
+        "parse_error_files": parse_error_count,
+    })
+
+    logger.info(f"V2 parsing ferdig: job={job_id}, parsed={parsed_count}, errors={parse_error_count}")
 
 
 @v2_router.get("/status/{job_id}")
 def v2_status(job_id: str):
-    """Get status for a V2 job."""
+    """Get status for a V2 job, including per-file parse results."""
     t = V2_TASKS.get(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
@@ -173,6 +241,8 @@ def v2_status(job_id: str):
         "total_files": t.get("total_files", 0),
         "uploaded_files": t.get("uploaded_files", 0),
         "error_files": t.get("error_files", 0),
+        "parsed_files": t.get("parsed_files"),
+        "parse_error_files": t.get("parse_error_files"),
     }
 
 
@@ -183,7 +253,7 @@ def v2_jobs(limit: int = 50):
 
 
 # ============================================================
-# V2 FRONTEND (inline HTML)
+# V2 FRONTEND
 # ============================================================
 V2_INDEX_HTML = """<!doctype html>
 <html>
@@ -202,15 +272,19 @@ V2_INDEX_HTML = """<!doctype html>
     .file-item { padding:6px 10px; border:1px solid #e6e6e6; border-radius:6px; margin:4px 0; display:flex; justify-content:space-between; align-items:center; }
     .file-item.error { border-color:#e74c3c; background:#fdf2f2; }
     .file-item.ok { border-color:#27ae60; background:#f2fdf5; }
+    .file-item.parsing { border-color:#f39c12; background:#fffdf2; }
     .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:12px; font-weight:600; }
     .tag-pdf { background:#fff3e0; color:#e65100; }
     .tag-xlsx { background:#e3f2fd; color:#1565c0; }
     .tag-error { background:#ffebee; color:#c62828; }
+    .tag-parsed { background:#e8f5e9; color:#2e7d32; }
+    .tag-ocr { background:#f3e5f5; color:#6a1b9a; }
     .result-box { margin-top:16px; padding:14px; background:#f8f9fa; border-radius:8px; border:1px solid #e6e6e6; display:none; }
     table { width:100%; border-collapse:collapse; margin-top:12px; }
     th, td { text-align:left; border-bottom:1px solid #eee; padding:8px 6px; }
     th { font-size:13px; color:#444; }
     .right { text-align:right; }
+    .parse-detail { font-size:12px; color:#888; margin-top:2px; }
   </style>
 </head>
 <body>
@@ -222,7 +296,7 @@ V2_INDEX_HTML = """<!doctype html>
     <p class="muted">Velg en eller flere PDF-fakturaer og/eller Excel-filer (.xlsx).</p>
     <input id="files" type="file" accept=".xlsx,.pdf" multiple />
     <div id="selectedFiles" class="file-list"></div>
-    <button id="btnUpload" disabled>Last opp</button>
+    <button id="btnUpload" disabled>Last opp og analyser</button>
     <span id="uploadStatus" class="muted" style="margin-left:12px;"></span>
 
     <div id="resultBox" class="result-box">
@@ -241,7 +315,7 @@ V2_INDEX_HTML = """<!doctype html>
 <script>
 const fileInput = document.getElementById('files');
 const btnUpload = document.getElementById('btnUpload');
-const selectedFiles = document.getElementById('selectedFiles');
+const selectedFilesEl = document.getElementById('selectedFiles');
 
 fileInput.addEventListener('change', () => {
   const fl = fileInput.files;
@@ -255,7 +329,7 @@ fileInput.addEventListener('change', () => {
       ' <span class="tag ' + tagClass + '">' + esc(ext.toUpperCase()) + '</span></span>' +
       '<span class="muted">' + size + ' KB</span></div>';
   }
-  selectedFiles.innerHTML = html;
+  selectedFilesEl.innerHTML = html;
 });
 
 btnUpload.addEventListener('click', async () => {
@@ -280,29 +354,94 @@ btnUpload.addEventListener('click', async () => {
     }
 
     document.getElementById('uploadStatus').textContent = '';
-    document.getElementById('resultJobId').textContent = data.job_id;
-    document.getElementById('resultStatus').textContent = 'Lastet opp';
+    const jobId = data.job_id;
+    document.getElementById('resultJobId').textContent = jobId;
+    document.getElementById('resultStatus').textContent = 'Parsing...';
     showFileResults(data.files || []);
     document.getElementById('resultBox').style.display = 'block';
 
     fileInput.value = '';
-    selectedFiles.innerHTML = '';
-    loadJobs();
+    selectedFilesEl.innerHTML = '';
+
+    // Poll for parse completion
+    pollParseStatus(jobId);
   } catch (e) {
     document.getElementById('uploadStatus').textContent = 'Nettverksfeil: ' + e.message;
   }
   btnUpload.disabled = false;
 });
 
+async function pollParseStatus(jobId) {
+  try {
+    const resp = await fetch('/v2/status/' + jobId);
+    const data = await resp.json();
+    document.getElementById('resultStatus').textContent = statusLabel(data.status);
+    showDetailedFileResults(data.files || []);
+
+    if (data.status === 'parsing') {
+      setTimeout(() => pollParseStatus(jobId), 1500);
+      return;
+    }
+    loadJobs();
+  } catch (e) {
+    document.getElementById('resultStatus').textContent = 'Polling feilet';
+  }
+}
+
+function statusLabel(s) {
+  const map = {
+    'uploaded': 'Lastet opp',
+    'parsing': 'Analyserer...',
+    'parsed': 'Ferdig analysert',
+    'partial_error': 'Delvis feil',
+    'error': 'Feil',
+  };
+  return map[s] || s;
+}
+
 function showFileResults(files) {
   let html = '';
   for (const f of files) {
-    const ok = f.status === 'uploaded';
+    const ok = f.upload_status === 'uploaded';
     const cls = ok ? 'ok' : 'error';
     const info = ok
       ? '<span class="tag tag-' + (f.type || 'xlsx') + '">' + esc((f.type || '').toUpperCase()) + '</span> ' + ((f.size_bytes / 1024).toFixed(1)) + ' KB'
       : '<span class="tag tag-error">' + esc(f.error || 'Feil') + '</span>';
     html += '<div class="file-item ' + cls + '"><span>' + esc(f.filename) + '</span><span>' + info + '</span></div>';
+  }
+  document.getElementById('resultFiles').innerHTML = html;
+}
+
+function showDetailedFileResults(files) {
+  let html = '';
+  for (const f of files) {
+    const uploadOk = f.upload_status === 'uploaded';
+    if (!uploadOk) {
+      html += '<div class="file-item error"><span>' + esc(f.filename) + '</span><span class="tag tag-error">' + esc(f.error || 'Opplasting feilet') + '</span></div>';
+      continue;
+    }
+    const parseStatus = f.parse_status || 'pending';
+    const cls = parseStatus === 'parsed' ? 'ok' : (parseStatus === 'error' ? 'error' : 'parsing');
+    const meta = f.parse_meta || {};
+
+    let tags = '<span class="tag tag-' + (f.type || 'xlsx') + '">' + esc((f.type || '').toUpperCase()) + '</span> ';
+    if (parseStatus === 'parsed') tags += '<span class="tag tag-parsed">Analysert</span> ';
+    if (parseStatus === 'error') tags += '<span class="tag tag-error">' + esc(f.parse_error || 'Feil') + '</span> ';
+    if (meta.ocr_used) tags += '<span class="tag tag-ocr">OCR</span> ';
+
+    let detail = '';
+    if (f.type === 'pdf' && parseStatus === 'parsed') {
+      detail = (meta.page_count || '?') + ' sider, ' + (meta.text_length || 0) + ' tegn';
+      if (meta.ocr_needed && !meta.ocr_used) detail += ', OCR ikke tilgjengelig';
+    }
+    if (f.type === 'xlsx' && parseStatus === 'parsed') {
+      const sheets = meta.sheets || [];
+      detail = sheets.length + ' ark, ' + (meta.total_rows || 0) + ' rader';
+    }
+
+    html += '<div class="file-item ' + cls + '"><div><span>' + esc(f.filename) + '</span> ' + tags;
+    if (detail) html += '<div class="parse-detail">' + esc(detail) + '</div>';
+    html += '</div><span class="muted">' + ((f.size_bytes / 1024).toFixed(1)) + ' KB</span></div>';
   }
   document.getElementById('resultFiles').innerHTML = html;
 }
@@ -332,9 +471,11 @@ async function loadJobs() {
     }
     let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th>Jobb-ID</th></tr></thead><tbody>';
     for (const j of jobs) {
-      html += '<tr><td>' + esc(formatOsloTime(j.created_at)) + '</td><td>' + esc(j.status) +
-        '</td><td class="right">' + esc(j.uploaded_files || 0) + ' ok';
-      if (j.error_files) html += ', ' + esc(j.error_files) + ' feil';
+      const st = statusLabel(j.status);
+      html += '<tr><td>' + esc(formatOsloTime(j.created_at)) + '</td><td>' + esc(st) +
+        '</td><td class="right">' + esc(j.uploaded_files || 0) + ' lastet opp';
+      if (j.parsed_files != null) html += ', ' + esc(j.parsed_files) + ' analysert';
+      if (j.parse_error_files) html += ', ' + esc(j.parse_error_files) + ' feil';
       html += '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
     }
     html += '</tbody></table>';
