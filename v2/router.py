@@ -170,6 +170,7 @@ def _parse_job_files(job_id: str) -> None:
     job_upload_dir = V2_UPLOADS_DIR / job_id
     parsed_count = 0
     parse_error_count = 0
+    all_rows: List[Dict[str, Any]] = []
 
     for entry in task["files"]:
         if entry.get("upload_status") != "uploaded":
@@ -193,7 +194,7 @@ def _parse_job_files(job_id: str) -> None:
             entry["parse_status"] = parse_result.get("parse_status", "error")
             entry["parse_meta"] = {
                 k: v for k, v in parse_result.items()
-                if k not in ("parse_status", "error")
+                if k not in ("parse_status", "error", "rows")
             }
             if parse_result.get("error"):
                 entry["parse_error"] = parse_result["error"]
@@ -201,10 +202,19 @@ def _parse_job_files(job_id: str) -> None:
             else:
                 parsed_count += 1
 
+            # Collect rows from this file
+            file_rows = parse_result.get("rows", [])
+            entry["row_count"] = len(file_rows)
+            all_rows.extend(file_rows)
+
         except Exception as e:
             entry["parse_status"] = "error"
             entry["parse_error"] = str(e)
             parse_error_count += 1
+
+    # Assign sequential row_idx across all files
+    for idx, row in enumerate(all_rows):
+        row["row_idx"] = idx
 
     # Update overall job status
     if parsed_count == 0 and parse_error_count > 0:
@@ -216,15 +226,26 @@ def _parse_job_files(job_id: str) -> None:
 
     task["parsed_files"] = parsed_count
     task["parse_error_files"] = parse_error_count
+    task["total_rows"] = len(all_rows)
+    task["rows"] = all_rows
+
+    # Persist parsed rows to disk
+    rows_path = V2_UPLOADS_DIR / job_id / "parsed_rows.json"
+    try:
+        with open(rows_path, "w", encoding="utf-8") as f:
+            json.dump(all_rows, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"V2: Kunne ikke lagre parsed rows: {e}")
 
     _append_v2_job({
         "job_id": job_id,
         "status": task["status"],
         "parsed_files": parsed_count,
         "parse_error_files": parse_error_count,
+        "total_rows": len(all_rows),
     })
 
-    logger.info(f"V2 parsing ferdig: job={job_id}, parsed={parsed_count}, errors={parse_error_count}")
+    logger.info(f"V2 parsing ferdig: job={job_id}, parsed={parsed_count}, errors={parse_error_count}, rows={len(all_rows)}")
 
 
 @v2_router.get("/status/{job_id}")
@@ -243,7 +264,19 @@ def v2_status(job_id: str):
         "error_files": t.get("error_files", 0),
         "parsed_files": t.get("parsed_files"),
         "parse_error_files": t.get("parse_error_files"),
+        "total_rows": t.get("total_rows", 0),
     }
+
+
+@v2_router.get("/rows/{job_id}")
+def v2_rows(job_id: str):
+    """Get parsed rows for a V2 job."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t["status"] == "parsing":
+        return JSONResponse({"error": "Parsing pågår fortsatt"}, status_code=409)
+    return {"job_id": job_id, "total_rows": t.get("total_rows", 0), "rows": t.get("rows", [])}
 
 
 @v2_router.get("/jobs")
@@ -375,7 +408,9 @@ async function pollParseStatus(jobId) {
   try {
     const resp = await fetch('/v2/status/' + jobId);
     const data = await resp.json();
-    document.getElementById('resultStatus').textContent = statusLabel(data.status);
+    let label = statusLabel(data.status);
+    if (data.total_rows > 0) label += ' (' + data.total_rows + ' rader totalt)';
+    document.getElementById('resultStatus').textContent = label;
     showDetailedFileResults(data.files || []);
 
     if (data.status === 'parsing') {
@@ -432,12 +467,14 @@ function showDetailedFileResults(files) {
     let detail = '';
     if (f.type === 'pdf' && parseStatus === 'parsed') {
       detail = (meta.page_count || '?') + ' sider, ' + (meta.text_length || 0) + ' tegn';
+      if (meta.detected_source) detail += ', kilde: ' + meta.detected_source;
       if (meta.ocr_needed && !meta.ocr_used) detail += ', OCR ikke tilgjengelig';
     }
     if (f.type === 'xlsx' && parseStatus === 'parsed') {
       const sheets = meta.sheets || [];
       detail = sheets.length + ' ark, ' + (meta.total_rows || 0) + ' rader';
     }
+    if (f.row_count != null && f.row_count > 0) detail += (detail ? ', ' : '') + f.row_count + ' produktrader';
 
     html += '<div class="file-item ' + cls + '"><div><span>' + esc(f.filename) + '</span> ' + tags;
     if (detail) html += '<div class="parse-detail">' + esc(detail) + '</div>';
@@ -469,14 +506,15 @@ async function loadJobs() {
       document.getElementById('jobsList').innerHTML = '<p class="muted">Ingen V2-jobber enda.</p>';
       return;
     }
-    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th>Jobb-ID</th></tr></thead><tbody>';
+    let html = '<table><thead><tr><th>Tidspunkt</th><th>Status</th><th class="right">Filer</th><th class="right">Rader</th><th>Jobb-ID</th></tr></thead><tbody>';
     for (const j of jobs) {
       const st = statusLabel(j.status);
       html += '<tr><td>' + esc(formatOsloTime(j.created_at)) + '</td><td>' + esc(st) +
         '</td><td class="right">' + esc(j.uploaded_files || 0) + ' lastet opp';
       if (j.parsed_files != null) html += ', ' + esc(j.parsed_files) + ' analysert';
       if (j.parse_error_files) html += ', ' + esc(j.parse_error_files) + ' feil';
-      html += '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
+      html += '</td><td class="right">' + esc(j.total_rows || 0) +
+        '</td><td><code>' + esc((j.job_id || '').substring(0, 12)) + '&hellip;</code></td></tr>';
     }
     html += '</tbody></table>';
     document.getElementById('jobsList').innerHTML = html;
