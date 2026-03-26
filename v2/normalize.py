@@ -67,6 +67,26 @@ def _dedup_key(row: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _check_consistency(group: List[Dict[str, Any]], fields: List[str]) -> List[Dict[str, Any]]:
+    """Check if all rows in a merge group have identical values for given fields.
+
+    Returns a list of dicts describing each inconsistent field, e.g.:
+      [{"field": "packaging_count", "values": [25, 50]}]
+
+    Returns empty list if all fields are consistent.
+    """
+    inconsistencies: List[Dict[str, Any]] = []
+    for field in fields:
+        values = [r.get(field) for r in group]
+        unique = []
+        for v in values:
+            if v not in unique:
+                unique.append(v)
+        if len(unique) > 1:
+            inconsistencies.append({"field": field, "values": unique})
+    return inconsistencies
+
+
 def _merge_rows(group: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge a group of duplicate rows into one deduplicated row.
 
@@ -106,6 +126,12 @@ def _merge_rows(group: List[Dict[str, Any]]) -> Dict[str, Any]:
             "line_amount": r.get("line_amount"),
         })
 
+    # Check consistency of identity fields across the group
+    inconsistent_fields = _check_consistency(group, [
+        "packaging_text", "packaging_count", "unit",
+        "price_unit", "price_before_discount", "discount_pct",
+    ])
+
     merged = {
         # Identity fields — from first row
         "source_file": source_files[0] if len(source_files) == 1 else source_files,
@@ -131,6 +157,9 @@ def _merge_rows(group: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Traceability
         "merged_from_count": len(group),
         "source_rows": source_rows,
+        # Consistency
+        "merge_warning": bool(inconsistent_fields),
+        "inconsistent_fields": inconsistent_fields,
     }
 
     return merged
@@ -167,6 +196,8 @@ def deduplicate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             # Single row — no merge needed, but add traceability fields
             single = dict(group[0])
             single["merged_from_count"] = 1
+            single["merge_warning"] = False
+            single["inconsistent_fields"] = []
             single["source_rows"] = [{
                 "row_idx": single.get("row_idx"),
                 "source_file": single.get("source_file"),
@@ -183,6 +214,8 @@ def deduplicate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for row in ungrouped:
         single = dict(row)
         single["merged_from_count"] = 1
+        single["merge_warning"] = False
+        single["inconsistent_fields"] = []
         single["source_rows"] = [{
             "row_idx": single.get("row_idx"),
             "source_file": single.get("source_file"),
