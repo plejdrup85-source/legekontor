@@ -15,6 +15,7 @@ from v2.normalize import deduplicate
 from v2.matching import match_deduped_rows
 from v2 import persistence as rv
 from v2.export import generate_export_xlsx
+from v2 import pricedb
 
 logger = logging.getLogger(__name__)
 
@@ -700,6 +701,57 @@ def v2_export(job_id: str):
 
 
 # ============================================================
+# V2 PRICE DATABASE
+# ============================================================
+
+@v2_router.post("/pricedb/commit/{job_id}")
+def v2_pricedb_commit(job_id: str):
+    """Commit approved review rows to the price database."""
+    t = V2_TASKS.get(job_id)
+    if not t:
+        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if t.get("status") not in ("review", "matched"):
+        return JSONResponse(
+            {"error": f"Kan ikke committe jobb med status '{t.get('status')}'"},
+            status_code=400,
+        )
+
+    review_rows = rv.load_review(job_id)
+    if review_rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+
+    rows = rv.apply_overrides(review_rows, job_id)
+    count = pricedb.commit_job(job_id, rows)
+    return {"ok": True, "job_id": job_id, "committed": count}
+
+
+@v2_router.get("/pricedb")
+def v2_pricedb_search(
+    q: str = "",
+    competitor: str = "",
+    competitor_artnr: str = "",
+    our_artnr: str = "",
+    limit: int = 500,
+):
+    """Search the price database."""
+    records = pricedb.search(
+        text=q or None,
+        competitor=competitor or None,
+        competitor_artnr=competitor_artnr or None,
+        our_artnr=our_artnr or None,
+        limit=limit,
+    )
+    return {"count": len(records), "records": records}
+
+
+@v2_router.get("/pricedb/ui", response_class=HTMLResponse)
+def v2_pricedb_ui():
+    """Serve the price database UI page."""
+    html_path = Path(__file__).parent / "templates" / "pricedb.html"
+    return HTMLResponse(html_path.read_text(encoding="utf-8"))
+
+
+# ============================================================
 # V2 FRONTEND
 # ============================================================
 V2_INDEX_HTML = """<!doctype html>
@@ -735,7 +787,7 @@ V2_INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <div style="margin-bottom:12px;"><a href="/">&larr; Tilbake til V1</a></div>
+  <div style="margin-bottom:12px;"><a href="/">&larr; Tilbake til V1</a> &nbsp; <a href="/v2/pricedb/ui">Prisdatabase</a></div>
   <div class="card">
     <h2>Prisammenligning V2</h2>
 

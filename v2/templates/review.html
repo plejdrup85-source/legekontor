@@ -98,6 +98,7 @@
     <button class="sm danger" id="btnBulkReject" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
     <button class="sm secondary" id="btnBatchSelect" onclick="batchSelect()">Auto-velg beste</button>
     <a id="exportLink" style="display:none;"><button class="sm" type="button">Last ned Excel</button></a>
+    <button class="sm" id="btnCommitDb" onclick="commitToDb()" style="display:none;">Lagre til prisdatabase</button>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
   </div>
 
@@ -128,6 +129,7 @@ async function loadReview() {
   const exportEl = document.getElementById('exportLink');
   exportEl.href = '/v2/export/' + JOB_ID;
   exportEl.style.display = 'inline';
+  document.getElementById('btnCommitDb').style.display = 'inline';
   updateSummary(data.summary);
   updateLockUI();
   applyFilters();
@@ -414,6 +416,21 @@ function savingsHtml(v) {
   if (n > 0) return '<span class="savings-pos">+' + formatted + '</span>';
   if (n < 0) return '<span class="savings-neg">-' + formatted + '</span>';
   return formatted;
+}
+
+async function commitToDb() {
+  const approved = allRows.filter(r => r.review_status === 'approved').length;
+  if (approved === 0) {
+    alert('Ingen godkjente rader. Godkjenn rader for du lagrer til prisdatabasen.');
+    return;
+  }
+  if (!confirm('Lagre ' + approved + ' godkjente rader til prisdatabasen?')) return;
+  const resp = await postJson('/v2/pricedb/commit/' + JOB_ID, {});
+  if (resp.ok) {
+    alert('Lagret ' + (resp.committed || 0) + ' rader til prisdatabasen.');
+  } else {
+    alert('Feil: ' + (resp.error || 'ukjent'));
+  }
 }
 
 // --- Init ---

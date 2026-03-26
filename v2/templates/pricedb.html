@@ -1,0 +1,186 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>V2 Prisdatabase</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 0; padding: 16px 24px; color: #1a1a1a; background: #f8f9fa; }
+    a { color: #1F4E79; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    button { background: #1F4E79; color: white; border: 0; padding: 7px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    button.sm { padding: 4px 8px; font-size: 12px; }
+    button.secondary { background: #6b7280; }
+    input[type=text] { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 13px; font-family: inherit; }
+    .muted { color: #666; font-size: 13px; }
+    .header { margin-bottom: 14px; }
+    .header h2 { margin: 4px 0 0 0; }
+    .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 12px; background: white; border: 1px solid #e5e7eb; border-radius: 8px; }
+    .toolbar input[type=text] { width: 180px; }
+    table { width: 100%; border-collapse: collapse; background: white; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; }
+    th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #f0f0f0; font-size: 13px; }
+    th { background: #f9fafb; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: #6b7280; position: sticky; top: 0; }
+    td { vertical-align: top; }
+    .right { text-align: right; }
+    .savings-pos { color: #16a34a; font-weight: 600; }
+    .savings-neg { color: #dc2626; font-weight: 600; }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 11px; font-weight: 600; }
+    .badge-warn { background: #fff7ed; color: #c2410c; }
+    .pager { display: flex; justify-content: center; gap: 8px; margin: 16px 0; align-items: center; }
+    .empty { text-align: center; padding: 40px; color: #9ca3af; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <a href="/v2/">&larr; Tilbake til V2</a>
+    <h2>Prisdatabase</h2>
+  </div>
+
+  <div class="toolbar">
+    <input type="text" id="qInput" placeholder="Fritekst..." />
+    <input type="text" id="compInput" placeholder="Konkurrent..." />
+    <input type="text" id="compArtInput" placeholder="Konk. art.nr..." />
+    <input type="text" id="ourArtInput" placeholder="Vart art.nr..." />
+    <button onclick="doSearch()">Sok</button>
+    <button class="secondary" onclick="clearSearch()">Nullstill</button>
+    <span class="muted" id="resultCount"></span>
+  </div>
+
+  <div id="tableContainer"></div>
+  <div class="pager" id="pager"></div>
+
+<script>
+let allRecords = [];
+const PAGE_SIZE = 50;
+let currentPage = 0;
+
+async function doSearch() {
+  const params = new URLSearchParams();
+  const q = document.getElementById('qInput').value.trim();
+  const comp = document.getElementById('compInput').value.trim();
+  const compArt = document.getElementById('compArtInput').value.trim();
+  const ourArt = document.getElementById('ourArtInput').value.trim();
+  if (q) params.set('q', q);
+  if (comp) params.set('competitor', comp);
+  if (compArt) params.set('competitor_artnr', compArt);
+  if (ourArt) params.set('our_artnr', ourArt);
+  params.set('limit', '500');
+
+  const resp = await fetch('/v2/pricedb?' + params.toString());
+  const data = await resp.json();
+  allRecords = data.records || [];
+  document.getElementById('resultCount').textContent = allRecords.length + ' treff';
+  currentPage = 0;
+  renderPage();
+}
+
+function clearSearch() {
+  document.getElementById('qInput').value = '';
+  document.getElementById('compInput').value = '';
+  document.getElementById('compArtInput').value = '';
+  document.getElementById('ourArtInput').value = '';
+  doSearch();
+}
+
+function renderPage() {
+  const container = document.getElementById('tableContainer');
+  if (allRecords.length === 0) {
+    container.innerHTML = '<div class="empty">Ingen data i prisdatabasen enna. Godkjenn rader i review og trykk "Lagre til prisdatabase".</div>';
+    document.getElementById('pager').innerHTML = '';
+    return;
+  }
+
+  const start = currentPage * PAGE_SIZE;
+  const page = allRecords.slice(start, start + PAGE_SIZE);
+
+  let html = '<table><thead><tr>';
+  html += '<th>Dato</th>';
+  html += '<th>Konkurrent</th>';
+  html += '<th>Konk. art.nr</th>';
+  html += '<th>Beskrivelse</th>';
+  html += '<th class="right">Enheter</th>';
+  html += '<th class="right">Konk. belop</th>';
+  html += '<th>Vart art.nr</th>';
+  html += '<th>Vart produkt</th>';
+  html += '<th class="right">Var pris</th>';
+  html += '<th class="right">Vart belop</th>';
+  html += '<th class="right">Besparelse</th>';
+  html += '<th>Strategi</th>';
+  html += '<th></th>';
+  html += '</tr></thead><tbody>';
+
+  for (const r of page) {
+    const date = r.committed_at ? formatDate(r.committed_at) : '';
+    html += '<tr>';
+    html += '<td class="muted">' + esc(date) + '</td>';
+    html += '<td>' + esc(r.competitor) + '</td>';
+    html += '<td>' + esc(r.competitor_artnr) + '</td>';
+    html += '<td>' + esc(r.description) + '</td>';
+    html += '<td class="right">' + fmt(r.total_units) + '</td>';
+    html += '<td class="right">' + money(r.competitor_line_amount) + '</td>';
+    html += '<td>' + esc(r.our_artnr) + '</td>';
+    html += '<td>' + esc(r.our_description) + '</td>';
+    html += '<td class="right">' + money(r.our_unit_price) + '</td>';
+    html += '<td class="right">' + money(r.our_comparable_line_price) + '</td>';
+    html += '<td class="right">' + savingsHtml(r.savings_amount) + '</td>';
+    html += '<td>' + esc(r.strategy) + '</td>';
+    html += '<td>';
+    if (r.merge_warning) html += '<span class="badge badge-warn">Avvik</span>';
+    html += '</td>';
+    html += '</tr>';
+  }
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
+  renderPager();
+}
+
+function renderPager() {
+  const totalPages = Math.ceil(allRecords.length / PAGE_SIZE);
+  if (totalPages <= 1) { document.getElementById('pager').innerHTML = ''; return; }
+  let html = '';
+  html += '<button class="sm secondary" onclick="goPage(' + (currentPage - 1) + ')" ' + (currentPage === 0 ? 'disabled' : '') + '>&laquo;</button>';
+  html += '<span class="muted">Side ' + (currentPage + 1) + ' av ' + totalPages + '</span>';
+  html += '<button class="sm secondary" onclick="goPage(' + (currentPage + 1) + ')" ' + (currentPage >= totalPages - 1 ? 'disabled' : '') + '>&raquo;</button>';
+  document.getElementById('pager').innerHTML = html;
+}
+
+function goPage(p) {
+  const totalPages = Math.ceil(allRecords.length / PAGE_SIZE);
+  if (p < 0 || p >= totalPages) return;
+  currentPage = p;
+  renderPage();
+  window.scrollTo(0, 0);
+}
+
+function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmt(v) { return v != null ? String(v) : '-'; }
+function money(v) {
+  if (v == null) return '-';
+  const n = Number(v);
+  if (isNaN(n)) return '-';
+  return n.toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function savingsHtml(v) {
+  if (v == null) return '-';
+  const n = Number(v);
+  if (isNaN(n)) return '-';
+  const f = Math.abs(n).toLocaleString('nb-NO', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n > 0) return '<span class="savings-pos">+' + f + '</span>';
+  if (n < 0) return '<span class="savings-neg">-' + f + '</span>';
+  return f;
+}
+function formatDate(iso) {
+  if (!iso) return '';
+  try {
+    return new Intl.DateTimeFormat('nb-NO', {
+      timeZone: 'Europe/Oslo', year: 'numeric', month: '2-digit', day: '2-digit',
+    }).format(new Date(iso));
+  } catch { return iso.substring(0, 10); }
+}
+
+// Load all on init
+doSearch();
+</script>
+</body>
+</html>
