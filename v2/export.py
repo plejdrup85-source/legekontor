@@ -209,7 +209,7 @@ def generate_export_xlsx(review_rows: List[Dict[str, Any]], show_line_prices: bo
 
 
 def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: bool = True) -> bytes:
-    """Generate a PDF report from review rows.
+    """Generate a branded PDF report from review rows.
 
     Returns raw PDF bytes.
     """
@@ -220,237 +220,269 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     totals = calculate_totals(rows)
     today = date.today().strftime("%d.%m.%Y")
 
-    # -- Brand colors --
-    C_PRIMARY = (31, 78, 121)      # OneMed dark blue
-    C_ACCENT = (0, 133, 173)       # teal accent
-    C_GREEN = (22, 163, 74)
-    C_RED = (220, 38, 38)
-    C_GRAY_TEXT = (100, 100, 100)
-    C_LIGHT_BG = (247, 248, 250)
+    # -- Design tokens --
+    C_PRIMARY = (122, 166, 65)     # #7AA641 OneMed green
+    C_DARK = (31, 42, 55)         # #1F2A37 dark text
+    C_SECONDARY = (91, 101, 115)  # #5B6573 secondary text
+    C_BORDER = (217, 225, 232)    # #D9E1E8 light grey borders
+    C_PANEL = (247, 249, 251)     # #F7F9FB very light bg
+    C_SAV_BG = (238, 246, 229)    # #EEF6E5 savings highlight bg
+    C_SAV_TEXT = (94, 142, 46)    # #5E8E2E savings highlight text
     C_WHITE = (255, 255, 255)
-    C_DIVIDER = (210, 215, 220)
-    C_BLACK = (30, 30, 30)
+    C_RED = (200, 50, 50)
 
-    def _s(v, maxlen=50):
-        """Safe string format."""
+    M_LEFT = 14                    # generous outer margins
+    M_RIGHT = 14
+
+    def _s(v, maxlen=55):
         if v is None or v == "":
-            return "-"
+            return ""
         if isinstance(v, float):
             return f"{v:,.2f}"
         return str(v)[:maxlen]
 
     def _kr(v):
-        """Format as NOK amount."""
         if v is None or v == "":
-            return "-"
+            return ""
         try:
             return f"{float(v):,.2f} kr"
         except (ValueError, TypeError):
-            return "-"
+            return ""
 
     class PDF(FPDF):
         def header(self):
-            # Logo or text brand
+            # Logo or text
             if _LOGO_PATH.exists():
                 try:
-                    self.image(str(_LOGO_PATH), x=10, y=8, h=14)
+                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10, h=12)
                 except Exception:
-                    self._draw_text_logo()
+                    self._text_logo()
             else:
-                self._draw_text_logo()
-            # Right side: title + date
+                self._text_logo()
+            # Title block — right of logo or below
+            self.set_xy(M_LEFT, 24)
+            self.set_font("Helvetica", "B", 20)
+            self.set_text_color(*C_DARK)
+            self.cell(0, 8, "Prissammenligning")
+            # Date right-aligned
             self.set_font("Helvetica", "", 9)
-            self.set_text_color(*C_GRAY_TEXT)
-            self.set_xy(self.w - 80, 8)
-            self.cell(70, 5, "Prissammenligning", align="R")
-            self.set_xy(self.w - 80, 13)
-            self.cell(70, 5, today, align="R")
-            # Divider line
-            self.set_draw_color(*C_DIVIDER)
-            self.line(10, 24, self.w - 10, 24)
-            self.set_y(28)
+            self.set_text_color(*C_SECONDARY)
+            self.set_xy(self.w - M_RIGHT - 60, 26)
+            self.cell(60, 5, today, align="R")
+            # Thin divider
+            self.set_draw_color(*C_BORDER)
+            self.set_line_width(0.3)
+            self.line(M_LEFT, 35, self.w - M_RIGHT, 35)
+            self.set_y(39)
 
-        def _draw_text_logo(self):
-            self.set_font("Helvetica", "B", 16)
+        def _text_logo(self):
+            self.set_font("Helvetica", "B", 15)
             self.set_text_color(*C_PRIMARY)
-            self.text(10, 16, "OneMed")
+            self.text(M_LEFT, 18, "OneMed")
 
         def footer(self):
-            self.set_y(-12)
-            self.set_font("Helvetica", "", 7)
-            self.set_text_color(*C_GRAY_TEXT)
-            self.cell(0, 8, f"Side {self.page_no()}/{{nb}}", align="C")
+            self.set_y(-13)
+            self.set_font("Helvetica", "", 7.5)
+            self.set_text_color(*C_SECONDARY)
+            self.cell(0, 6, f"Side {self.page_no()}/{{nb}}", align="C")
 
     pdf = PDF(orientation="L", unit="mm", format="A4")
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
 
-    # ============================================================
-    # SUMMARY BOX — 3 columns: Konkurrent | OneMed | Besparelse
-    # ============================================================
-    box_y = pdf.get_y()
-    box_w = (pdf.w - 20 - 8) / 3  # 3 equal columns with 4mm gaps
-    box_h = 22
+    content_w = pdf.w - M_LEFT - M_RIGHT
 
-    def _draw_summary_card(x, y, w, h, label, value, accent=None):
-        # Card background
-        pdf.set_fill_color(*C_LIGHT_BG)
-        if accent:
-            pdf.set_fill_color(*accent, 15 if accent == C_GREEN else 15)
-            # Lighter tint — fpdf doesn't do alpha so use a light mix
-            if accent == C_GREEN:
-                pdf.set_fill_color(235, 250, 240)
-            elif accent == C_RED:
-                pdf.set_fill_color(254, 240, 240)
+    # ============================================================
+    # SUMMARY CARDS — 3 columns
+    # ============================================================
+    card_gap = 5
+    card_w = (content_w - card_gap * 2) / 3
+    card_h = 24
+    card_y = pdf.get_y()
+
+    def _summary_card(x, y, w, h, label, value, highlight=False):
+        # Background
+        if highlight:
+            pdf.set_fill_color(*C_SAV_BG)
+        else:
+            pdf.set_fill_color(*C_PANEL)
         pdf.rect(x, y, w, h, "F")
-        # Top accent bar
-        if accent:
-            pdf.set_fill_color(*accent)
-            pdf.rect(x, y, w, 1.5, "F")
+        # Left accent stripe
+        pdf.set_fill_color(*(C_SAV_TEXT if highlight else C_PRIMARY))
+        pdf.rect(x, y, 1.2, h, "F")
         # Label
-        pdf.set_xy(x + 4, y + 4)
-        pdf.set_font("Helvetica", "", 8)
-        pdf.set_text_color(*C_GRAY_TEXT)
-        pdf.cell(w - 8, 4, label)
+        pdf.set_xy(x + 6, y + 5)
+        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_text_color(*C_SECONDARY)
+        pdf.cell(w - 10, 4, label)
         # Value
-        pdf.set_xy(x + 4, y + 10)
-        pdf.set_font("Helvetica", "B", 14)
-        pdf.set_text_color(*(accent if accent else C_BLACK))
-        pdf.cell(w - 8, 7, value)
+        pdf.set_xy(x + 6, y + 12)
+        if highlight:
+            pdf.set_font("Helvetica", "B", 16)
+            pdf.set_text_color(*C_SAV_TEXT)
+        else:
+            pdf.set_font("Helvetica", "B", 14)
+            pdf.set_text_color(*C_DARK)
+        pdf.cell(w - 10, 7, value)
 
-    _draw_summary_card(10, box_y, box_w, box_h,
-                       "Totalt konkurrent", _kr(totals["total_competitor"]))
-    _draw_summary_card(10 + box_w + 4, box_y, box_w, box_h,
-                       "Totalt OneMed", _kr(totals["total_onemed"]), accent=C_PRIMARY)
+    _summary_card(M_LEFT, card_y, card_w, card_h,
+                  "Totalt konkurrent", _kr(totals["total_competitor"]))
+    _summary_card(M_LEFT + card_w + card_gap, card_y, card_w, card_h,
+                  "Totalt OneMed", _kr(totals["total_onemed"]))
 
     sav = totals["total_savings"]
-    sav_color = C_GREEN if sav >= 0 else C_RED
-    sav_text = f"{_kr(sav)}  ({totals['savings_pct']}%)"
-    _draw_summary_card(10 + (box_w + 4) * 2, box_y, box_w, box_h,
-                       "Besparelse", sav_text, accent=sav_color)
+    sav_label = f"{_kr(sav)}  ({totals['savings_pct']}%)"
+    _summary_card(M_LEFT + (card_w + card_gap) * 2, card_y, card_w, card_h,
+                  "Besparelse", sav_label, highlight=(sav >= 0))
 
-    pdf.set_y(box_y + box_h + 6)
+    pdf.set_y(card_y + card_h + 5)
 
-    # Row counts line
+    # Row counts
     approved = sum(1 for r in rows if r.get("Review-status") == "approved")
     rejected = sum(1 for r in rows if r.get("Review-status") == "rejected")
     pending = sum(1 for r in rows if r.get("Review-status") == "pending")
+    pdf.set_x(M_LEFT)
     pdf.set_font("Helvetica", "", 8)
-    pdf.set_text_color(*C_GRAY_TEXT)
-    pdf.cell(0, 4, f"{totals['row_count']} linjer  |  {approved} godkjent  |  {rejected} avvist  |  {pending} ventende", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(4)
+    pdf.set_text_color(*C_SECONDARY)
+    pdf.cell(content_w, 4,
+             f"{totals['row_count']} produktlinjer   |   {approved} godkjent   |   {rejected} avvist   |   {pending} ventende",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
 
     # ============================================================
-    # PRODUCT COMPARISON TABLE
+    # PRODUCT COMPARISON — card-style rows
     # ============================================================
+    pdf.set_x(M_LEFT)
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_text_color(*C_DARK)
+    pdf.cell(content_w, 6, "Produktsammenligning", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(3)
 
-    # Column definitions: Konkurrent side → OneMed side
-    if show_line_prices:
-        col_defs = [
-            ("Konk. Art.Nr",       20),
-            ("Konkurrent",         42),
-            ("Konk. Spesifikasjon", 30),
-            ("Antall",             14),
-            ("Konk. pris",         20),
-            ("OneMed Art.Nr",      20),
-            ("OneMed",             42),
-            ("OneMed Spesifikasjon", 30),
-            ("OneMed pris",        20),
-            ("Besparelse",         22),
-        ]
-    else:
-        col_defs = [
-            ("Konk. Art.Nr",       22),
-            ("Konkurrent",         52),
-            ("Konk. Spesifikasjon", 38),
-            ("Antall",             16),
-            ("OneMed Art.Nr",      22),
-            ("OneMed",             52),
-            ("OneMed Spesifikasjon", 52),
-        ]
+    half_w = (content_w - 12) / 2  # left and right halves with center gap
+    arrow_w = 12
 
-    col_widths = [c[1] for c in col_defs]
-    row_h = 5.5
-
-    # Table header
-    pdf.set_font("Helvetica", "B", 7)
-    pdf.set_fill_color(*C_PRIMARY)
-    pdf.set_text_color(*C_WHITE)
-    for name, w in col_defs:
-        pdf.cell(w, 6, name, border=0, fill=True, align="C")
-    pdf.ln()
-
-    # Table rows
-    pdf.set_text_color(*C_BLACK)
     for i, r in enumerate(rows):
-        # Alternate background
-        if i % 2 == 1:
-            pdf.set_fill_color(*C_LIGHT_BG)
-        else:
-            pdf.set_fill_color(*C_WHITE)
-        bg = True  # always fill for consistent look
+        # Check if we need a new page (need ~28mm for a row block)
+        if pdf.get_y() > pdf.h - 38:
+            pdf.add_page()
 
-        pdf.set_font("Helvetica", "", 7)
+        row_y = pdf.get_y()
+
+        # Row background panel
+        pdf.set_fill_color(*C_PANEL)
+        block_h = 20 if not show_line_prices else 24
+        pdf.rect(M_LEFT, row_y, content_w, block_h, "F")
+
+        # --- Left side: Konkurrent ---
+        lx = M_LEFT + 4
+        pdf.set_xy(lx, row_y + 2)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*C_SECONDARY)
+        pdf.cell(30, 3, "Konkurrent")
+
+        pdf.set_xy(lx, row_y + 5.5)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*C_DARK)
+        desc = _s(r.get("Beskrivelse"), 50)
+        pdf.cell(half_w - 8, 4, desc)
+
+        pdf.set_xy(lx, row_y + 10)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*C_SECONDARY)
+        artnr = _s(r.get("Konkurrent Art.Nr"), 20)
+        qty = _s(r.get("Totalt enheter"))
+        meta_left = f"Art.nr: {artnr}" if artnr else ""
+        if qty:
+            meta_left += f"   Antall: {qty}"
+        pdf.cell(half_w - 8, 3.5, meta_left)
 
         if show_line_prices:
-            vals = [
-                _s(r.get("Konkurrent Art.Nr"), 20),
-                _s(r.get("Beskrivelse"), 40),
-                _s(r.get("Vart spesifikasjon"), 30),  # competitor spec not in export — use description context
-                _s(r.get("Totalt enheter")),
-                _kr(r.get("Konk. linjebelop")),
-                _s(r.get("Vart Art.Nr"), 20),
-                _s(r.get("Vart produktnavn"), 40),
-                _s(r.get("Vart spesifikasjon"), 30),
-                _kr(r.get("Vart linjebelop")),
-                _kr(r.get("Besparelse")),
-            ]
-        else:
-            vals = [
-                _s(r.get("Konkurrent Art.Nr"), 22),
-                _s(r.get("Beskrivelse"), 50),
-                _s(r.get("Vart spesifikasjon"), 38),
-                _s(r.get("Totalt enheter")),
-                _s(r.get("Vart Art.Nr"), 22),
-                _s(r.get("Vart produktnavn"), 50),
-                _s(r.get("Vart spesifikasjon"), 50),
-            ]
+            pdf.set_xy(lx, row_y + 14.5)
+            pdf.set_font("Helvetica", "", 8)
+            pdf.set_text_color(*C_DARK)
+            pdf.cell(half_w - 8, 3.5, _kr(r.get("Konk. linjebelop")))
 
-        for val, w in zip(vals, col_widths):
-            pdf.cell(w, row_h, val, border=0, fill=bg)
-        pdf.ln()
+        # --- Center arrow ---
+        cx = M_LEFT + half_w + 2
+        pdf.set_xy(cx, row_y + 6)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(*C_BORDER)
+        pdf.cell(arrow_w, 5, chr(0x2192), align="C")  # →
 
-        # Subtle row separator
-        pdf.set_draw_color(*C_DIVIDER)
-        pdf.line(10, pdf.get_y(), 10 + sum(col_widths), pdf.get_y())
+        # --- Right side: OneMed ---
+        rx = M_LEFT + half_w + arrow_w
+        pdf.set_xy(rx, row_y + 2)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*C_PRIMARY)
+        pdf.cell(30, 3, "OneMed")
+
+        pdf.set_xy(rx, row_y + 5.5)
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(*C_DARK)
+        our_name = _s(r.get("Vart produktnavn"), 50)
+        pdf.cell(half_w - 8, 4, our_name if our_name else "-")
+
+        pdf.set_xy(rx, row_y + 10)
+        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_text_color(*C_SECONDARY)
+        our_artnr = _s(r.get("Vart Art.Nr"), 20)
+        our_spec = _s(r.get("Vart spesifikasjon"), 35)
+        meta_right = f"Art.nr: {our_artnr}" if our_artnr else ""
+        if our_spec:
+            meta_right += f"   {our_spec}"
+        pdf.cell(half_w - 8, 3.5, meta_right)
+
+        if show_line_prices:
+            pdf.set_xy(rx, row_y + 14.5)
+            pdf.set_font("Helvetica", "", 8)
+            sav_row = r.get("Besparelse")
+            our_price_text = _kr(r.get("Vart linjebelop"))
+            if sav_row is not None and sav_row != "":
+                try:
+                    sv = float(sav_row)
+                    pdf.set_text_color(*(C_SAV_TEXT if sv >= 0 else C_RED))
+                    our_price_text += f"   (besparelse: {_kr(sav_row)})"
+                except (ValueError, TypeError):
+                    pdf.set_text_color(*C_DARK)
+            else:
+                pdf.set_text_color(*C_DARK)
+            pdf.cell(half_w - 8, 3.5, our_price_text)
+
+        # Move past this row block + gap
+        pdf.set_y(row_y + block_h + 3)
 
     # ============================================================
     # BOTTOM TOTALS
     # ============================================================
-    pdf.ln(6)
-    pdf.set_draw_color(*C_DIVIDER)
-    pdf.line(10, pdf.get_y(), pdf.w - 10, pdf.get_y())
-    pdf.ln(4)
+    if pdf.get_y() > pdf.h - 35:
+        pdf.add_page()
 
-    tw = 85
-    lh = 7
+    pdf.ln(2)
+    pdf.set_draw_color(*C_BORDER)
+    pdf.set_line_width(0.3)
+    pdf.line(M_LEFT, pdf.get_y(), pdf.w - M_RIGHT, pdf.get_y())
+    pdf.ln(5)
 
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(*C_BLACK)
-    pdf.set_fill_color(*C_LIGHT_BG)
-    pdf.cell(tw, lh, f"Totalt konkurrent:  {totals['total_competitor']:,.2f} kr", fill=True, new_x="LMARGIN", new_y="NEXT")
-    pdf.cell(tw, lh, f"Totalt OneMed:  {totals['total_onemed']:,.2f} kr", fill=True, new_x="LMARGIN", new_y="NEXT")
+    tot_x = M_LEFT
+    tw = 100
+    lh = 7.5
 
-    # Savings — highlighted
-    pdf.set_text_color(*(C_GREEN if sav >= 0 else C_RED))
-    if sav >= 0:
-        pdf.set_fill_color(235, 250, 240)
-    else:
-        pdf.set_fill_color(254, 240, 240)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(tw, lh + 1, f"Besparelse:  {sav:,.2f} kr  ({totals['savings_pct']}%)", fill=True, new_x="LMARGIN", new_y="NEXT")
-    pdf.set_text_color(*C_BLACK)
+    pdf.set_x(tot_x)
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_text_color(*C_DARK)
+    pdf.set_fill_color(*C_PANEL)
+    pdf.cell(tw, lh, f"  Totalt konkurrent     {totals['total_competitor']:,.2f} kr", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_x(tot_x)
+    pdf.cell(tw, lh, f"  Totalt OneMed          {totals['total_onemed']:,.2f} kr", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+    # Savings — prominent
+    pdf.set_x(tot_x)
+    pdf.set_fill_color(*C_SAV_BG)
+    pdf.set_text_color(*(C_SAV_TEXT if sav >= 0 else C_RED))
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(tw, lh + 2, f"  Besparelse                {sav:,.2f} kr  ({totals['savings_pct']}%)", fill=True, new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(*C_DARK)
 
     buf = BytesIO()
     pdf.output(buf)
