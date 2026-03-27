@@ -20,7 +20,7 @@ def _build_v1_compat_row(deduped_row: Dict[str, Any]) -> Dict[str, Any]:
     """
     return {
         "Konkurrent Item Description": deduped_row.get("description", ""),
-        "Konkurrent Specification": "",
+        "Konkurrent Specification": deduped_row.get("specification", ""),
         "Konkurrent Art.Nr": deduped_row.get("competitor_artnr", ""),
     }
 

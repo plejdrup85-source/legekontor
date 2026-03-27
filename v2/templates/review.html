@@ -732,6 +732,12 @@ async function submitAddRow() {
   msg.textContent = '';
   updateSummaryFromRows();
   applyFilters();
+  // Navigate to last page so the new row is visible
+  const totalPages = Math.ceil(filteredRows.length / PAGE_SIZE);
+  if (totalPages > 1) {
+    currentPage = totalPages - 1;
+    renderPage();
+  }
 }
 
 // --- Init ---
