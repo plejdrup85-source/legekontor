@@ -19,8 +19,8 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# Optional logo path (place logo.png next to this file or in v2/)
-_LOGO_PATH = Path(__file__).parent / "logo.png"
+# Logo path – use the single logo.png in the project root (same as web UI)
+_LOGO_PATH = Path(__file__).parent.parent / "logo.png"
 
 # DejaVuSans font paths — search common locations
 _FONT_SEARCH_PATHS = [
