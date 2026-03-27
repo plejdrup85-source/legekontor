@@ -1384,6 +1384,7 @@ V2_INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
+  <div style="margin-bottom:12px;"><img src="/static/logo.png" alt="OneMed" style="max-height:50px; width:auto;" onerror="this.style.display='none';"/></div>
   <div style="margin-bottom:12px;"><a href="/">&larr; Tilbake til V1</a> &nbsp; <a href="/v2/pricedb/ui">Prisdatabase</a></div>
   <div class="card">
     <h2>Prisammenligning V2</h2>
