@@ -50,7 +50,8 @@ EXPORT_COLUMNS = [
     "Kvt.",
     "Pakning",
     "Pakningsstr.",
-    "Totalt enheter",
+    "Totale enheter Konkurrent",
+    "Totale Enheter OM",
     "Konk. linjebelop",
     "Vart Art.Nr",
     "Vart produktnavn",
@@ -75,7 +76,8 @@ EXPORT_COLUMNS_NO_PRICES = [
     "Kvt.",
     "Pakning",
     "Pakningsstr.",
-    "Totalt enheter",
+    "Totale enheter Konkurrent",
+    "Totale Enheter OM",
     "Vart Art.Nr",
     "Vart produktnavn",
     "Vart spesifikasjon",
@@ -95,18 +97,28 @@ def calculate_totals(export_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         total_onemed: sum of all our line amounts
         total_savings: total_competitor - total_onemed
         savings_pct: savings as percentage of competitor total
+        total_units_competitor: sum of competitor units
+        total_units_om: sum of OM units
         row_count: number of rows included
     """
     total_comp = 0.0
     total_our = 0.0
+    total_units_comp = 0.0
+    total_units_om = 0.0
     count = 0
     for r in export_rows:
         cl = r.get("Konk. linjebelop")
         ol = r.get("Vart linjebelop")
+        uc = r.get("Totale enheter Konkurrent")
+        uo = r.get("Totale Enheter OM")
         if cl is not None:
             total_comp += float(cl)
         if ol is not None:
             total_our += float(ol)
+        if uc is not None:
+            total_units_comp += float(uc)
+        if uo is not None:
+            total_units_om += float(uo)
         count += 1
     total_savings = total_comp - total_our
     savings_pct = round(total_savings / total_comp * 100, 1) if total_comp else 0.0
@@ -115,6 +127,8 @@ def calculate_totals(export_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "total_onemed": round(total_our, 2),
         "total_savings": round(total_savings, 2),
         "savings_pct": savings_pct,
+        "total_units_competitor": round(total_units_comp, 2),
+        "total_units_om": round(total_units_om, 2),
         "row_count": count,
     }
 
@@ -151,6 +165,11 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             fields = [f.get("field", "") for f in r["inconsistent_fields"]]
             warn_note = ", ".join(fields)
 
+        # Effective quantities: competitor and OM may differ due to separate overrides
+        base_units = r.get("total_units")
+        comp_units = r.get("quantity_override_competitor") if r.get("quantity_override_competitor") is not None else base_units
+        om_units = r.get("quantity_override") if r.get("quantity_override") is not None else base_units
+
         row = {
             "Review-status": r.get("review_status", "pending"),
             "Konkurrent": r.get("competitor", ""),
@@ -159,7 +178,8 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "Kvt.": r.get("quantity_purchased"),
             "Pakning": r.get("packaging_text", ""),
             "Pakningsstr.": r.get("packaging_count"),
-            "Totalt enheter": r.get("quantity_override") or r.get("total_units"),
+            "Totale enheter Konkurrent": comp_units,
+            "Totale Enheter OM": om_units,
             "Konk. linjebelop": comp_line,
             "Vart Art.Nr": cand.get("our_artnr", "") if cand else "",
             "Vart produktnavn": cand.get("our_description", "") if cand else "",
@@ -202,6 +222,8 @@ def generate_export_xlsx(review_rows: List[Dict[str, Any]], show_line_prices: bo
     # Add totals row
     totals_row = {col: "" for col in columns}
     totals_row[columns[0]] = "TOTALT"
+    totals_row["Totale enheter Konkurrent"] = totals["total_units_competitor"]
+    totals_row["Totale Enheter OM"] = totals["total_units_om"]
     if show_line_prices:
         totals_row["Konk. linjebelop"] = totals["total_competitor"]
         totals_row["Vart linjebelop"] = totals["total_onemed"]
@@ -433,10 +455,10 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
         pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_SECONDARY)
         artnr = _s(r.get("Konkurrent Art.Nr"), 20)
-        qty = _s(r.get("Totalt enheter"))
+        comp_qty = _s(r.get("Totale enheter Konkurrent"))
         meta_left = f"Art.nr: {artnr}" if artnr else ""
-        if qty:
-            meta_left += f"   Antall: {qty}"
+        if comp_qty:
+            meta_left += f"   Antall: {comp_qty}"
         pdf.cell(half_w - 8, 3.5, meta_left)
 
         if show_line_prices:
@@ -469,8 +491,11 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
         pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_SECONDARY)
         our_artnr = _s(r.get("Vart Art.Nr"), 20)
+        om_qty = _s(r.get("Totale Enheter OM"))
         our_spec = _s(r.get("Vart spesifikasjon"), 35)
         meta_right = f"Art.nr: {our_artnr}" if our_artnr else ""
+        if om_qty:
+            meta_right += f"   Antall: {om_qty}"
         if our_spec:
             meta_right += f"   {our_spec}"
         pdf.cell(half_w - 8, 3.5, meta_right)

@@ -316,17 +316,25 @@ function renderCard(r) {
   }
 
   // Meta grid (input data)
-  const effectiveUnits = r.quantity_override || r.total_units;
-  const hasOverride = r.quantity_override != null;
+  const compUnits = r.quantity_override_competitor != null ? r.quantity_override_competitor : r.total_units;
+  const hasCompOverride = r.quantity_override_competitor != null;
+  const omUnits = r.quantity_override != null ? r.quantity_override : r.total_units;
+  const hasOmOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
   html += '<div><dt>Konkurrent</dt><dd>' + esc(r.competitor || '') + '</dd></div>';
   html += '<div><dt>Konk. art.nr</dt><dd>' + esc(r.competitor_artnr || '') + '</dd></div>';
   html += '<div><dt>Kvt.</dt><dd>' + fmt(r.quantity_purchased) + '</dd></div>';
   html += '<div><dt>Pakning</dt><dd>' + esc(r.packaging_text || '-') + ' (' + (r.packaging_count || 1) + ')</dd></div>';
-  html += '<div><dt>Totalt enheter</dt><dd>';
-  html += '<input type="number" class="qty-input' + (hasOverride ? ' overridden' : '') + '" value="' + (effectiveUnits != null ? effectiveUnits : '') + '" '
+  html += '<div><dt>Totale enheter Konkurrent</dt><dd>';
+  html += '<input type="number" class="qty-input' + (hasCompOverride ? ' overridden' : '') + '" value="' + (compUnits != null ? compUnits : '') + '" '
+    + 'onchange="updateQuantityCompetitor(' + idx + ', this.value)" '
+    + 'title="' + (hasCompOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre konkurrentantall') + '" '
+    + (locked ? 'disabled' : '') + ' min="0" step="any"/>';
+  html += '</dd></div>';
+  html += '<div><dt>Totale Enheter OM</dt><dd>';
+  html += '<input type="number" class="qty-input' + (hasOmOverride ? ' overridden' : '') + '" value="' + (omUnits != null ? omUnits : '') + '" '
     + 'onchange="updateQuantity(' + idx + ', this.value)" '
-    + 'title="' + (hasOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre') + '" '
+    + 'title="' + (hasOmOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre OM-antall') + '" '
     + (locked ? 'disabled' : '') + ' min="0" step="any"/>';
   html += '</dd></div>';
   html += '<div><dt>Konk. linjebelop</dt><dd>' + money(r.competitor_line_amount) + '</dd></div>';
@@ -494,12 +502,37 @@ async function updateQuantity(dedupIdx, value) {
   applyFilters(true);
 }
 
+async function updateQuantityCompetitor(dedupIdx, value) {
+  if (locked) return;
+  const qty = value === '' ? null : parseFloat(value);
+  if (qty !== null && (isNaN(qty) || qty < 0)) return;
+  const body = { dedup_idx: dedupIdx, quantity_override_competitor: qty };
+  const resp = await postJson('/v2/review/' + JOB_ID + '/extras', body);
+  if (!resp.ok) return;
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) {
+    row.quantity_override_competitor = qty;
+    recalcLocal(row);
+  }
+  applyFilters(true);
+}
+
 function recalcLocal(row) {
-  const units = row.quantity_override || row.total_units || 0;
+  const baseUnits = row.total_units || 0;
+
+  // Competitor side
+  const compUnits = row.quantity_override_competitor != null ? row.quantity_override_competitor : baseUnits;
+  const compUnitPrice = row.competitor_unit_price;
+  if (row.quantity_override_competitor != null && compUnitPrice != null && compUnits > 0) {
+    row.competitor_line_amount = Math.round(compUnits * compUnitPrice * 100) / 100;
+  }
+
+  // OM side
+  const omUnits = row.quantity_override != null ? row.quantity_override : baseUnits;
   const price = row.our_unit_price;
   const compLine = row.competitor_line_amount;
-  if (price != null && units > 0) {
-    row.our_comparable_line_price = Math.round(units * price * 100) / 100;
+  if (price != null && omUnits > 0) {
+    row.our_comparable_line_price = Math.round(omUnits * price * 100) / 100;
     row.savings_amount = compLine != null ? Math.round((compLine - row.our_comparable_line_price) * 100) / 100 : null;
   } else {
     row.our_comparable_line_price = null;

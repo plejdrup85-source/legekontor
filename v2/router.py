@@ -737,11 +737,14 @@ async def v2_extras(job_id: str, request: Request):
         comment=body.get("comment"),
     )
 
-    # Handle quantity override (stored separately in extras.json)
-    if "quantity_override" in body:
+    # Handle quantity overrides (stored in extras.json)
+    if "quantity_override" in body or "quantity_override_competitor" in body:
         extras = rv.load_extras(job_id)
         entry = extras.get(str(dedup_idx), {})
-        entry["quantity_override"] = body["quantity_override"]
+        if "quantity_override" in body:
+            entry["quantity_override"] = body["quantity_override"]
+        if "quantity_override_competitor" in body:
+            entry["quantity_override_competitor"] = body["quantity_override_competitor"]
         entry["updated_at"] = _utc_now_iso()
         extras[str(dedup_idx)] = entry
         rv.save_extras(job_id, extras)
@@ -916,7 +919,8 @@ async def v2_replace_candidate(job_id: str, request: Request):
 
     # Build new candidate
     candidates = row.get("candidates", [])
-    total_units = row.get("total_units", 0) or 0
+    # Use OM quantity override if set, otherwise original total_units
+    om_units = row.get("quantity_override") if row.get("quantity_override") is not None else (row.get("total_units", 0) or 0)
     competitor_line = row.get("competitor_line_amount")
 
     new_cand = {
@@ -932,9 +936,9 @@ async def v2_replace_candidate(job_id: str, request: Request):
         "matched_from": "manual",
     }
 
-    # Calculate prices for new candidate
-    if price is not None and total_units > 0:
-        new_cand["our_comparable_line_price"] = round(total_units * price, 2)
+    # Calculate prices for new candidate using OM units
+    if price is not None and om_units > 0:
+        new_cand["our_comparable_line_price"] = round(om_units * price, 2)
         if competitor_line is not None:
             new_cand["savings_amount"] = round(competitor_line - new_cand["our_comparable_line_price"], 2)
         else:
