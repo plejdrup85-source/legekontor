@@ -294,36 +294,63 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     class PDF(FPDF):
         font_family_name = "Helvetica"  # overridden after font registration
 
+        # Header layout constants (mm)
+        _LOGO_MAX_W = 50   # max logo width
+        _LOGO_MAX_H = 14   # max logo height
+        _HEADER_TOP = 10   # top margin for logo
+        _LOGO_TITLE_GAP = 3  # space between logo and title
+        _TITLE_H = 8       # title cell height
+        _DIVIDER_GAP = 3   # space between title and divider
+        _CONTENT_GAP = 4   # space below divider before content
+
         def header(self):
             f = self.font_family_name
-            # Logo or text
-            if _LOGO_PATH.exists():
-                try:
-                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10)
-                except Exception:
-                    self._text_logo()
-            else:
-                self._text_logo()
-            # Title block — right of logo or below
-            self.set_xy(M_LEFT, 24)
+            y = self._HEADER_TOP
+
+            # ── Logo block ──
+            logo_h = self._render_logo(y)
+
+            # ── Title block ── below logo with spacing
+            title_y = y + logo_h + self._LOGO_TITLE_GAP
+            self.set_xy(M_LEFT, title_y)
             self.set_font(f, "B", 20)
             self.set_text_color(*C_DARK)
-            self.cell(0, 8, "Prissammenligning")
-            # Date right-aligned
+            self.cell(0, self._TITLE_H, "Prissammenligning")
+
+            # Date right-aligned on same baseline as title
             self.set_font(f, "", 9)
             self.set_text_color(*C_SECONDARY)
-            self.set_xy(self.w - M_RIGHT - 60, 26)
+            self.set_xy(self.w - M_RIGHT - 60, title_y + 2)
             self.cell(60, 5, today, align="R")
-            # Thin divider
+
+            # ── Divider ── thin line below title
+            divider_y = title_y + self._TITLE_H + self._DIVIDER_GAP
             self.set_draw_color(*C_BORDER)
             self.set_line_width(0.3)
-            self.line(M_LEFT, 35, self.w - M_RIGHT, 35)
-            self.set_y(39)
+            self.line(M_LEFT, divider_y, self.w - M_RIGHT, divider_y)
 
-        def _text_logo(self):
+            # ── Content starts here
+            self.set_y(divider_y + self._CONTENT_GAP)
+
+        def _render_logo(self, y: float) -> float:
+            """Render logo constrained to max bounds. Returns actual height used."""
+            if not _LOGO_PATH.exists():
+                return self._render_text_logo(y)
+            try:
+                info = self.image(str(_LOGO_PATH), x=M_LEFT, y=y,
+                                  w=self._LOGO_MAX_W, h=self._LOGO_MAX_H,
+                                  keep_aspect_ratio=True)
+                # info.rendered_height gives the actual height after scaling
+                return getattr(info, "rendered_height", self._LOGO_MAX_H)
+            except Exception:
+                return self._render_text_logo(y)
+
+        def _render_text_logo(self, y: float) -> float:
+            """Fallback: render 'OneMed' text. Returns height used."""
             self.set_font(self.font_family_name, "B", 15)
             self.set_text_color(*C_PRIMARY)
-            self.text(M_LEFT, 18, "OneMed")
+            self.text(M_LEFT, y + 6, "OneMed")
+            return 8
 
         def footer(self):
             self.set_y(-13)
