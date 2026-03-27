@@ -14,7 +14,7 @@ from v2.parsing import classify_file, parse_file
 from v2.normalize import deduplicate
 from v2.matching import match_deduped_rows
 from v2 import persistence as rv
-from v2.export import generate_export_xlsx
+from v2.export import generate_export_xlsx, generate_export_pdf
 from v2 import pricedb
 
 logger = logging.getLogger(__name__)
@@ -1222,8 +1222,13 @@ V2_EXPORTS_DIR.mkdir(exist_ok=True)
 
 
 @v2_router.get("/export/{job_id}")
-def v2_export(job_id: str):
-    """Generate and download Excel export from review state."""
+def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True):
+    """Generate and download export from review state.
+
+    Query params:
+        format: 'xlsx' (default) or 'pdf'
+        show_line_prices: true (default) or false
+    """
     t = _get_task(job_id)
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
@@ -1240,24 +1245,35 @@ def v2_export(job_id: str):
     rows = rv.apply_overrides(review_rows, job_id)
 
     try:
-        xlsx_bytes = generate_export_xlsx(rows)
+        if format == "pdf":
+            pdf_bytes = generate_export_pdf(rows, show_line_prices=show_line_prices)
+            suffix = "_med_priser" if show_line_prices else "_uten_priser"
+            filename = f"V2_prissammenligning_{job_id[:12]}{suffix}.pdf"
+            return StreamingResponse(
+                BytesIO(pdf_bytes),
+                media_type="application/pdf",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        else:
+            xlsx_bytes = generate_export_xlsx(rows, show_line_prices=show_line_prices)
+
+            # Persist export to disk
+            export_path = V2_EXPORTS_DIR / f"{job_id}.xlsx"
+            try:
+                export_path.write_bytes(xlsx_bytes)
+            except Exception as e:
+                logger.warning(f"V2: Kunne ikke lagre eksport til disk: {e}")
+
+            suffix = "_med_priser" if show_line_prices else "_uten_priser"
+            filename = f"V2_prissammenligning_{job_id[:12]}{suffix}.xlsx"
+            return StreamingResponse(
+                BytesIO(xlsx_bytes),
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
     except Exception as e:
         logger.exception(f"V2 eksport feilet for job={job_id}")
         return JSONResponse({"error": f"Eksport feilet: {e}"}, status_code=500)
-
-    # Persist export to disk
-    export_path = V2_EXPORTS_DIR / f"{job_id}.xlsx"
-    try:
-        export_path.write_bytes(xlsx_bytes)
-    except Exception as e:
-        logger.warning(f"V2: Kunne ikke lagre eksport til disk: {e}")
-
-    filename = f"V2_prissammenligning_{job_id[:12]}.xlsx"
-    return StreamingResponse(
-        BytesIO(xlsx_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
 
 
 # ============================================================

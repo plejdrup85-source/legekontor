@@ -127,7 +127,11 @@
     <button class="sm success" id="btnBulkApprove" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
     <button class="sm danger" id="btnBulkReject" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
     <button class="sm secondary" id="btnBatchSelect" onclick="batchSelect()">Auto-velg beste</button>
-    <a id="exportLink" style="display:none;"><button class="sm" type="button">Last ned Excel</button></a>
+    <span id="exportOptions" style="display:none;">
+      <label style="font-size:11px;"><input type="checkbox" id="showLinePrices" checked> Vis linjepriser</label>
+      <button class="sm" onclick="doExport('xlsx')">Excel</button>
+      <button class="sm secondary" onclick="doExport('pdf')">PDF</button>
+    </span>
     <button class="sm" id="btnCommitDb" onclick="commitToDb()" style="display:none;">Lagre til prisdatabase</button>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
     <button class="sm" id="btnAddRow" onclick="toggleAddRowForm()">+ Legg til linje</button>
@@ -176,9 +180,9 @@ async function loadReview() {
   locked = data.lock?.locked || false;
 
   document.getElementById('jobIdDisplay').textContent = JOB_ID.substring(0, 12) + '...';
-  const exportEl = document.getElementById('exportLink');
-  exportEl.href = '/v2/export/' + JOB_ID;
-  exportEl.style.display = 'inline';
+  document.getElementById('exportOptions').style.display = 'inline-flex';
+  document.getElementById('exportOptions').style.gap = '6px';
+  document.getElementById('exportOptions').style.alignItems = 'center';
   document.getElementById('btnCommitDb').style.display = 'inline';
   updateSummary(data.summary);
   updateLockUI();
@@ -670,6 +674,12 @@ function savingsHtml(v) {
   if (n > 0) return '<span class="savings-pos">+' + formatted + '</span>';
   if (n < 0) return '<span class="savings-neg">-' + formatted + '</span>';
   return formatted;
+}
+
+function doExport(format) {
+  const showPrices = document.getElementById('showLinePrices').checked;
+  const url = '/v2/export/' + JOB_ID + '?format=' + format + '&show_line_prices=' + showPrices;
+  window.open(url, '_blank');
 }
 
 async function commitToDb() {
