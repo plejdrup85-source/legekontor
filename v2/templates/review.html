@@ -167,6 +167,7 @@ const PAGE_SIZE = 25;
 let currentPage = 0;
 let debounceTimers = {};
 let openSearchPanels = {};
+let searchControllers = {};  // AbortController per search panel
 let expandedRows = {};
 
 async function loadReview() {
@@ -517,6 +518,12 @@ function toggleSearchPanel(dedupIdx) {
   if (!isOpen) {
     const input = document.getElementById('search-input-' + dedupIdx);
     if (input) input.focus();
+  } else {
+    // Abort any in-flight search when closing panel
+    if (searchControllers[dedupIdx]) {
+      searchControllers[dedupIdx].abort();
+      delete searchControllers[dedupIdx];
+    }
   }
 }
 
@@ -533,22 +540,42 @@ async function searchCatalog(dedupIdx, query) {
     container.innerHTML = '<div class="muted">Skriv minst 2 tegn for a soke...</div>';
     return;
   }
+  // Abort any in-flight request for this panel
+  if (searchControllers[dedupIdx]) {
+    searchControllers[dedupIdx].abort();
+  }
+  const controller = new AbortController();
+  searchControllers[dedupIdx] = controller;
+
   container.innerHTML = '<div class="search-spinner">Soker...</div>';
-  const resp = await postJson('/v2/review/' + JOB_ID + '/search-catalog', { query: query, limit: 15 });
-  if (!resp.ok) {
+  try {
+    const resp = await fetch('/v2/review/' + JOB_ID + '/search-catalog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: query, limit: 15 }),
+      signal: controller.signal,
+    });
+    const data = await resp.json();
+    // If this controller was replaced by a newer request, discard
+    if (searchControllers[dedupIdx] !== controller) return;
+    if (!resp.ok) {
+      container.innerHTML = '<div class="muted">Sok feilet.</div>';
+      return;
+    }
+    const results = data.results || [];
+    if (results.length === 0) {
+      container.innerHTML = '<div class="muted">Ingen treff.</div>';
+      return;
+    }
+    container.innerHTML = results.map(r =>
+      '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
+      renderProductCols(r) +
+      '</div>'
+    ).join('');
+  } catch (e) {
+    if (e.name === 'AbortError') return;  // superseded by newer search
     container.innerHTML = '<div class="muted">Sok feilet.</div>';
-    return;
   }
-  const results = resp.results || [];
-  if (results.length === 0) {
-    container.innerHTML = '<div class="muted">Ingen treff.</div>';
-    return;
-  }
-  container.innerHTML = results.map(r =>
-    '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
-    renderProductCols(r) +
-    '</div>'
-  ).join('');
 }
 
 async function selectSearchResult(dedupIdx, artnr) {

@@ -751,9 +751,10 @@ async def v2_extras(job_id: str, request: Request):
 
 @v2_router.post("/review/{job_id}/search-catalog")
 async def v2_search_catalog(job_id: str, request: Request):
-    """Search the product catalog. Body: {query: str, limit?: int}
+    """Fast interactive catalog search using BM25 only (no Claude/embeddings).
 
-    Returns matching products from both LK and full catalogs.
+    Body: {query: str, limit?: int}
+    Returns matching products from both LK and full catalogs, ranked by relevance.
     """
     t, err = _require_review_job(job_id)
     if err:
@@ -769,16 +770,6 @@ async def v2_search_catalog(job_id: str, request: Request):
     if bundle is None:
         return JSONResponse({"error": "Produktkatalog er ikke lastet"}, status_code=503)
 
-    # Build a fake competitor row for the matcher
-    search_row = {
-        "Produktnavn": "",
-        "Beskrivelse": query,
-        "Spesifikasjon": "",
-        "Konkurrent art.nr": "",
-        "Produsent art.nr": "",
-        "Kommentar": "",
-    }
-
     results = []
     seen = set()
 
@@ -788,55 +779,81 @@ async def v2_search_catalog(job_id: str, request: Request):
         gid = str(row_data.get("Katalog: GID") or row_data.get("GID") or "")
         return "" if gid.lower() == "nan" else gid
 
-    def _extract_result(artnr, best_row, quality, source):
-        price, psrc = bundle.price_for_artnr(artnr)
+    def _make_result(item, score, source):
+        artnr = str(item.artnr)
+        price, _ = bundle.price_for_artnr(artnr)
+        row_data = item.row if hasattr(item, "row") else {}
         desc = ""
         spec = ""
         producer = ""
         gid = ""
-        if isinstance(best_row, dict):
-            desc = str(best_row.get("Katalog: Item Description") or best_row.get("Item Description") or best_row.get("Description") or "")
-            spec = str(best_row.get("Katalog: Specification") or best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
-            producer = str(best_row.get("Katalog: Producer Name") or best_row.get("Producer Name") or best_row.get("Produsent") or "")
-            gid = _extract_gid(best_row)
+        if isinstance(row_data, dict):
+            desc = str(row_data.get("Katalog: Item Description") or row_data.get("Item Description") or row_data.get("Description") or "")
+            spec = str(row_data.get("Katalog: Specification") or row_data.get("Specification") or row_data.get("Spesifikasjon") or "")
+            producer = str(row_data.get("Katalog: Producer Name") or row_data.get("Producer Name") or row_data.get("Produsent") or "")
+            gid = _extract_gid(row_data)
         return {
-            "our_artnr": str(artnr),
+            "our_artnr": artnr,
             "our_description": desc,
             "our_specification": spec,
             "our_producer": producer,
             "our_gid": gid,
             "our_unit_price": price,
             "matched_from": source,
-            "match_quality": quality,
+            "match_quality": "Søk",
+            "_score": round(score, 4),
         }
 
-    # Build a lookup from artnr -> catalog item for resolving alternatives
-    def _find_item(artnr_str, catalog):
-        for item in catalog.items:
-            if str(getattr(item, "artnr", "")).strip() == artnr_str.strip():
-                return item
-        return None
-
-    # Search both catalogs, collecting best + alternatives
+    # Use BM25 directly for fast, deterministic results — skip Claude/embeddings
+    query_upper = query.upper()
     for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
-        try:
-            artnr, alts_str, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
-            if artnr and artnr not in seen:
-                results.append(_extract_result(artnr, best_row, quality, source))
-                seen.add(artnr)
-            # alts_str is a comma-separated string of art.nr values, e.g. "123, 456, 789"
-            if alts_str and isinstance(alts_str, str):
-                for alt_artnr in alts_str.split(","):
-                    alt_artnr = alt_artnr.strip()
-                    if alt_artnr and alt_artnr not in seen:
-                        alt_item = _find_item(alt_artnr, catalog)
-                        alt_row = alt_item.row if alt_item else None
-                        results.append(_extract_result(alt_artnr, alt_row, quality, source))
-                        seen.add(alt_artnr)
-                        if len(results) >= limit:
-                            break
-        except Exception as e:
-            logger.warning(f"V2 catalog search failed for source={source}: {e}")
+        bm25 = catalog.bm25_index
+
+        # First: exact substring match on artnr or text (catches short codes like "CRP")
+        exact_hits = []
+        for item in bm25.docs:
+            item_text_upper = item.text.upper() if item.text else ""
+            artnr_upper = item.artnr.upper() if item.artnr else ""
+            if query_upper in artnr_upper or query_upper in item_text_upper:
+                # Score: prefer artnr match, then position in text
+                if query_upper in artnr_upper:
+                    s = 1000.0
+                else:
+                    pos = item_text_upper.find(query_upper)
+                    s = 500.0 - pos * 0.1  # earlier match = higher score
+                exact_hits.append((item, s))
+        exact_hits.sort(key=lambda x: -x[1])
+
+        # Then: BM25 token search
+        bm25_hits = bm25.top_n(query, n=limit * 3)
+
+        # Merge: exact matches first, then BM25 (deduplicated)
+        seen_in_catalog = set()
+        merged = []
+        for item, score in exact_hits:
+            if item.artnr not in seen_in_catalog:
+                merged.append((item, score))
+                seen_in_catalog.add(item.artnr)
+        for item, score in bm25_hits:
+            if item.artnr not in seen_in_catalog:
+                merged.append((item, score))
+                seen_in_catalog.add(item.artnr)
+
+        for item, score in merged:
+            if item.artnr in seen:
+                continue
+            results.append(_make_result(item, score, source))
+            seen.add(item.artnr)
+            if len(results) >= limit:
+                break
+        if len(results) >= limit:
+            break
+
+    # Sort globally by score descending
+    results.sort(key=lambda r: -r.get("_score", 0))
+    # Remove internal score from response
+    for r in results:
+        r.pop("_score", None)
 
     return {"ok": True, "results": results[:limit]}
 
