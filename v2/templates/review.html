@@ -322,7 +322,7 @@ function renderCard(r) {
   const hasOmOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
   html += '<div><dt>Konkurrent</dt><dd>' + esc(r.competitor || '') + '</dd></div>';
-  html += '<div><dt>Konk. art.nr</dt><dd>' + esc(r.competitor_artnr || '') + '</dd></div>';
+  html += '<div><dt>Konk. art.nr</dt><dd>' + competitorArtnrHtml(r.competitor, r.competitor_artnr) + '</dd></div>';
   html += '<div><dt>Kvt.</dt><dd>' + fmt(r.quantity_purchased) + '</dd></div>';
   html += '<div><dt>Pakning</dt><dd>' + esc(r.packaging_text || '-') + ' (' + (r.packaging_count || 1) + ')</dd></div>';
   html += '<div><dt>Totale enheter Konkurrent</dt><dd>';
@@ -717,6 +717,42 @@ function artnrWithLink(artnr, gid) {
   if (!gid) return '<span class="artnr">' + esc(artnr || '') + '</span>';
   return '<span class="artnr"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">' + esc(artnr || '') + '</a></span>';
 }
+// Competitor search URL mapping: competitor name (lowercased) -> URL template
+// {q} is replaced with URL-encoded art.nr
+var COMPETITOR_URL_MAP = {
+  'norengros': 'https://www.norengros.no/search?query={q}',
+  'nor engros': 'https://www.norengros.no/search?query={q}',
+  'epion': 'https://epion.no/nettbutikk/sok?query={q}',
+  'maske': 'https://www.maske.no/search?action=search&q={q}',
+  'mediq': 'https://b2b.mediqnorge.no/mediqb2bstorefront/NorwayB2Bifs10/no/search/?text={q}',
+  'mediq norge': 'https://b2b.mediqnorge.no/mediqb2bstorefront/NorwayB2Bifs10/no/search/?text={q}'
+};
+
+function competitorSearchUrl(competitor, artnr) {
+  if (!competitor || !artnr) return null;
+  var key = competitor.trim().toLowerCase();
+  // Exact match first
+  if (COMPETITOR_URL_MAP[key]) {
+    return COMPETITOR_URL_MAP[key].replace('{q}', encodeURIComponent(artnr.trim()));
+  }
+  // Partial match: check if competitor name contains a known key
+  for (var k in COMPETITOR_URL_MAP) {
+    if (key.indexOf(k) !== -1 || k.indexOf(key) !== -1) {
+      return COMPETITOR_URL_MAP[k].replace('{q}', encodeURIComponent(artnr.trim()));
+    }
+  }
+  return null;
+}
+
+function competitorArtnrHtml(competitor, artnr) {
+  if (!artnr) return '<span class="muted">-</span>';
+  var url = competitorSearchUrl(competitor, artnr);
+  if (url) {
+    return '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" title="Sok hos ' + esc(competitor) + '">' + esc(artnr) + ' &#x2197;</a>';
+  }
+  return esc(artnr);
+}
+
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 function fmt(v) { return v != null ? String(v) : '-'; }
