@@ -130,6 +130,24 @@
     <a id="exportLink" style="display:none;"><button class="sm" type="button">Last ned Excel</button></a>
     <button class="sm" id="btnCommitDb" onclick="commitToDb()" style="display:none;">Lagre til prisdatabase</button>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
+    <button class="sm" id="btnAddRow" onclick="toggleAddRowForm()">+ Legg til linje</button>
+  </div>
+
+  <div id="addRowForm" style="display:none; margin-bottom:12px; padding:12px 14px; background:white; border:1px solid #e5e7eb; border-radius:8px;">
+    <div style="font-weight:600; margin-bottom:8px;">Legg til manuell linje</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
+      <label style="font-size:12px;">Beskrivelse *<br><input type="text" id="addDesc" style="width:100%;" placeholder="Produktbeskrivelse"></label>
+      <label style="font-size:12px;">Pris (konkurrent) *<br><input type="number" id="addPrice" style="width:100%;" step="any" min="0" placeholder="0.00"></label>
+      <label style="font-size:12px;">Antall<br><input type="number" id="addQty" style="width:100%;" step="any" min="0" value="1"></label>
+      <label style="font-size:12px;">Konkurrent navn<br><input type="text" id="addCompName" style="width:100%;" placeholder="Valgfri"></label>
+      <label style="font-size:12px;">Art.nr<br><input type="text" id="addArtnr" style="width:100%;" placeholder="Valgfri"></label>
+      <label style="font-size:12px;">Spesifikasjon<br><input type="text" id="addSpec" style="width:100%;" placeholder="Valgfri"></label>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px;">
+      <button class="sm success" onclick="submitAddRow()">Legg til</button>
+      <button class="sm secondary" onclick="toggleAddRowForm()">Avbryt</button>
+      <span class="muted" id="addRowMsg"></span>
+    </div>
   </div>
 
   <div id="rows"></div>
@@ -185,6 +203,8 @@ function updateLockUI() {
   document.getElementById('btnBulkApprove').disabled = locked;
   document.getElementById('btnBulkReject').disabled = locked;
   document.getElementById('btnBatchSelect').disabled = locked;
+  document.getElementById('btnAddRow').disabled = locked;
+  if (locked) document.getElementById('addRowForm').style.display = 'none';
 }
 
 function applyFilters(preservePage) {
@@ -665,6 +685,53 @@ async function commitToDb() {
   } else {
     alert('Feil: ' + (resp.error || 'ukjent'));
   }
+}
+
+// --- Add row ---
+
+function toggleAddRowForm() {
+  const form = document.getElementById('addRowForm');
+  form.style.display = form.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('addRowMsg').textContent = '';
+}
+
+async function submitAddRow() {
+  const desc = document.getElementById('addDesc').value.trim();
+  const price = document.getElementById('addPrice').value;
+  const msg = document.getElementById('addRowMsg');
+  if (!desc) { msg.textContent = 'Beskrivelse er påkrevd.'; return; }
+  if (!price) { msg.textContent = 'Pris er påkrevd.'; return; }
+
+  msg.textContent = 'Legger til...';
+  const body = {
+    description: desc,
+    price: parseFloat(price),
+    quantity: parseFloat(document.getElementById('addQty').value) || 1,
+    competitor_name: document.getElementById('addCompName').value.trim(),
+    competitor_artnr: document.getElementById('addArtnr').value.trim(),
+    specification: document.getElementById('addSpec').value.trim(),
+  };
+  const resp = await postJson('/v2/review/' + JOB_ID + '/add-row', body);
+  if (!resp.ok) {
+    msg.textContent = 'Feil: ' + (resp.error || 'ukjent');
+    return;
+  }
+  // Append and show
+  if (resp.row) {
+    allRows.push(resp.row);
+    expandedRows[resp.row.dedup_idx] = true;
+  }
+  // Clear form
+  document.getElementById('addDesc').value = '';
+  document.getElementById('addPrice').value = '';
+  document.getElementById('addQty').value = '1';
+  document.getElementById('addCompName').value = '';
+  document.getElementById('addArtnr').value = '';
+  document.getElementById('addSpec').value = '';
+  document.getElementById('addRowForm').style.display = 'none';
+  msg.textContent = '';
+  updateSummaryFromRows();
+  applyFilters();
 }
 
 // --- Init ---
