@@ -34,7 +34,6 @@ EXPORT_COLUMNS = [
     "Besparelse %",
     "Match-kvalitet",
     "Kommentar",
-    "Strategi",
     "Sammenslatt",
     "Avvik i sammenslatt",
 ]
@@ -45,6 +44,9 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     export_rows = []
 
     for r in review_rows:
+        # Skip deleted rows
+        if r.get("deleted"):
+            continue
         # Get selected candidate
         sel_idx = r.get("selected_candidate_idx")
         candidates = r.get("candidates", [])
@@ -77,7 +79,7 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "Kvt.": r.get("quantity_purchased"),
             "Pakning": r.get("packaging_text", ""),
             "Pakningsstr.": r.get("packaging_count"),
-            "Totalt enheter": r.get("total_units"),
+            "Totalt enheter": r.get("quantity_override") or r.get("total_units"),
             "Konk. linjebelop": comp_line,
             "Vart Art.Nr": cand.get("our_artnr", "") if cand else "",
             "Vart produktnavn": cand.get("our_description", "") if cand else "",
@@ -89,7 +91,6 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "Besparelse %": savings_pct,
             "Match-kvalitet": cand.get("match_quality", "") if cand else "Ingen",
             "Kommentar": r.get("comment", ""),
-            "Strategi": r.get("strategy", ""),
             "Sammenslatt": merge_note,
             "Avvik i sammenslatt": warn_note,
         }

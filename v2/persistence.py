@@ -5,7 +5,8 @@ Files per job (stored in DATA_DIR/v2/reviews/{job_id}/):
   review.json      – full review rows (matched rows + review fields)
   selections.json  – {dedup_idx: selected_candidate_idx}
   decisions.json   – {dedup_idx: {status, decided_at}}
-  extras.json      – {dedup_idx: {comment, strategy}}
+  extras.json      – {dedup_idx: {comment}}
+  deletions.json   – {dedup_idx: {deleted_at}}
   lock.json        – {locked: bool, locked_at, locked_by}
 """
 import json
@@ -54,7 +55,7 @@ def init_review(job_id: str, matched_rows: List[Dict[str, Any]]) -> List[Dict[st
       - review_status: 'pending' | 'approved' | 'rejected'
       - selected_candidate_idx: from best_candidate_idx
       - comment: ''
-      - strategy: ''
+      - deleted: False
     """
     review_rows = []
     for row in matched_rows:
@@ -62,7 +63,7 @@ def init_review(job_id: str, matched_rows: List[Dict[str, Any]]) -> List[Dict[st
         rr["review_status"] = "pending"
         rr["selected_candidate_idx"] = row.get("best_candidate_idx")
         rr["comment"] = ""
-        rr["strategy"] = ""
+        rr["deleted"] = False
         review_rows.append(rr)
     return review_rows
 
@@ -117,7 +118,34 @@ def save_decision(job_id: str, dedup_idx: int, status: str) -> None:
 
 
 # ============================================================
-# EXTRAS (comment + strategy per row)
+# DELETIONS (soft-delete rows)
+# ============================================================
+
+def save_deletions(job_id: str, deletions: Dict[str, Dict[str, Any]]) -> None:
+    _write_json(_job_dir(job_id) / "deletions.json", deletions)
+
+
+def load_deletions(job_id: str) -> Dict[str, Dict[str, Any]]:
+    data = _read_json(_job_dir(job_id) / "deletions.json")
+    return data if isinstance(data, dict) else {}
+
+
+def save_deletion(job_id: str, dedup_idx: int) -> None:
+    """Mark a row as deleted."""
+    dels = load_deletions(job_id)
+    dels[str(dedup_idx)] = {"deleted_at": _utc_now_iso()}
+    save_deletions(job_id, dels)
+
+
+def remove_deletion(job_id: str, dedup_idx: int) -> None:
+    """Restore a deleted row."""
+    dels = load_deletions(job_id)
+    dels.pop(str(dedup_idx), None)
+    save_deletions(job_id, dels)
+
+
+# ============================================================
+# EXTRAS (comment per row)
 # ============================================================
 
 def save_extras(job_id: str, extras: Dict[str, Dict[str, Any]]) -> None:
@@ -129,14 +157,12 @@ def load_extras(job_id: str) -> Dict[str, Dict[str, Any]]:
     return data if isinstance(data, dict) else {}
 
 
-def save_extra(job_id: str, dedup_idx: int, comment: Optional[str] = None, strategy: Optional[str] = None) -> None:
-    """Save comment/strategy for one row, merging with existing."""
+def save_extra(job_id: str, dedup_idx: int, comment: Optional[str] = None) -> None:
+    """Save comment for one row, merging with existing."""
     extras = load_extras(job_id)
     entry = extras.get(str(dedup_idx), {})
     if comment is not None:
         entry["comment"] = comment
-    if strategy is not None:
-        entry["strategy"] = strategy
     entry["updated_at"] = _utc_now_iso()
     extras[str(dedup_idx)] = entry
     save_extras(job_id, extras)
@@ -173,19 +199,26 @@ def get_lock_info(job_id: str) -> Dict[str, Any]:
 # ============================================================
 
 def apply_overrides(review_rows: List[Dict[str, Any]], job_id: str) -> List[Dict[str, Any]]:
-    """Apply persisted selections, decisions, and extras on top of review rows.
+    """Apply persisted selections, decisions, extras, deletions, and quantity overrides.
 
-    When a selection changes the candidate, recalculates:
+    When a selection or quantity changes, recalculates:
       our_unit_price, our_comparable_line_price, savings_amount
     """
     sels = load_selections(job_id)
     decs = load_decisions(job_id)
     extras = load_extras(job_id)
+    dels = load_deletions(job_id)
 
     result = []
     for row in review_rows:
         r = dict(row)
         idx_str = str(r.get("dedup_idx", ""))
+
+        # Apply deletion
+        if idx_str in dels:
+            r["deleted"] = True
+        else:
+            r["deleted"] = r.get("deleted", False)
 
         # Apply selection
         if idx_str in sels:
@@ -195,21 +228,39 @@ def apply_overrides(review_rows: List[Dict[str, Any]], job_id: str) -> List[Dict
                 r["selected_candidate_idx"] = new_cand_idx
                 cand = candidates[new_cand_idx]
                 r["our_unit_price"] = cand.get("our_unit_price")
-                r["our_comparable_line_price"] = cand.get("our_comparable_line_price")
-                r["savings_amount"] = cand.get("savings_amount")
+
+        # Apply quantity override from extras
+        if idx_str in extras:
+            ex = extras[idx_str]
+            if "comment" in ex:
+                r["comment"] = ex["comment"]
+            if "quantity_override" in ex and ex["quantity_override"] is not None:
+                r["quantity_override"] = ex["quantity_override"]
+
+        # Recalculate prices using effective quantity
+        _recalc_prices(r)
 
         # Apply decision
         if idx_str in decs:
             r["review_status"] = decs[idx_str].get("status", r.get("review_status", "pending"))
 
-        # Apply extras
-        if idx_str in extras:
-            ex = extras[idx_str]
-            if "comment" in ex:
-                r["comment"] = ex["comment"]
-            if "strategy" in ex:
-                r["strategy"] = ex["strategy"]
-
         result.append(r)
 
     return result
+
+
+def _recalc_prices(r: Dict[str, Any]) -> None:
+    """Recalculate our_comparable_line_price and savings_amount based on current state."""
+    effective_units = r.get("quantity_override") or r.get("total_units", 0) or 0
+    our_price = r.get("our_unit_price")
+    competitor_line = r.get("competitor_line_amount")
+
+    if our_price is not None and effective_units > 0:
+        r["our_comparable_line_price"] = round(effective_units * our_price, 2)
+        if competitor_line is not None:
+            r["savings_amount"] = round(competitor_line - r["our_comparable_line_price"], 2)
+        else:
+            r["savings_amount"] = None
+    else:
+        r["our_comparable_line_price"] = None
+        r["savings_amount"] = None

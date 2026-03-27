@@ -579,16 +579,17 @@ def v2_review(job_id: str):
     lock = rv.get_lock_info(job_id)
 
     # Summary counts
-    approved = sum(1 for r in rows if r.get("review_status") == "approved")
-    rejected = sum(1 for r in rows if r.get("review_status") == "rejected")
-    pending = sum(1 for r in rows if r.get("review_status") == "pending")
+    approved = sum(1 for r in rows if r.get("review_status") == "approved" and not r.get("deleted"))
+    rejected = sum(1 for r in rows if r.get("review_status") == "rejected" and not r.get("deleted"))
+    pending = sum(1 for r in rows if r.get("review_status") == "pending" and not r.get("deleted"))
+    deleted = sum(1 for r in rows if r.get("deleted"))
 
     return {
         "job_id": job_id,
         "status": t.get("status"),
         "lock": lock,
         "count": len(rows),
-        "summary": {"approved": approved, "rejected": rejected, "pending": pending},
+        "summary": {"approved": approved, "rejected": rejected, "pending": pending, "deleted": deleted},
         "rows": rows,
     }
 
@@ -686,9 +687,9 @@ async def v2_bulk_decide(job_id: str, request: Request):
 
 @v2_router.post("/review/{job_id}/extras")
 async def v2_extras(job_id: str, request: Request):
-    """Update comment and/or strategy for one row.
+    """Update comment for one row.
 
-    Body: {dedup_idx: int, comment?: str, strategy?: str}
+    Body: {dedup_idx: int, comment?: str}
     """
     t, err = _require_review_job(job_id)
     if err:
@@ -703,9 +704,233 @@ async def v2_extras(job_id: str, request: Request):
         job_id,
         int(dedup_idx),
         comment=body.get("comment"),
-        strategy=body.get("strategy"),
     )
+
+    # Handle quantity override (stored separately in extras.json)
+    if "quantity_override" in body:
+        extras = rv.load_extras(job_id)
+        entry = extras.get(str(dedup_idx), {})
+        entry["quantity_override"] = body["quantity_override"]
+        entry["updated_at"] = _utc_now_iso()
+        extras[str(dedup_idx)] = entry
+        rv.save_extras(job_id, extras)
+
     return {"ok": True, "dedup_idx": dedup_idx}
+
+
+@v2_router.post("/review/{job_id}/search-catalog")
+async def v2_search_catalog(job_id: str, request: Request):
+    """Search the product catalog. Body: {query: str, limit?: int}
+
+    Returns matching products from both LK and full catalogs.
+    """
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    query = (body.get("query") or "").strip()
+    limit = body.get("limit", 15)
+    if not query or len(query) < 2:
+        return {"ok": True, "results": []}
+
+    bundle = _get_catalog_bundle()
+    if bundle is None:
+        return JSONResponse({"error": "Produktkatalog er ikke lastet"}, status_code=503)
+
+    # Build a fake competitor row for the matcher
+    search_row = {
+        "Produktnavn": "",
+        "Beskrivelse": query,
+        "Spesifikasjon": "",
+        "Konkurrent art.nr": "",
+        "Produsent art.nr": "",
+        "Kommentar": "",
+    }
+
+    results = []
+    seen = set()
+
+    # Search both catalogs
+    for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
+        try:
+            artnr, _alts, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
+            if artnr and artnr not in seen:
+                price, psrc = bundle.price_for_artnr(artnr)
+                desc = ""
+                spec = ""
+                producer = ""
+                if isinstance(best_row, dict):
+                    desc = str(best_row.get("Katalog: Item Description") or best_row.get("Item Description") or best_row.get("Description") or "")
+                    spec = str(best_row.get("Katalog: Specification") or best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
+                    producer = str(best_row.get("Katalog: Producer Name") or best_row.get("Producer Name") or best_row.get("Produsent") or "")
+                results.append({
+                    "our_artnr": str(artnr),
+                    "our_description": desc,
+                    "our_specification": spec,
+                    "our_producer": producer,
+                    "our_unit_price": price,
+                    "matched_from": source,
+                    "match_quality": quality,
+                })
+                seen.add(artnr)
+        except Exception as e:
+            logger.warning(f"V2 catalog search failed for source={source}: {e}")
+
+    return {"ok": True, "results": results[:limit]}
+
+
+@v2_router.post("/review/{job_id}/replace-candidate")
+async def v2_replace_candidate(job_id: str, request: Request):
+    """Replace/add a candidate from catalog search. Body: {dedup_idx: int, our_artnr: str}
+
+    Looks up the product in the catalog, adds it as a new candidate, and selects it.
+    Returns the updated row data.
+    """
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    our_artnr = (body.get("our_artnr") or "").strip()
+    if dedup_idx is None or not our_artnr:
+        return JSONResponse({"error": "dedup_idx og our_artnr er påkrevd"}, status_code=400)
+
+    bundle = _get_catalog_bundle()
+    if bundle is None:
+        return JSONResponse({"error": "Produktkatalog er ikke lastet"}, status_code=503)
+
+    # Look up price
+    price, price_source = bundle.price_for_artnr(our_artnr)
+
+    # Try to find the product details from catalog items
+    desc = ""
+    spec = ""
+    producer = ""
+    for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
+        for item in catalog.items:
+            if str(getattr(item, "artnr", "")).strip() == our_artnr:
+                row_data = item.row if hasattr(item, "row") else {}
+                if isinstance(row_data, dict):
+                    desc = str(row_data.get("Katalog: Item Description") or row_data.get("Item Description") or row_data.get("Description") or "")
+                    spec = str(row_data.get("Katalog: Specification") or row_data.get("Specification") or row_data.get("Spesifikasjon") or "")
+                    producer = str(row_data.get("Katalog: Producer Name") or row_data.get("Producer Name") or row_data.get("Produsent") or "")
+                break
+        if desc:
+            break
+
+    # Load review data and update the row
+    review_rows = rv.load_review(job_id)
+    if review_rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+
+    row = None
+    for r in review_rows:
+        if r.get("dedup_idx") == int(dedup_idx):
+            row = r
+            break
+    if row is None:
+        return JSONResponse({"error": f"Rad {dedup_idx} ikke funnet"}, status_code=404)
+
+    # Build new candidate
+    candidates = row.get("candidates", [])
+    total_units = row.get("total_units", 0) or 0
+    competitor_line = row.get("competitor_line_amount")
+
+    new_cand = {
+        "candidate_idx": len(candidates),
+        "our_artnr": our_artnr,
+        "our_description": desc,
+        "our_specification": spec,
+        "our_producer": producer,
+        "our_unit_price": price,
+        "price_source": price_source,
+        "match_quality": "Manuelt valgt",
+        "matched_from": "manual",
+    }
+
+    # Calculate prices for new candidate
+    if price is not None and total_units > 0:
+        new_cand["our_comparable_line_price"] = round(total_units * price, 2)
+        if competitor_line is not None:
+            new_cand["savings_amount"] = round(competitor_line - new_cand["our_comparable_line_price"], 2)
+        else:
+            new_cand["savings_amount"] = None
+    else:
+        new_cand["our_comparable_line_price"] = None
+        new_cand["savings_amount"] = None
+
+    # Check if artnr already exists in candidates
+    existing_idx = None
+    for c in candidates:
+        if c.get("our_artnr") == our_artnr:
+            existing_idx = c["candidate_idx"]
+            break
+
+    if existing_idx is not None:
+        # Select existing candidate
+        selected_idx = existing_idx
+    else:
+        # Add new candidate
+        candidates.append(new_cand)
+        selected_idx = new_cand["candidate_idx"]
+
+    row["candidates"] = candidates
+    row["selected_candidate_idx"] = selected_idx
+    row["match_status"] = "matched"
+
+    # Persist updated review.json and selection
+    rv.save_review(job_id, review_rows)
+    rv.save_selection(job_id, int(dedup_idx), selected_idx)
+
+    # Apply overrides to get the final state for this row
+    overridden = rv.apply_overrides([row], job_id)
+    final_row = overridden[0] if overridden else row
+
+    return {
+        "ok": True,
+        "dedup_idx": dedup_idx,
+        "row": {
+            "candidates": final_row.get("candidates", []),
+            "selected_candidate_idx": final_row.get("selected_candidate_idx"),
+            "our_unit_price": final_row.get("our_unit_price"),
+            "our_comparable_line_price": final_row.get("our_comparable_line_price"),
+            "savings_amount": final_row.get("savings_amount"),
+        },
+    }
+
+
+@v2_router.post("/review/{job_id}/delete")
+async def v2_delete_row(job_id: str, request: Request):
+    """Soft-delete a row. Body: {dedup_idx: int}"""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    if dedup_idx is None:
+        return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
+
+    rv.save_deletion(job_id, int(dedup_idx))
+    return {"ok": True, "dedup_idx": dedup_idx, "deleted": True}
+
+
+@v2_router.post("/review/{job_id}/restore")
+async def v2_restore_row(job_id: str, request: Request):
+    """Restore a soft-deleted row. Body: {dedup_idx: int}"""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    dedup_idx = body.get("dedup_idx")
+    if dedup_idx is None:
+        return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
+
+    rv.remove_deletion(job_id, int(dedup_idx))
+    return {"ok": True, "dedup_idx": dedup_idx, "deleted": False}
 
 
 @v2_router.post("/review/{job_id}/lock")
