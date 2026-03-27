@@ -251,7 +251,7 @@ function renderCard(r) {
 
   // --- Clickable summary row ---
   const selCand = (selIdx != null && cands[selIdx]) ? cands[selIdx] : null;
-  const matchLabel = selCand ? esc(selCand.our_artnr) + ' ' + esc(selCand.our_description || '') : (cands.length ? cands.length + ' kandidater' : 'Ingen match');
+  const matchLabel = selCand ? productLink(selCand.our_gid, selCand.our_artnr) + ' ' + esc(selCand.our_description || '') : (cands.length ? cands.length + ' kandidater' : 'Ingen match');
   const statusBadge = {approved:'badge-approved', rejected:'badge-rejected', pending:'badge-pending'}[st] || 'badge-pending';
   const statusText = {approved:'Godkjent', rejected:'Avvist', pending:'Pending'}[st] || st;
 
@@ -322,7 +322,7 @@ function renderCard(r) {
       const isSel = c.candidate_idx === selIdx;
       const candCls = 'cand-row' + (isSel ? ' selected' : '') + (locked ? ' disabled' : '');
       html += '<div class="' + candCls + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
-      html += '<span class="artnr">' + esc(c.our_artnr) + '</span>';
+      html += artnrWithLink(c.our_artnr, c.our_gid);
       html += '<span class="desc">' + esc(c.our_description || '') + '</span>';
       html += '<span class="price">' + money(c.our_unit_price) + '/enh</span>';
       html += '<span class="savings">' + savingsHtml(c.savings_amount) + '</span>';
@@ -521,7 +521,7 @@ async function searchCatalog(dedupIdx, query) {
   }
   container.innerHTML = results.map(r =>
     '<div class="search-result-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
-    '<span class="artnr">' + esc(r.our_artnr) + '</span>' +
+    artnrWithLink(r.our_artnr, r.our_gid) +
     '<span class="desc">' + esc(r.our_description || '') + (r.our_specification ? ' – ' + esc(r.our_specification) : '') + '</span>' +
     '<span class="price">' + money(r.our_unit_price) + '/enh</span>' +
     '<span class="muted">' + esc(r.matched_from || '') + '</span>' +
@@ -613,6 +613,14 @@ async function postJson(url, body) {
 
 // --- Formatting ---
 
+function productLink(gid, label) {
+  if (!gid) return esc(label || '');
+  return '<a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt hos OneMed">' + esc(label || gid) + '</a>';
+}
+function artnrWithLink(artnr, gid) {
+  if (!gid) return '<span class="artnr">' + esc(artnr || '') + '</span>';
+  return '<span class="artnr"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">' + esc(artnr || '') + '</a></span>';
+}
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 function fmt(v) { return v != null ? String(v) : '-'; }

@@ -810,21 +810,28 @@ async def v2_search_catalog(job_id: str, request: Request):
             "match_quality": quality,
         }
 
+    # Build a lookup from artnr -> catalog item for resolving alternatives
+    def _find_item(artnr_str, catalog):
+        for item in catalog.items:
+            if str(getattr(item, "artnr", "")).strip() == artnr_str.strip():
+                return item
+        return None
+
     # Search both catalogs, collecting best + alternatives
     for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
         try:
-            artnr, alts, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
+            artnr, alts_str, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
             if artnr and artnr not in seen:
                 results.append(_extract_result(artnr, best_row, quality, source))
                 seen.add(artnr)
-            # Also include alternatives from the matcher
-            if alts:
-                for alt in alts:
-                    alt_artnr = alt.get("artnr") or (alt.artnr if hasattr(alt, "artnr") else "")
+            # alts_str is a comma-separated string of art.nr values, e.g. "123, 456, 789"
+            if alts_str and isinstance(alts_str, str):
+                for alt_artnr in alts_str.split(","):
+                    alt_artnr = alt_artnr.strip()
                     if alt_artnr and alt_artnr not in seen:
-                        alt_row = alt.get("row") or (alt.row if hasattr(alt, "row") else None)
-                        alt_quality = alt.get("quality", quality)
-                        results.append(_extract_result(alt_artnr, alt_row, alt_quality, source))
+                        alt_item = _find_item(alt_artnr, catalog)
+                        alt_row = alt_item.row if alt_item else None
+                        results.append(_extract_result(alt_artnr, alt_row, quality, source))
                         seen.add(alt_artnr)
                         if len(results) >= limit:
                             break
