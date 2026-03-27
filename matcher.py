@@ -905,9 +905,11 @@ def _fill_catalog_fields(out_row: Dict[str, Any], best: Optional[_CatalogItem]) 
 
 
 
-def _load_catalog_excel(path: str, sheet_name: str | int | None = None, **_kwargs) -> List[_CatalogItem]:
+def _load_catalog_excel(path: str, sheet_name: str | int | None = None, column_mapping: Dict[str, str] | None = None, **_kwargs) -> List[_CatalogItem]:
     """Les katalog fra Excel og bygg items.
     - sheet_name: valgfritt; hvis None leses første ark.
+    - column_mapping: valgfri bruker-mapping {system_key: file_column_name}.
+      Brukes til å rename kolonner før auto-deteksjon.
     - **_kwargs: ignoreres for bakoverkompatibilitet.
     """
     # Pandas: sheet_name=None => dict av ark; vi vil ha første ark i så fall
@@ -927,6 +929,31 @@ def _load_catalog_excel(path: str, sheet_name: str | int | None = None, **_kwarg
 
     if cat is None or getattr(cat, "empty", False):
         raise ValueError("Katalogfila ga 0 rader.")
+
+    # Apply user column mapping before auto-detection
+    if column_mapping:
+        _KEY_TO_INTERNAL = {
+            "Artikkelnummer": "Katalog: Artikkelnummer",
+            "Item Description": "Katalog: Item Description",
+            "Specification": "Katalog: Specification",
+            "Producer Name": "Katalog: Producer Name",
+            "Producer Item Number": "Katalog: Producer Item Number",
+            "GID": "Katalog: GID",
+            "ALC": "Katalog: ALC",
+            "Item group": "Katalog: Item group",
+            "Web Title": "Katalog: Web Title",
+            "Web Text": "Katalog: Web Text",
+            "Storage instruction": "Katalog: Storage instruction",
+        }
+        user_rename: Dict[str, str] = {}
+        for sys_key, file_col in column_mapping.items():
+            if not file_col or file_col == "__none__":
+                continue
+            internal = _KEY_TO_INTERNAL.get(sys_key)
+            if internal and file_col in cat.columns and internal not in cat.columns:
+                user_rename[file_col] = internal
+        if user_rename:
+            cat = cat.rename(columns=user_rename)
 
     # Bygg normert kolonnenavn-mapping
     cols = list(cat.columns)
@@ -1193,9 +1220,9 @@ class Catalog:
                 self.embed_index = None
 
     @classmethod
-    def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: str | int | None = None) -> "Catalog":
+    def from_excel(cls, catalog_path: str, use_embeddings: bool = True, sheet_name: str | int | None = None, column_mapping: Dict[str, str] | None = None) -> "Catalog":
         try:
-            items = _load_catalog_excel(catalog_path, sheet_name=sheet_name)
+            items = _load_catalog_excel(catalog_path, sheet_name=sheet_name, column_mapping=column_mapping)
         except TypeError:
             # bakoverkompatibilitet hvis loader ikke støtter sheet_name
             items = _load_catalog_excel(catalog_path)
