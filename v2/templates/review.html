@@ -49,9 +49,15 @@
     .cand-row.disabled { cursor: default; opacity: 0.7; }
     .cand-row.disabled:hover { background: transparent; }
     .cand-row .artnr { font-weight: 600; min-width: 70px; }
+    .cand-row .artnr a { color: #1F4E79; }
+    .cand-row .link-icon { font-size: 11px; min-width: 16px; }
+    .cand-row .link-icon a { color: #6b7280; }
+    .cand-row .link-icon a:hover { color: #1F4E79; }
+    .cand-row .name { flex: 1; color: #374151; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cand-row .spec { flex: 0.6; color: #6b7280; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cand-row .price { min-width: 90px; text-align: right; }
+    .cand-row .score { min-width: 60px; text-align: right; color: #6b7280; }
     .cand-row .desc { flex: 1; color: #374151; }
-    .cand-row .price { min-width: 70px; text-align: right; }
-    .cand-row .savings { min-width: 80px; text-align: right; }
     .savings-pos { color: #16a34a; font-weight: 600; }
     .savings-neg { color: #dc2626; font-weight: 600; }
     .extras { display: flex; gap: 10px; margin-top: 8px; align-items: flex-start; }
@@ -68,11 +74,20 @@
     .search-results { max-height: 200px; overflow-y: auto; }
     .search-result-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 4px; font-size: 12px; cursor: pointer; }
     .search-result-row:hover { background: #e5e7eb; }
-    .search-result-row .artnr { font-weight: 600; min-width: 70px; }
-    .search-result-row .desc { flex: 1; color: #374151; }
-    .search-result-row .price { min-width: 70px; text-align: right; }
     .search-spinner { color: #6b7280; font-size: 12px; padding: 4px; }
     .deleted-label { display: inline-block; padding: 2px 8px; background: #f3f4f6; color: #6b7280; border-radius: 4px; font-size: 11px; font-weight: 600; margin-left: 8px; }
+    /* Expandable row */
+    .card-summary { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+    .card-summary:hover { background: #f9fafb; margin: -4px -6px; padding: 4px 6px; border-radius: 6px; }
+    .card-chevron { font-size: 11px; color: #9ca3af; transition: transform 0.15s; min-width: 16px; text-align: center; }
+    .card-chevron.open { transform: rotate(90deg); }
+    .card-summary .sum-desc { flex: 1; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-summary .sum-match { font-size: 12px; color: #374151; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-summary .sum-price { font-size: 12px; min-width: 80px; text-align: right; }
+    .card-summary .sum-savings { font-size: 12px; min-width: 90px; text-align: right; }
+    .card-summary .sum-status { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .card-detail { padding-top: 10px; border-top: 1px solid #f3f4f6; margin-top: 10px; }
+    .card-detail.hidden { display: none; }
   </style>
 </head>
 <body>
@@ -112,9 +127,31 @@
     <button class="sm success" id="btnBulkApprove" onclick="bulkDecide('approved')">Godkjenn filtrerte</button>
     <button class="sm danger" id="btnBulkReject" onclick="bulkDecide('rejected')">Avvis filtrerte</button>
     <button class="sm secondary" id="btnBatchSelect" onclick="batchSelect()">Auto-velg beste</button>
-    <a id="exportLink" style="display:none;"><button class="sm" type="button">Last ned Excel</button></a>
+    <span id="exportOptions" style="display:none;">
+      <label style="font-size:11px;"><input type="checkbox" id="showLinePrices" checked> Vis linjepriser</label>
+      <button class="sm" onclick="doExport('xlsx')">Excel</button>
+      <button class="sm secondary" onclick="doExport('pdf')">PDF</button>
+    </span>
     <button class="sm" id="btnCommitDb" onclick="commitToDb()" style="display:none;">Lagre til prisdatabase</button>
     <button class="sm secondary" id="lockBtn" onclick="toggleLock()">Las</button>
+    <button class="sm" id="btnAddRow" onclick="toggleAddRowForm()">+ Legg til linje</button>
+  </div>
+
+  <div id="addRowForm" style="display:none; margin-bottom:12px; padding:12px 14px; background:white; border:1px solid #e5e7eb; border-radius:8px;">
+    <div style="font-weight:600; margin-bottom:8px;">Legg til manuell linje</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px;">
+      <label style="font-size:12px;">Beskrivelse *<br><input type="text" id="addDesc" style="width:100%;" placeholder="Produktbeskrivelse"></label>
+      <label style="font-size:12px;">Pris (konkurrent) *<br><input type="number" id="addPrice" style="width:100%;" step="any" min="0" placeholder="0.00"></label>
+      <label style="font-size:12px;">Antall<br><input type="number" id="addQty" style="width:100%;" step="any" min="0" value="1"></label>
+      <label style="font-size:12px;">Konkurrent navn<br><input type="text" id="addCompName" style="width:100%;" placeholder="Valgfri"></label>
+      <label style="font-size:12px;">Art.nr<br><input type="text" id="addArtnr" style="width:100%;" placeholder="Valgfri"></label>
+      <label style="font-size:12px;">Spesifikasjon<br><input type="text" id="addSpec" style="width:100%;" placeholder="Valgfri"></label>
+    </div>
+    <div style="margin-top:10px; display:flex; gap:8px;">
+      <button class="sm success" onclick="submitAddRow()">Legg til</button>
+      <button class="sm secondary" onclick="toggleAddRowForm()">Avbryt</button>
+      <span class="muted" id="addRowMsg"></span>
+    </div>
   </div>
 
   <div id="rows"></div>
@@ -130,6 +167,7 @@ const PAGE_SIZE = 25;
 let currentPage = 0;
 let debounceTimers = {};
 let openSearchPanels = {};
+let expandedRows = {};
 
 async function loadReview() {
   const resp = await fetch('/v2/review/' + JOB_ID);
@@ -142,9 +180,9 @@ async function loadReview() {
   locked = data.lock?.locked || false;
 
   document.getElementById('jobIdDisplay').textContent = JOB_ID.substring(0, 12) + '...';
-  const exportEl = document.getElementById('exportLink');
-  exportEl.href = '/v2/export/' + JOB_ID;
-  exportEl.style.display = 'inline';
+  document.getElementById('exportOptions').style.display = 'inline-flex';
+  document.getElementById('exportOptions').style.gap = '6px';
+  document.getElementById('exportOptions').style.alignItems = 'center';
   document.getElementById('btnCommitDb').style.display = 'inline';
   updateSummary(data.summary);
   updateLockUI();
@@ -169,6 +207,8 @@ function updateLockUI() {
   document.getElementById('btnBulkApprove').disabled = locked;
   document.getElementById('btnBulkReject').disabled = locked;
   document.getElementById('btnBatchSelect').disabled = locked;
+  document.getElementById('btnAddRow').disabled = locked;
+  if (locked) document.getElementById('addRowForm').style.display = 'none';
 }
 
 function applyFilters(preservePage) {
@@ -232,20 +272,33 @@ function renderCard(r) {
   const selIdx = r.selected_candidate_idx;
   const cands = r.candidates || [];
   const dis = (locked || isDeleted) ? 'disabled' : '';
+  const isOpen = !!expandedRows[idx];
 
   let html = '<div class="card ' + (isDeleted ? '' : st) + warnCls + deletedCls + '" id="card-' + idx + '">';
 
-  // Header
-  html += '<div class="card-header"><div>';
-  html += '<span class="card-title">' + esc(r.description || '(ingen beskrivelse)') + '</span>';
-  if (isDeleted) {
-    html += '<span class="deleted-label">SLETTET</span>';
-  }
-  if (r.merged_from_count > 1) {
-    html += '<span class="merged-info">Slatt sammen fra ' + r.merged_from_count + ' rader</span>';
-  }
-  html += '</div><div class="decision-btns">';
+  // --- Clickable summary row ---
+  const selCand = (selIdx != null && cands[selIdx]) ? cands[selIdx] : null;
+  const matchLabel = selCand ? productLink(selCand.our_gid, selCand.our_artnr) + ' ' + esc(selCand.our_description || '') : (cands.length ? cands.length + ' kandidater' : 'Ingen match');
+  const statusBadge = {approved:'badge-approved', rejected:'badge-rejected', pending:'badge-pending'}[st] || 'badge-pending';
+  const statusText = {approved:'Godkjent', rejected:'Avvist', pending:'Pending'}[st] || st;
 
+  html += '<div class="card-summary" onclick="toggleExpand(' + idx + ')">';
+  html += '<span class="card-chevron' + (isOpen ? ' open' : '') + '" id="chevron-' + idx + '">&#9654;</span>';
+  html += '<span class="sum-desc">' + esc(r.description || '(ingen beskrivelse)');
+  if (isDeleted) html += ' <span class="deleted-label">SLETTET</span>';
+  if (r.merged_from_count > 1) html += '<span class="merged-info">(' + r.merged_from_count + ' slatt sammen)</span>';
+  html += '</span>';
+  html += '<span class="sum-match muted">' + matchLabel + '</span>';
+  html += '<span class="sum-price">' + money(r.our_unit_price) + '</span>';
+  html += '<span class="sum-savings">' + savingsHtml(r.savings_amount) + '</span>';
+  html += '<span class="sum-status ' + statusBadge + '">' + statusText + '</span>';
+  html += '</div>';
+
+  // --- Expandable detail ---
+  html += '<div class="card-detail' + (isOpen ? '' : ' hidden') + '" id="detail-' + idx + '">';
+
+  // Decision buttons
+  html += '<div style="display:flex;justify-content:flex-end;gap:4px;margin-bottom:8px;">';
   if (isDeleted) {
     html += '<button class="sm warn-btn" onclick="restoreRow(' + idx + ')" ' + (locked ? 'disabled' : '') + '>Gjenopprett</button>';
   } else {
@@ -254,14 +307,14 @@ function renderCard(r) {
     html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + dis + '>Pending</button>';
     html += '<button class="sm danger" onclick="deleteRow(' + idx + ')" ' + dis + ' title="Slett rad">Slett</button>';
   }
-  html += '</div></div>';
+  html += '</div>';
 
   if (isDeleted) {
-    html += '</div>';
+    html += '</div></div>';
     return html;
   }
 
-  // Meta grid
+  // Meta grid (input data)
   const effectiveUnits = r.quantity_override || r.total_units;
   const hasOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
@@ -291,16 +344,14 @@ function renderCard(r) {
   // Candidates
   if (cands.length > 0) {
     html += '<div class="candidates">';
-    html += '<div class="muted" style="margin-bottom:4px;">Kandidater:</div>';
+    html += '<div class="muted" style="margin-bottom:4px; display:flex; gap:8px; font-size:11px; padding:0 8px;">';
+    html += '<span style="min-width:70px;">Art.Nr</span><span style="min-width:16px;"></span><span style="flex:1;">Navn</span><span style="flex:0.6;">Spesifikasjon</span><span style="min-width:90px;text-align:right;">Pris</span><span style="min-width:60px;text-align:right;">Score</span>';
+    html += '</div>';
     for (const c of cands) {
       const isSel = c.candidate_idx === selIdx;
       const candCls = 'cand-row' + (isSel ? ' selected' : '') + (locked ? ' disabled' : '');
       html += '<div class="' + candCls + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
-      html += '<span class="artnr">' + esc(c.our_artnr) + '</span>';
-      html += '<span class="desc">' + esc(c.our_description || '') + '</span>';
-      html += '<span class="price">' + money(c.our_unit_price) + '/enh</span>';
-      html += '<span class="savings">' + savingsHtml(c.savings_amount) + '</span>';
-      html += '<span class="muted">' + esc(c.match_quality || '') + '</span>';
+      html += renderProductCols(c);
       html += '</div>';
     }
     if (!locked) {
@@ -326,7 +377,8 @@ function renderCard(r) {
   html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value)" oninput="debounceExtra(\'comment\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
   html += '</div>';
 
-  html += '</div>';
+  html += '</div>'; // close detail
+  html += '</div>'; // close card
   return html;
 }
 
@@ -346,6 +398,15 @@ function goPage(p) {
   currentPage = p;
   renderPage();
   window.scrollTo(0, 0);
+}
+
+function toggleExpand(idx, evt) {
+  if (evt) evt.stopPropagation();
+  expandedRows[idx] = !expandedRows[idx];
+  const chevron = document.getElementById('chevron-' + idx);
+  const detail = document.getElementById('detail-' + idx);
+  if (chevron) chevron.classList.toggle('open', expandedRows[idx]);
+  if (detail) detail.classList.toggle('hidden', !expandedRows[idx]);
 }
 
 // --- API calls ---
@@ -484,11 +545,8 @@ async function searchCatalog(dedupIdx, query) {
     return;
   }
   container.innerHTML = results.map(r =>
-    '<div class="search-result-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
-    '<span class="artnr">' + esc(r.our_artnr) + '</span>' +
-    '<span class="desc">' + esc(r.our_description || '') + (r.our_specification ? ' – ' + esc(r.our_specification) : '') + '</span>' +
-    '<span class="price">' + money(r.our_unit_price) + '/enh</span>' +
-    '<span class="muted">' + esc(r.matched_from || '') + '</span>' +
+    '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
+    renderProductCols(r) +
     '</div>'
   ).join('');
 }
@@ -577,6 +635,28 @@ async function postJson(url, body) {
 
 // --- Formatting ---
 
+function renderProductCols(p) {
+  // Shared column rendering: Art.Nr | Link | Navn | Spesifikasjon | Pris | Score
+  let h = artnrWithLink(p.our_artnr, p.our_gid);
+  if (p.our_gid) {
+    h += '<span class="link-icon"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(p.our_gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">&#x2197;</a></span>';
+  } else {
+    h += '<span class="link-icon"></span>';
+  }
+  h += '<span class="name">' + esc(p.our_description || '') + '</span>';
+  h += '<span class="spec">' + esc(p.our_specification || '') + '</span>';
+  h += '<span class="price">' + money(p.our_unit_price) + '</span>';
+  h += '<span class="score">' + esc(p.match_quality || '') + '</span>';
+  return h;
+}
+function productLink(gid, label) {
+  if (!gid) return esc(label || '');
+  return '<a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt hos OneMed">' + esc(label || gid) + '</a>';
+}
+function artnrWithLink(artnr, gid) {
+  if (!gid) return '<span class="artnr">' + esc(artnr || '') + '</span>';
+  return '<span class="artnr"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">' + esc(artnr || '') + '</a></span>';
+}
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 function fmt(v) { return v != null ? String(v) : '-'; }
@@ -596,6 +676,12 @@ function savingsHtml(v) {
   return formatted;
 }
 
+function doExport(format) {
+  const showPrices = document.getElementById('showLinePrices').checked;
+  const url = '/v2/export/' + JOB_ID + '?format=' + format + '&show_line_prices=' + showPrices;
+  window.open(url, '_blank');
+}
+
 async function commitToDb() {
   const approved = allRows.filter(r => r.review_status === 'approved' && !r.deleted).length;
   if (approved === 0) {
@@ -608,6 +694,59 @@ async function commitToDb() {
     alert('Lagret ' + (resp.committed || 0) + ' rader til prisdatabasen.');
   } else {
     alert('Feil: ' + (resp.error || 'ukjent'));
+  }
+}
+
+// --- Add row ---
+
+function toggleAddRowForm() {
+  const form = document.getElementById('addRowForm');
+  form.style.display = form.style.display === 'none' ? 'block' : 'none';
+  document.getElementById('addRowMsg').textContent = '';
+}
+
+async function submitAddRow() {
+  const desc = document.getElementById('addDesc').value.trim();
+  const price = document.getElementById('addPrice').value;
+  const msg = document.getElementById('addRowMsg');
+  if (!desc) { msg.textContent = 'Beskrivelse er påkrevd.'; return; }
+  if (!price) { msg.textContent = 'Pris er påkrevd.'; return; }
+
+  msg.textContent = 'Legger til...';
+  const body = {
+    description: desc,
+    price: parseFloat(price),
+    quantity: parseFloat(document.getElementById('addQty').value) || 1,
+    competitor_name: document.getElementById('addCompName').value.trim(),
+    competitor_artnr: document.getElementById('addArtnr').value.trim(),
+    specification: document.getElementById('addSpec').value.trim(),
+  };
+  const resp = await postJson('/v2/review/' + JOB_ID + '/add-row', body);
+  if (!resp.ok) {
+    msg.textContent = 'Feil: ' + (resp.error || 'ukjent');
+    return;
+  }
+  // Append and show
+  if (resp.row) {
+    allRows.push(resp.row);
+    expandedRows[resp.row.dedup_idx] = true;
+  }
+  // Clear form
+  document.getElementById('addDesc').value = '';
+  document.getElementById('addPrice').value = '';
+  document.getElementById('addQty').value = '1';
+  document.getElementById('addCompName').value = '';
+  document.getElementById('addArtnr').value = '';
+  document.getElementById('addSpec').value = '';
+  document.getElementById('addRowForm').style.display = 'none';
+  msg.textContent = '';
+  updateSummaryFromRows();
+  applyFilters();
+  // Navigate to last page so the new row is visible
+  const totalPages = Math.ceil(filteredRows.length / PAGE_SIZE);
+  if (totalPages > 1) {
+    currentPage = totalPages - 1;
+    renderPage();
   }
 }
 

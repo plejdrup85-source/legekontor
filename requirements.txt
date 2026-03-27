@@ -17,6 +17,9 @@ numpy>=1.26.0
 # PDF parsing
 pypdf>=4.0.0
 
+# PDF generation
+fpdf2>=2.8.0
+
 # OCR for scannede PDF-er
 pytesseract==0.3.13
 PyMuPDF==1.27.1
