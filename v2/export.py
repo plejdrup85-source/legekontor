@@ -402,16 +402,6 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
 
     pdf.set_y(card_y + card_h + 5)
 
-    # Row counts
-    approved = sum(1 for r in rows if r.get("Review-status") == "approved")
-    rejected = sum(1 for r in rows if r.get("Review-status") == "rejected")
-    pending = sum(1 for r in rows if r.get("Review-status") == "pending")
-    pdf.set_x(M_LEFT)
-    pdf.set_font(FONT, "", 8)
-    pdf.set_text_color(*C_SECONDARY)
-    pdf.cell(content_w, 4,
-             f"{totals['row_count']} produktlinjer   |   {approved} godkjent   |   {rejected} avvist   |   {pending} ventende",
-             new_x="LMARGIN", new_y="NEXT")
     pdf.ln(6)
 
     # ============================================================
