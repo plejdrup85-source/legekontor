@@ -187,15 +187,20 @@ def generate_export_xlsx(review_rows: List[Dict[str, Any]], show_line_prices: bo
         totals_row["Vart linjebelop"] = totals["total_onemed"]
         totals_row["Besparelse"] = totals["total_savings"]
         totals_row["Besparelse %"] = totals["savings_pct"]
+        df = pd.concat([df, pd.DataFrame([totals_row])], ignore_index=True)
     else:
-        # Even without line prices, put totals in the last column as a note
-        totals_row["Kommentar"] = (
-            f"Totalt konkurrent: {totals['total_competitor']:.2f} kr | "
-            f"Totalt OneMed: {totals['total_onemed']:.2f} kr | "
-            f"Besparelse: {totals['total_savings']:.2f} kr ({totals['savings_pct']}%)"
-        )
-
-    df = pd.concat([df, pd.DataFrame([totals_row])], ignore_index=True)
+        # Dedicated totals rows — no prices in data rows, totals in their own rows
+        blank = {col: "" for col in columns}
+        row_comp = dict(blank)
+        row_comp[columns[0]] = "Totalt konkurrent"
+        row_comp[columns[-1]] = totals["total_competitor"]
+        row_our = dict(blank)
+        row_our[columns[0]] = "Totalt OneMed"
+        row_our[columns[-1]] = totals["total_onemed"]
+        row_sav = dict(blank)
+        row_sav[columns[0]] = "Besparelse"
+        row_sav[columns[-1]] = f"{totals['total_savings']} ({totals['savings_pct']}%)"
+        df = pd.concat([df, pd.DataFrame([blank, row_comp, row_our, row_sav])], ignore_index=True)
 
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
