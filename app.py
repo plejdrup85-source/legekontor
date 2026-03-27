@@ -39,7 +39,7 @@ APP_SUBTITLE = os.getenv("APP_SUBTITLE", "").strip()
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "logo.png").resolve())))
+LOGO_PATH = Path(os.getenv("LOGO_PATH", str((Path(__file__).parent / "onemed_logo.png").resolve())))
 
 RESULTS_DIR = DATA_DIR / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
@@ -1319,7 +1319,7 @@ INDEX_HTML = """
   </style>
 </head>
 <body>
-  <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" style="max-height:110px; width:auto;" onerror="this.style.display='none';"/></div>
+  <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" onerror="this.style.display='none';"/></div>
   <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">__APP_SUBTITLE__</div>
   <div style="margin-bottom:12px;"><a href="/v2/">Prisammenligning V2 &rarr;</a></div>
   <div class="card">
