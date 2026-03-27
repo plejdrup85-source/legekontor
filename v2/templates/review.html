@@ -167,6 +167,7 @@ const PAGE_SIZE = 25;
 let currentPage = 0;
 let debounceTimers = {};
 let openSearchPanels = {};
+let searchControllers = {};  // AbortController per search panel
 let expandedRows = {};
 
 async function loadReview() {
@@ -315,17 +316,25 @@ function renderCard(r) {
   }
 
   // Meta grid (input data)
-  const effectiveUnits = r.quantity_override || r.total_units;
-  const hasOverride = r.quantity_override != null;
+  const compUnits = r.quantity_override_competitor != null ? r.quantity_override_competitor : r.total_units;
+  const hasCompOverride = r.quantity_override_competitor != null;
+  const omUnits = r.quantity_override != null ? r.quantity_override : r.total_units;
+  const hasOmOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
   html += '<div><dt>Konkurrent</dt><dd>' + esc(r.competitor || '') + '</dd></div>';
-  html += '<div><dt>Konk. art.nr</dt><dd>' + esc(r.competitor_artnr || '') + '</dd></div>';
+  html += '<div><dt>Konk. art.nr</dt><dd>' + competitorArtnrHtml(r.competitor, r.competitor_artnr) + '</dd></div>';
   html += '<div><dt>Kvt.</dt><dd>' + fmt(r.quantity_purchased) + '</dd></div>';
   html += '<div><dt>Pakning</dt><dd>' + esc(r.packaging_text || '-') + ' (' + (r.packaging_count || 1) + ')</dd></div>';
-  html += '<div><dt>Totalt enheter</dt><dd>';
-  html += '<input type="number" class="qty-input' + (hasOverride ? ' overridden' : '') + '" value="' + (effectiveUnits != null ? effectiveUnits : '') + '" '
+  html += '<div><dt>Totale enheter Konkurrent</dt><dd>';
+  html += '<input type="number" class="qty-input' + (hasCompOverride ? ' overridden' : '') + '" value="' + (compUnits != null ? compUnits : '') + '" '
+    + 'onchange="updateQuantityCompetitor(' + idx + ', this.value)" '
+    + 'title="' + (hasCompOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre konkurrentantall') + '" '
+    + (locked ? 'disabled' : '') + ' min="0" step="any"/>';
+  html += '</dd></div>';
+  html += '<div><dt>Totale Enheter OM</dt><dd>';
+  html += '<input type="number" class="qty-input' + (hasOmOverride ? ' overridden' : '') + '" value="' + (omUnits != null ? omUnits : '') + '" '
     + 'onchange="updateQuantity(' + idx + ', this.value)" '
-    + 'title="' + (hasOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre') + '" '
+    + 'title="' + (hasOmOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre OM-antall') + '" '
     + (locked ? 'disabled' : '') + ' min="0" step="any"/>';
   html += '</dd></div>';
   html += '<div><dt>Konk. linjebelop</dt><dd>' + money(r.competitor_line_amount) + '</dd></div>';
@@ -493,12 +502,37 @@ async function updateQuantity(dedupIdx, value) {
   applyFilters(true);
 }
 
+async function updateQuantityCompetitor(dedupIdx, value) {
+  if (locked) return;
+  const qty = value === '' ? null : parseFloat(value);
+  if (qty !== null && (isNaN(qty) || qty < 0)) return;
+  const body = { dedup_idx: dedupIdx, quantity_override_competitor: qty };
+  const resp = await postJson('/v2/review/' + JOB_ID + '/extras', body);
+  if (!resp.ok) return;
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) {
+    row.quantity_override_competitor = qty;
+    recalcLocal(row);
+  }
+  applyFilters(true);
+}
+
 function recalcLocal(row) {
-  const units = row.quantity_override || row.total_units || 0;
+  const baseUnits = row.total_units || 0;
+
+  // Competitor side
+  const compUnits = row.quantity_override_competitor != null ? row.quantity_override_competitor : baseUnits;
+  const compUnitPrice = row.competitor_unit_price;
+  if (row.quantity_override_competitor != null && compUnitPrice != null && compUnits > 0) {
+    row.competitor_line_amount = Math.round(compUnits * compUnitPrice * 100) / 100;
+  }
+
+  // OM side
+  const omUnits = row.quantity_override != null ? row.quantity_override : baseUnits;
   const price = row.our_unit_price;
   const compLine = row.competitor_line_amount;
-  if (price != null && units > 0) {
-    row.our_comparable_line_price = Math.round(units * price * 100) / 100;
+  if (price != null && omUnits > 0) {
+    row.our_comparable_line_price = Math.round(omUnits * price * 100) / 100;
     row.savings_amount = compLine != null ? Math.round((compLine - row.our_comparable_line_price) * 100) / 100 : null;
   } else {
     row.our_comparable_line_price = null;
@@ -517,6 +551,12 @@ function toggleSearchPanel(dedupIdx) {
   if (!isOpen) {
     const input = document.getElementById('search-input-' + dedupIdx);
     if (input) input.focus();
+  } else {
+    // Abort any in-flight search when closing panel
+    if (searchControllers[dedupIdx]) {
+      searchControllers[dedupIdx].abort();
+      delete searchControllers[dedupIdx];
+    }
   }
 }
 
@@ -533,22 +573,42 @@ async function searchCatalog(dedupIdx, query) {
     container.innerHTML = '<div class="muted">Skriv minst 2 tegn for a soke...</div>';
     return;
   }
+  // Abort any in-flight request for this panel
+  if (searchControllers[dedupIdx]) {
+    searchControllers[dedupIdx].abort();
+  }
+  const controller = new AbortController();
+  searchControllers[dedupIdx] = controller;
+
   container.innerHTML = '<div class="search-spinner">Soker...</div>';
-  const resp = await postJson('/v2/review/' + JOB_ID + '/search-catalog', { query: query, limit: 15 });
-  if (!resp.ok) {
+  try {
+    const resp = await fetch('/v2/review/' + JOB_ID + '/search-catalog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: query, limit: 15 }),
+      signal: controller.signal,
+    });
+    const data = await resp.json();
+    // If this controller was replaced by a newer request, discard
+    if (searchControllers[dedupIdx] !== controller) return;
+    if (!resp.ok) {
+      container.innerHTML = '<div class="muted">Sok feilet.</div>';
+      return;
+    }
+    const results = data.results || [];
+    if (results.length === 0) {
+      container.innerHTML = '<div class="muted">Ingen treff.</div>';
+      return;
+    }
+    container.innerHTML = results.map(r =>
+      '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
+      renderProductCols(r) +
+      '</div>'
+    ).join('');
+  } catch (e) {
+    if (e.name === 'AbortError') return;  // superseded by newer search
     container.innerHTML = '<div class="muted">Sok feilet.</div>';
-    return;
   }
-  const results = resp.results || [];
-  if (results.length === 0) {
-    container.innerHTML = '<div class="muted">Ingen treff.</div>';
-    return;
-  }
-  container.innerHTML = results.map(r =>
-    '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
-    renderProductCols(r) +
-    '</div>'
-  ).join('');
 }
 
 async function selectSearchResult(dedupIdx, artnr) {
@@ -657,6 +717,42 @@ function artnrWithLink(artnr, gid) {
   if (!gid) return '<span class="artnr">' + esc(artnr || '') + '</span>';
   return '<span class="artnr"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">' + esc(artnr || '') + '</a></span>';
 }
+// Competitor search URL mapping: competitor name (lowercased) -> URL template
+// {q} is replaced with URL-encoded art.nr
+var COMPETITOR_URL_MAP = {
+  'norengros': 'https://www.norengros.no/search?query={q}',
+  'nor engros': 'https://www.norengros.no/search?query={q}',
+  'epion': 'https://epion.no/nettbutikk/sok?query={q}',
+  'maske': 'https://www.maske.no/search?action=search&q={q}',
+  'mediq': 'https://b2b.mediqnorge.no/mediqb2bstorefront/NorwayB2Bifs10/no/search/?text={q}',
+  'mediq norge': 'https://b2b.mediqnorge.no/mediqb2bstorefront/NorwayB2Bifs10/no/search/?text={q}'
+};
+
+function competitorSearchUrl(competitor, artnr) {
+  if (!competitor || !artnr) return null;
+  var key = competitor.trim().toLowerCase();
+  // Exact match first
+  if (COMPETITOR_URL_MAP[key]) {
+    return COMPETITOR_URL_MAP[key].replace('{q}', encodeURIComponent(artnr.trim()));
+  }
+  // Partial match: check if competitor name contains a known key
+  for (var k in COMPETITOR_URL_MAP) {
+    if (key.indexOf(k) !== -1 || k.indexOf(key) !== -1) {
+      return COMPETITOR_URL_MAP[k].replace('{q}', encodeURIComponent(artnr.trim()));
+    }
+  }
+  return null;
+}
+
+function competitorArtnrHtml(competitor, artnr) {
+  if (!artnr) return '<span class="muted">-</span>';
+  var url = competitorSearchUrl(competitor, artnr);
+  if (url) {
+    return '<a href="' + escAttr(url) + '" target="_blank" rel="noopener" title="Sok hos ' + esc(competitor) + '">' + esc(artnr) + ' &#x2197;</a>';
+  }
+  return esc(artnr);
+}
+
 function esc(s) { return String(s ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function escAttr(s) { return esc(s).replace(/"/g,'&quot;'); }
 function fmt(v) { return v != null ? String(v) : '-'; }

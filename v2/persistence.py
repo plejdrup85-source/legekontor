@@ -229,13 +229,15 @@ def apply_overrides(review_rows: List[Dict[str, Any]], job_id: str) -> List[Dict
                 cand = candidates[new_cand_idx]
                 r["our_unit_price"] = cand.get("our_unit_price")
 
-        # Apply quantity override from extras
+        # Apply quantity overrides and comment from extras
         if idx_str in extras:
             ex = extras[idx_str]
             if "comment" in ex:
                 r["comment"] = ex["comment"]
             if "quantity_override" in ex and ex["quantity_override"] is not None:
                 r["quantity_override"] = ex["quantity_override"]
+            if "quantity_override_competitor" in ex and ex["quantity_override_competitor"] is not None:
+                r["quantity_override_competitor"] = ex["quantity_override_competitor"]
 
         # Recalculate prices using effective quantity
         _recalc_prices(r)
@@ -250,13 +252,37 @@ def apply_overrides(review_rows: List[Dict[str, Any]], job_id: str) -> List[Dict
 
 
 def _recalc_prices(r: Dict[str, Any]) -> None:
-    """Recalculate our_comparable_line_price and savings_amount based on current state."""
-    effective_units = r.get("quantity_override") or r.get("total_units", 0) or 0
+    """Recalculate line prices and savings based on current state.
+
+    Uses separate quantities for competitor and OM sides:
+      - Competitor line amount uses competitor quantity (quantity_override_competitor or total_units)
+      - Our line amount uses OM quantity (quantity_override or total_units)
+    """
+    base_units = r.get("total_units", 0) or 0
+
+    # Competitor side: use competitor override if set, else original total_units
+    comp_units = r.get("quantity_override_competitor")
+    if comp_units is None:
+        comp_units = base_units
+    comp_units = comp_units or 0
+
+    # OM side: use OM override if set, else original total_units
+    om_units = r.get("quantity_override")
+    if om_units is None:
+        om_units = base_units
+    om_units = om_units or 0
+
+    # Recalc competitor line amount if competitor quantity was overridden
+    comp_unit_price = r.get("competitor_unit_price")
+    if r.get("quantity_override_competitor") is not None and comp_unit_price is not None and comp_units > 0:
+        r["competitor_line_amount"] = round(comp_units * comp_unit_price, 2)
+
+    # Recalc OM line price
     our_price = r.get("our_unit_price")
     competitor_line = r.get("competitor_line_amount")
 
-    if our_price is not None and effective_units > 0:
-        r["our_comparable_line_price"] = round(effective_units * our_price, 2)
+    if our_price is not None and om_units > 0:
+        r["our_comparable_line_price"] = round(om_units * our_price, 2)
         if competitor_line is not None:
             r["savings_amount"] = round(competitor_line - r["our_comparable_line_price"], 2)
         else:

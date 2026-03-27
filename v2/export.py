@@ -10,6 +10,7 @@ Supports two modes via show_line_prices:
   False → no line prices: quantities shown, only summary totals
 """
 import logging
+import shutil
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,25 @@ logger = logging.getLogger(__name__)
 # Optional logo path (place logo.png next to this file or in v2/)
 _LOGO_PATH = Path(__file__).parent / "logo.png"
 
+# DejaVuSans font paths — search common locations
+_FONT_SEARCH_PATHS = [
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+]
+
+
+def _find_font(name: str = "DejaVuSans.ttf") -> Optional[Path]:
+    """Find a TTF font file by searching common system paths."""
+    for p in _FONT_SEARCH_PATHS:
+        if p.name == name and p.exists():
+            return p
+    # Fallback: search with shutil.which-style approach
+    for base in [Path("/usr/share/fonts"), Path("/usr/local/share/fonts")]:
+        if base.exists():
+            for f in base.rglob(name):
+                return f
+    return None
+
 # Column order for the export Excel
 EXPORT_COLUMNS = [
     "Review-status",
@@ -30,7 +50,8 @@ EXPORT_COLUMNS = [
     "Kvt.",
     "Pakning",
     "Pakningsstr.",
-    "Totalt enheter",
+    "Totale enheter Konkurrent",
+    "Totale Enheter OM",
     "Konk. linjebelop",
     "Vart Art.Nr",
     "Vart produktnavn",
@@ -55,7 +76,8 @@ EXPORT_COLUMNS_NO_PRICES = [
     "Kvt.",
     "Pakning",
     "Pakningsstr.",
-    "Totalt enheter",
+    "Totale enheter Konkurrent",
+    "Totale Enheter OM",
     "Vart Art.Nr",
     "Vart produktnavn",
     "Vart spesifikasjon",
@@ -75,18 +97,28 @@ def calculate_totals(export_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         total_onemed: sum of all our line amounts
         total_savings: total_competitor - total_onemed
         savings_pct: savings as percentage of competitor total
+        total_units_competitor: sum of competitor units
+        total_units_om: sum of OM units
         row_count: number of rows included
     """
     total_comp = 0.0
     total_our = 0.0
+    total_units_comp = 0.0
+    total_units_om = 0.0
     count = 0
     for r in export_rows:
         cl = r.get("Konk. linjebelop")
         ol = r.get("Vart linjebelop")
+        uc = r.get("Totale enheter Konkurrent")
+        uo = r.get("Totale Enheter OM")
         if cl is not None:
             total_comp += float(cl)
         if ol is not None:
             total_our += float(ol)
+        if uc is not None:
+            total_units_comp += float(uc)
+        if uo is not None:
+            total_units_om += float(uo)
         count += 1
     total_savings = total_comp - total_our
     savings_pct = round(total_savings / total_comp * 100, 1) if total_comp else 0.0
@@ -95,6 +127,8 @@ def calculate_totals(export_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         "total_onemed": round(total_our, 2),
         "total_savings": round(total_savings, 2),
         "savings_pct": savings_pct,
+        "total_units_competitor": round(total_units_comp, 2),
+        "total_units_om": round(total_units_om, 2),
         "row_count": count,
     }
 
@@ -131,6 +165,11 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             fields = [f.get("field", "") for f in r["inconsistent_fields"]]
             warn_note = ", ".join(fields)
 
+        # Effective quantities: competitor and OM may differ due to separate overrides
+        base_units = r.get("total_units")
+        comp_units = r.get("quantity_override_competitor") if r.get("quantity_override_competitor") is not None else base_units
+        om_units = r.get("quantity_override") if r.get("quantity_override") is not None else base_units
+
         row = {
             "Review-status": r.get("review_status", "pending"),
             "Konkurrent": r.get("competitor", ""),
@@ -139,7 +178,8 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "Kvt.": r.get("quantity_purchased"),
             "Pakning": r.get("packaging_text", ""),
             "Pakningsstr.": r.get("packaging_count"),
-            "Totalt enheter": r.get("quantity_override") or r.get("total_units"),
+            "Totale enheter Konkurrent": comp_units,
+            "Totale Enheter OM": om_units,
             "Konk. linjebelop": comp_line,
             "Vart Art.Nr": cand.get("our_artnr", "") if cand else "",
             "Vart produktnavn": cand.get("our_description", "") if cand else "",
@@ -182,6 +222,8 @@ def generate_export_xlsx(review_rows: List[Dict[str, Any]], show_line_prices: bo
     # Add totals row
     totals_row = {col: "" for col in columns}
     totals_row[columns[0]] = "TOTALT"
+    totals_row["Totale enheter Konkurrent"] = totals["total_units_competitor"]
+    totals_row["Totale Enheter OM"] = totals["total_units_om"]
     if show_line_prices:
         totals_row["Konk. linjebelop"] = totals["total_competitor"]
         totals_row["Vart linjebelop"] = totals["total_onemed"]
@@ -250,7 +292,10 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
             return ""
 
     class PDF(FPDF):
+        font_family_name = "Helvetica"  # overridden after font registration
+
         def header(self):
+            f = self.font_family_name
             # Logo or text
             if _LOGO_PATH.exists():
                 try:
@@ -261,11 +306,11 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
                 self._text_logo()
             # Title block — right of logo or below
             self.set_xy(M_LEFT, 24)
-            self.set_font("Helvetica", "B", 20)
+            self.set_font(f, "B", 20)
             self.set_text_color(*C_DARK)
             self.cell(0, 8, "Prissammenligning")
             # Date right-aligned
-            self.set_font("Helvetica", "", 9)
+            self.set_font(f, "", 9)
             self.set_text_color(*C_SECONDARY)
             self.set_xy(self.w - M_RIGHT - 60, 26)
             self.cell(60, 5, today, align="R")
@@ -276,19 +321,38 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
             self.set_y(39)
 
         def _text_logo(self):
-            self.set_font("Helvetica", "B", 15)
+            self.set_font(self.font_family_name, "B", 15)
             self.set_text_color(*C_PRIMARY)
             self.text(M_LEFT, 18, "OneMed")
 
         def footer(self):
             self.set_y(-13)
-            self.set_font("Helvetica", "", 7.5)
+            self.set_font(self.font_family_name, "", 7.5)
             self.set_text_color(*C_SECONDARY)
             self.cell(0, 6, f"Side {self.page_no()}/{{nb}}", align="C")
 
     pdf = PDF(orientation="L", unit="mm", format="A4")
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=18)
+
+    # Register Unicode font (DejaVuSans) for full character support
+    font_regular = _find_font("DejaVuSans.ttf")
+    font_bold = _find_font("DejaVuSans-Bold.ttf")
+    if not font_regular:
+        raise RuntimeError(
+            "DejaVuSans.ttf not found. Install fonts-dejavu-core "
+            "(apt-get install fonts-dejavu-core)."
+        )
+    pdf.add_font("DejaVu", "", str(font_regular), uni=True)
+    if font_bold:
+        pdf.add_font("DejaVu", "B", str(font_bold), uni=True)
+    else:
+        # Fallback: use regular for bold too
+        pdf.add_font("DejaVu", "B", str(font_regular), uni=True)
+
+    FONT = "DejaVu"
+    pdf.font_family_name = FONT
+
     pdf.add_page()
 
     content_w = pdf.w - M_LEFT - M_RIGHT
@@ -313,16 +377,16 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
         pdf.rect(x, y, 1.2, h, "F")
         # Label
         pdf.set_xy(x + 6, y + 5)
-        pdf.set_font("Helvetica", "", 8.5)
+        pdf.set_font(FONT, "", 8.5)
         pdf.set_text_color(*C_SECONDARY)
         pdf.cell(w - 10, 4, label)
         # Value
         pdf.set_xy(x + 6, y + 12)
         if highlight:
-            pdf.set_font("Helvetica", "B", 16)
+            pdf.set_font(FONT, "B", 16)
             pdf.set_text_color(*C_SAV_TEXT)
         else:
-            pdf.set_font("Helvetica", "B", 14)
+            pdf.set_font(FONT, "B", 14)
             pdf.set_text_color(*C_DARK)
         pdf.cell(w - 10, 7, value)
 
@@ -343,7 +407,7 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     rejected = sum(1 for r in rows if r.get("Review-status") == "rejected")
     pending = sum(1 for r in rows if r.get("Review-status") == "pending")
     pdf.set_x(M_LEFT)
-    pdf.set_font("Helvetica", "", 8)
+    pdf.set_font(FONT, "", 8)
     pdf.set_text_color(*C_SECONDARY)
     pdf.cell(content_w, 4,
              f"{totals['row_count']} produktlinjer   |   {approved} godkjent   |   {rejected} avvist   |   {pending} ventende",
@@ -354,7 +418,7 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     # PRODUCT COMPARISON — card-style rows
     # ============================================================
     pdf.set_x(M_LEFT)
-    pdf.set_font("Helvetica", "B", 12)
+    pdf.set_font(FONT, "B", 12)
     pdf.set_text_color(*C_DARK)
     pdf.cell(content_w, 6, "Produktsammenligning", new_x="LMARGIN", new_y="NEXT")
     pdf.ln(3)
@@ -377,65 +441,68 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
         # --- Left side: Konkurrent ---
         lx = M_LEFT + 4
         pdf.set_xy(lx, row_y + 2)
-        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_SECONDARY)
         pdf.cell(30, 3, "Konkurrent")
 
         pdf.set_xy(lx, row_y + 5.5)
-        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_font(FONT, "B", 9)
         pdf.set_text_color(*C_DARK)
         desc = _s(r.get("Beskrivelse"), 50)
         pdf.cell(half_w - 8, 4, desc)
 
         pdf.set_xy(lx, row_y + 10)
-        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_SECONDARY)
         artnr = _s(r.get("Konkurrent Art.Nr"), 20)
-        qty = _s(r.get("Totalt enheter"))
+        comp_qty = _s(r.get("Totale enheter Konkurrent"))
         meta_left = f"Art.nr: {artnr}" if artnr else ""
-        if qty:
-            meta_left += f"   Antall: {qty}"
+        if comp_qty:
+            meta_left += f"   Antall: {comp_qty}"
         pdf.cell(half_w - 8, 3.5, meta_left)
 
         if show_line_prices:
             pdf.set_xy(lx, row_y + 14.5)
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font(FONT, "", 8)
             pdf.set_text_color(*C_DARK)
             pdf.cell(half_w - 8, 3.5, _kr(r.get("Konk. linjebelop")))
 
         # --- Center arrow ---
         cx = M_LEFT + half_w + 2
         pdf.set_xy(cx, row_y + 6)
-        pdf.set_font("Helvetica", "", 10)
+        pdf.set_font(FONT, "", 10)
         pdf.set_text_color(*C_BORDER)
         pdf.cell(arrow_w, 5, chr(0x2192), align="C")  # →
 
         # --- Right side: OneMed ---
         rx = M_LEFT + half_w + arrow_w
         pdf.set_xy(rx, row_y + 2)
-        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_PRIMARY)
         pdf.cell(30, 3, "OneMed")
 
         pdf.set_xy(rx, row_y + 5.5)
-        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_font(FONT, "B", 9)
         pdf.set_text_color(*C_DARK)
         our_name = _s(r.get("Vart produktnavn"), 50)
         pdf.cell(half_w - 8, 4, our_name if our_name else "-")
 
         pdf.set_xy(rx, row_y + 10)
-        pdf.set_font("Helvetica", "", 7.5)
+        pdf.set_font(FONT, "", 7.5)
         pdf.set_text_color(*C_SECONDARY)
         our_artnr = _s(r.get("Vart Art.Nr"), 20)
+        om_qty = _s(r.get("Totale Enheter OM"))
         our_spec = _s(r.get("Vart spesifikasjon"), 35)
         meta_right = f"Art.nr: {our_artnr}" if our_artnr else ""
+        if om_qty:
+            meta_right += f"   Antall: {om_qty}"
         if our_spec:
             meta_right += f"   {our_spec}"
         pdf.cell(half_w - 8, 3.5, meta_right)
 
         if show_line_prices:
             pdf.set_xy(rx, row_y + 14.5)
-            pdf.set_font("Helvetica", "", 8)
+            pdf.set_font(FONT, "", 8)
             sav_row = r.get("Besparelse")
             our_price_text = _kr(r.get("Vart linjebelop"))
             if sav_row is not None and sav_row != "":
@@ -469,7 +536,7 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     lh = 7.5
 
     pdf.set_x(tot_x)
-    pdf.set_font("Helvetica", "", 9.5)
+    pdf.set_font(FONT, "", 9.5)
     pdf.set_text_color(*C_DARK)
     pdf.set_fill_color(*C_PANEL)
     pdf.cell(tw, lh, f"  Totalt konkurrent     {totals['total_competitor']:,.2f} kr", fill=True, new_x="LMARGIN", new_y="NEXT")
@@ -480,7 +547,7 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
     pdf.set_x(tot_x)
     pdf.set_fill_color(*C_SAV_BG)
     pdf.set_text_color(*(C_SAV_TEXT if sav >= 0 else C_RED))
-    pdf.set_font("Helvetica", "B", 11)
+    pdf.set_font(FONT, "B", 11)
     pdf.cell(tw, lh + 2, f"  Besparelse                {sav:,.2f} kr  ({totals['savings_pct']}%)", fill=True, new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(*C_DARK)
 
