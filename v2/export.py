@@ -296,29 +296,37 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
 
         def header(self):
             f = self.font_family_name
-            # Logo or text
+            logo_bottom = 10  # fallback if no logo
+            # Logo — constrained to max 50mm wide, preserving aspect ratio
             if _LOGO_PATH.exists():
                 try:
-                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10)
+                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10, w=50)
+                    logo_bottom = self.get_y()
+                    if logo_bottom <= 10:
+                        logo_bottom = 22  # fallback estimate
                 except Exception:
                     self._text_logo()
+                    logo_bottom = 20
             else:
                 self._text_logo()
-            # Title block — right of logo or below
-            self.set_xy(M_LEFT, 24)
+                logo_bottom = 20
+            # Title below logo with spacing
+            title_y = logo_bottom + 3
+            self.set_xy(M_LEFT, title_y)
             self.set_font(f, "B", 20)
             self.set_text_color(*C_DARK)
             self.cell(0, 8, "Prissammenligning")
-            # Date right-aligned
+            # Date right-aligned on same line as title
             self.set_font(f, "", 9)
             self.set_text_color(*C_SECONDARY)
-            self.set_xy(self.w - M_RIGHT - 60, 26)
+            self.set_xy(self.w - M_RIGHT - 60, title_y + 2)
             self.cell(60, 5, today, align="R")
-            # Thin divider
+            # Thin divider below title
+            divider_y = title_y + 12
             self.set_draw_color(*C_BORDER)
             self.set_line_width(0.3)
-            self.line(M_LEFT, 35, self.w - M_RIGHT, 35)
-            self.set_y(39)
+            self.line(M_LEFT, divider_y, self.w - M_RIGHT, divider_y)
+            self.set_y(divider_y + 4)
 
         def _text_logo(self):
             self.set_font(self.font_family_name, "B", 15)
