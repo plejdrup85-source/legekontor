@@ -20,7 +20,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 # Logo path – use the single logo.png in the project root (same as web UI)
-_LOGO_PATH = Path(__file__).parent.parent / "logo.png"
+_LOGO_PATH = Path(__file__).parent.parent / "onemed_logo.png"
 
 # DejaVuSans font paths — search common locations
 _FONT_SEARCH_PATHS = [
@@ -299,7 +299,7 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
             # Logo or text
             if _LOGO_PATH.exists():
                 try:
-                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10, h=12)
+                    self.image(str(_LOGO_PATH), x=M_LEFT, y=10)
                 except Exception:
                     self._text_logo()
             else:
