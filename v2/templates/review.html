@@ -14,7 +14,8 @@
     button.danger { background: #dc2626; }
     button.success { background: #16a34a; }
     button.sm { padding: 4px 8px; font-size: 12px; }
-    select, input[type=text], textarea { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 13px; font-family: inherit; }
+    button.warn-btn { background: #f59e0b; color: #1a1a1a; }
+    select, input[type=text], input[type=number], textarea { padding: 5px 8px; border: 1px solid #d1d5db; border-radius: 5px; font-size: 13px; font-family: inherit; }
     .muted { color: #666; font-size: 13px; }
     .header { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }
     .header h2 { margin: 0; }
@@ -23,6 +24,7 @@
     .badge-approved { background: #dcfce7; color: #166534; }
     .badge-rejected { background: #fee2e2; color: #991b1b; }
     .badge-pending { background: #fef3c7; color: #92400e; }
+    .badge-deleted { background: #f3f4f6; color: #6b7280; }
     .badge-warn { background: #fff7ed; color: #c2410c; }
     .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; padding: 10px 12px; background: white; border: 1px solid #e5e7eb; border-radius: 8px; }
     .toolbar input[type=text] { width: 220px; }
@@ -32,6 +34,7 @@
     .card.approved { border-left: 4px solid #16a34a; }
     .card.rejected { border-left: 4px solid #dc2626; }
     .card.pending { border-left: 4px solid #f59e0b; }
+    .card.deleted-card { border-left: 4px solid #9ca3af; opacity: 0.55; }
     .card.warn { background: #fffbeb; }
     .card-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; margin-bottom: 8px; }
     .card-title { font-weight: 600; font-size: 14px; }
@@ -51,14 +54,25 @@
     .cand-row .savings { min-width: 80px; text-align: right; }
     .savings-pos { color: #16a34a; font-weight: 600; }
     .savings-neg { color: #dc2626; font-weight: 600; }
-    .extras { display: flex; gap: 10px; margin-top: 8px; }
+    .extras { display: flex; gap: 10px; margin-top: 8px; align-items: flex-start; }
     .extras textarea { flex: 1; min-height: 32px; resize: vertical; }
-    .extras input[type=text] { flex: 1; }
     .decision-btns { display: flex; gap: 4px; }
     .pager { display: flex; justify-content: center; gap: 8px; margin: 16px 0; align-items: center; }
     .merged-info { font-size: 11px; color: #9333ea; margin-left: 8px; }
     .warn-box { font-size: 11px; color: #c2410c; background: #fff7ed; padding: 4px 8px; border-radius: 4px; margin-top: 4px; }
     .no-match { color: #9ca3af; font-style: italic; }
+    .qty-input { width: 80px; text-align: right; }
+    .qty-input.overridden { border-color: #3b82f6; background: #eff6ff; }
+    .search-panel { margin-top: 8px; padding: 8px; background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px; }
+    .search-panel input[type=text] { width: 100%; margin-bottom: 6px; }
+    .search-results { max-height: 200px; overflow-y: auto; }
+    .search-result-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 4px; font-size: 12px; cursor: pointer; }
+    .search-result-row:hover { background: #e5e7eb; }
+    .search-result-row .artnr { font-weight: 600; min-width: 70px; }
+    .search-result-row .desc { flex: 1; color: #374151; }
+    .search-result-row .price { min-width: 70px; text-align: right; }
+    .search-spinner { color: #6b7280; font-size: 12px; padding: 4px; }
+    .deleted-label { display: inline-block; padding: 2px 8px; background: #f3f4f6; color: #6b7280; border-radius: 4px; font-size: 11px; font-weight: 600; margin-left: 8px; }
   </style>
 </head>
 <body>
@@ -82,6 +96,7 @@
       <option value="pending">Pending</option>
       <option value="approved">Godkjent</option>
       <option value="rejected">Avvist</option>
+      <option value="deleted">Slettet</option>
     </select>
     <select id="matchFilter" onchange="applyFilters()">
       <option value="">Alle match</option>
@@ -114,6 +129,7 @@ let locked = false;
 const PAGE_SIZE = 25;
 let currentPage = 0;
 let debounceTimers = {};
+let openSearchPanels = {};
 
 async function loadReview() {
   const resp = await fetch('/v2/review/' + JOB_ID);
@@ -137,17 +153,19 @@ async function loadReview() {
 
 function updateSummary(s) {
   if (!s) return;
-  document.getElementById('summary').innerHTML =
-    '<span class="badge badge-approved">' + s.approved + ' godkjent</span>' +
+  let html = '<span class="badge badge-approved">' + s.approved + ' godkjent</span>' +
     '<span class="badge badge-rejected">' + s.rejected + ' avvist</span>' +
-    '<span class="badge badge-pending">' + s.pending + ' pending</span>' +
-    '<span class="muted">' + allRows.length + ' rader totalt</span>';
+    '<span class="badge badge-pending">' + s.pending + ' pending</span>';
+  if (s.deleted > 0) {
+    html += '<span class="badge badge-deleted">' + s.deleted + ' slettet</span>';
+  }
+  html += '<span class="muted">' + allRows.length + ' rader totalt</span>';
+  document.getElementById('summary').innerHTML = html;
 }
 
 function updateLockUI() {
   document.getElementById('lockBar').style.display = locked ? 'flex' : 'none';
   document.getElementById('lockBtn').textContent = locked ? 'Las opp' : 'Las';
-  // Disable/enable toolbar batch buttons
   document.getElementById('btnBulkApprove').disabled = locked;
   document.getElementById('btnBulkReject').disabled = locked;
   document.getElementById('btnBatchSelect').disabled = locked;
@@ -160,7 +178,16 @@ function applyFilters(preservePage) {
   const warnF = document.getElementById('warnFilter').value;
 
   filteredRows = allRows.filter(r => {
-    if (statusF && r.review_status !== statusF) return false;
+    // Handle deleted filter
+    if (statusF === 'deleted') {
+      if (!r.deleted) return false;
+    } else if (statusF) {
+      if (r.deleted) return false;
+      if (r.review_status !== statusF) return false;
+    } else {
+      // Default: hide deleted rows unless specifically filtered
+      if (r.deleted) return false;
+    }
     if (matchF === 'matched' && r.match_status !== 'matched') return false;
     if (matchF === 'no_match' && r.match_status !== 'no_match') return false;
     if (warnF === 'warn' && !r.merge_warning) return false;
@@ -171,12 +198,10 @@ function applyFilters(preservePage) {
     return true;
   });
 
-  document.getElementById('filterCount').textContent = filteredRows.length + ' av ' + allRows.length + ' rader';
+  const activeCount = allRows.filter(r => !r.deleted).length;
+  document.getElementById('filterCount').textContent = filteredRows.length + ' av ' + activeCount + ' aktive rader';
 
-  // Only reset page when filters actually change, not on in-page actions
   if (!preservePage) currentPage = 0;
-
-  // Clamp page to valid range
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE));
   if (currentPage >= totalPages) currentPage = totalPages - 1;
 
@@ -200,33 +225,56 @@ function renderPage() {
 
 function renderCard(r) {
   const idx = r.dedup_idx;
+  const isDeleted = r.deleted;
   const st = r.review_status || 'pending';
   const warnCls = r.merge_warning ? ' warn' : '';
+  const deletedCls = isDeleted ? ' deleted-card' : '';
   const selIdx = r.selected_candidate_idx;
   const cands = r.candidates || [];
-  const dis = locked ? 'disabled' : '';
+  const dis = (locked || isDeleted) ? 'disabled' : '';
 
-  let html = '<div class="card ' + st + warnCls + '" id="card-' + idx + '">';
+  let html = '<div class="card ' + (isDeleted ? '' : st) + warnCls + deletedCls + '" id="card-' + idx + '">';
 
   // Header
   html += '<div class="card-header"><div>';
   html += '<span class="card-title">' + esc(r.description || '(ingen beskrivelse)') + '</span>';
+  if (isDeleted) {
+    html += '<span class="deleted-label">SLETTET</span>';
+  }
   if (r.merged_from_count > 1) {
     html += '<span class="merged-info">Slatt sammen fra ' + r.merged_from_count + ' rader</span>';
   }
   html += '</div><div class="decision-btns">';
-  html += '<button class="sm ' + (st === 'approved' ? 'success' : 'secondary') + '" onclick="decide(' + idx + ',\'approved\')" ' + dis + '>Godkjenn</button>';
-  html += '<button class="sm ' + (st === 'rejected' ? 'danger' : 'secondary') + '" onclick="decide(' + idx + ',\'rejected\')" ' + dis + '>Avvis</button>';
-  html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + dis + '>Pending</button>';
+
+  if (isDeleted) {
+    html += '<button class="sm warn-btn" onclick="restoreRow(' + idx + ')" ' + (locked ? 'disabled' : '') + '>Gjenopprett</button>';
+  } else {
+    html += '<button class="sm ' + (st === 'approved' ? 'success' : 'secondary') + '" onclick="decide(' + idx + ',\'approved\')" ' + dis + '>Godkjenn</button>';
+    html += '<button class="sm ' + (st === 'rejected' ? 'danger' : 'secondary') + '" onclick="decide(' + idx + ',\'rejected\')" ' + dis + '>Avvis</button>';
+    html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + dis + '>Pending</button>';
+    html += '<button class="sm danger" onclick="deleteRow(' + idx + ')" ' + dis + ' title="Slett rad">Slett</button>';
+  }
   html += '</div></div>';
 
+  if (isDeleted) {
+    html += '</div>';
+    return html;
+  }
+
   // Meta grid
+  const effectiveUnits = r.quantity_override || r.total_units;
+  const hasOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
   html += '<div><dt>Konkurrent</dt><dd>' + esc(r.competitor || '') + '</dd></div>';
   html += '<div><dt>Konk. art.nr</dt><dd>' + esc(r.competitor_artnr || '') + '</dd></div>';
   html += '<div><dt>Kvt.</dt><dd>' + fmt(r.quantity_purchased) + '</dd></div>';
   html += '<div><dt>Pakning</dt><dd>' + esc(r.packaging_text || '-') + ' (' + (r.packaging_count || 1) + ')</dd></div>';
-  html += '<div><dt>Totalt enheter</dt><dd>' + fmt(r.total_units) + '</dd></div>';
+  html += '<div><dt>Totalt enheter</dt><dd>';
+  html += '<input type="number" class="qty-input' + (hasOverride ? ' overridden' : '') + '" value="' + (effectiveUnits != null ? effectiveUnits : '') + '" '
+    + 'onchange="updateQuantity(' + idx + ', this.value)" '
+    + 'title="' + (hasOverride ? 'Overstyrt (original: ' + fmt(r.total_units) + ')' : 'Rediger for a overstyre') + '" '
+    + (locked ? 'disabled' : '') + ' min="0" step="any"/>';
+  html += '</dd></div>';
   html += '<div><dt>Konk. linjebelop</dt><dd>' + money(r.competitor_line_amount) + '</dd></div>';
   html += '<div><dt>Var pris/enhet</dt><dd>' + money(r.our_unit_price) + '</dd></div>';
   html += '<div><dt>Vart linjebelop</dt><dd>' + money(r.our_comparable_line_price) + '</dd></div>';
@@ -255,15 +303,27 @@ function renderCard(r) {
       html += '<span class="muted">' + esc(c.match_quality || '') + '</span>';
       html += '</div>';
     }
+    if (!locked) {
+      html += '<button class="sm secondary" style="margin-top:4px;" onclick="toggleSearchPanel(' + idx + ')">Sok alternativt produkt...</button>';
+    }
     html += '</div>';
   } else {
-    html += '<div class="no-match">Ingen kandidater funnet</div>';
+    html += '<div class="no-match">Ingen kandidater funnet';
+    if (!locked) {
+      html += ' &mdash; <button class="sm secondary" onclick="toggleSearchPanel(' + idx + ')">Sok i katalog</button>';
+    }
+    html += '</div>';
   }
+
+  // Search panel (inline, hidden by default)
+  html += '<div class="search-panel" id="search-panel-' + idx + '" style="display:' + (openSearchPanels[idx] ? 'block' : 'none') + ';">';
+  html += '<input type="text" placeholder="Sok etter produktnavn, art.nr..." oninput="debounceSearch(' + idx + ', this.value)" id="search-input-' + idx + '"/>';
+  html += '<div class="search-results" id="search-results-' + idx + '"></div>';
+  html += '</div>';
 
   // Extras
   html += '<div class="extras">';
-  html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value,null)" oninput="debounceExtra(\'comment\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
-  html += '<input type="text" placeholder="Strategi..." value="' + escAttr(r.strategy || '') + '" onchange="saveExtra(' + idx + ',null,this.value)" oninput="debounceExtra(\'strategy\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '/>';
+  html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value)" oninput="debounceExtra(\'comment\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
   html += '</div>';
 
   html += '</div>';
@@ -294,15 +354,13 @@ async function selectCandidate(dedupIdx, candidateIdx) {
   if (locked) return;
   const resp = await postJson('/v2/review/' + JOB_ID + '/select', { dedup_idx: dedupIdx, candidate_idx: candidateIdx });
   if (!resp.ok) return;
-  // Update local state
   const row = allRows.find(r => r.dedup_idx === dedupIdx);
   if (row) {
     row.selected_candidate_idx = candidateIdx;
     const cand = (row.candidates || [])[candidateIdx];
     if (cand) {
       row.our_unit_price = cand.our_unit_price;
-      row.our_comparable_line_price = cand.our_comparable_line_price;
-      row.savings_amount = cand.savings_amount;
+      recalcLocal(row);
     }
   }
   applyFilters(true);
@@ -320,7 +378,7 @@ async function decide(dedupIdx, status) {
 
 async function bulkDecide(status) {
   if (locked) return;
-  const indices = filteredRows.map(r => r.dedup_idx);
+  const indices = filteredRows.filter(r => !r.deleted).map(r => r.dedup_idx);
   if (!indices.length) return;
   if (!confirm('Sett ' + indices.length + ' rader til "' + status + '"?')) return;
   const resp = await postJson('/v2/review/' + JOB_ID + '/bulk-decide', { dedup_indices: indices, status: status });
@@ -335,32 +393,149 @@ async function bulkDecide(status) {
 async function batchSelect() {
   if (locked) return;
   await postJson('/v2/review/' + JOB_ID + '/batch-select', { override_existing: false });
-  // Full reload to get updated selections and recalculated prices
   await loadReview();
 }
 
+async function deleteRow(dedupIdx) {
+  if (locked) return;
+  if (!confirm('Slett denne raden? Den kan gjenopprettes senere.')) return;
+  const resp = await postJson('/v2/review/' + JOB_ID + '/delete', { dedup_idx: dedupIdx });
+  if (!resp.ok) return;
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) row.deleted = true;
+  updateSummaryFromRows();
+  applyFilters(true);
+}
+
+async function restoreRow(dedupIdx) {
+  if (locked) return;
+  const resp = await postJson('/v2/review/' + JOB_ID + '/restore', { dedup_idx: dedupIdx });
+  if (!resp.ok) return;
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) row.deleted = false;
+  updateSummaryFromRows();
+  applyFilters(true);
+}
+
+async function updateQuantity(dedupIdx, value) {
+  if (locked) return;
+  const qty = value === '' ? null : parseFloat(value);
+  if (qty !== null && (isNaN(qty) || qty < 0)) return;
+  const body = { dedup_idx: dedupIdx, quantity_override: qty };
+  const resp = await postJson('/v2/review/' + JOB_ID + '/extras', body);
+  if (!resp.ok) return;
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row) {
+    row.quantity_override = qty;
+    recalcLocal(row);
+  }
+  applyFilters(true);
+}
+
+function recalcLocal(row) {
+  const units = row.quantity_override || row.total_units || 0;
+  const price = row.our_unit_price;
+  const compLine = row.competitor_line_amount;
+  if (price != null && units > 0) {
+    row.our_comparable_line_price = Math.round(units * price * 100) / 100;
+    row.savings_amount = compLine != null ? Math.round((compLine - row.our_comparable_line_price) * 100) / 100 : null;
+  } else {
+    row.our_comparable_line_price = null;
+    row.savings_amount = null;
+  }
+}
+
+// --- Catalog search ---
+
+function toggleSearchPanel(dedupIdx) {
+  const panel = document.getElementById('search-panel-' + dedupIdx);
+  if (!panel) return;
+  const isOpen = panel.style.display !== 'none';
+  panel.style.display = isOpen ? 'none' : 'block';
+  openSearchPanels[dedupIdx] = !isOpen;
+  if (!isOpen) {
+    const input = document.getElementById('search-input-' + dedupIdx);
+    if (input) input.focus();
+  }
+}
+
+function debounceSearch(dedupIdx, query) {
+  const key = 'search-' + dedupIdx;
+  if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
+  debounceTimers[key] = setTimeout(() => searchCatalog(dedupIdx, query), 300);
+}
+
+async function searchCatalog(dedupIdx, query) {
+  const container = document.getElementById('search-results-' + dedupIdx);
+  if (!container) return;
+  if (!query || query.length < 2) {
+    container.innerHTML = '<div class="muted">Skriv minst 2 tegn for a soke...</div>';
+    return;
+  }
+  container.innerHTML = '<div class="search-spinner">Soker...</div>';
+  const resp = await postJson('/v2/review/' + JOB_ID + '/search-catalog', { query: query, limit: 15 });
+  if (!resp.ok) {
+    container.innerHTML = '<div class="muted">Sok feilet.</div>';
+    return;
+  }
+  const results = resp.results || [];
+  if (results.length === 0) {
+    container.innerHTML = '<div class="muted">Ingen treff.</div>';
+    return;
+  }
+  container.innerHTML = results.map(r =>
+    '<div class="search-result-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
+    '<span class="artnr">' + esc(r.our_artnr) + '</span>' +
+    '<span class="desc">' + esc(r.our_description || '') + (r.our_specification ? ' – ' + esc(r.our_specification) : '') + '</span>' +
+    '<span class="price">' + money(r.our_unit_price) + '/enh</span>' +
+    '<span class="muted">' + esc(r.matched_from || '') + '</span>' +
+    '</div>'
+  ).join('');
+}
+
+async function selectSearchResult(dedupIdx, artnr) {
+  if (locked) return;
+  const resp = await postJson('/v2/review/' + JOB_ID + '/replace-candidate', { dedup_idx: dedupIdx, our_artnr: artnr });
+  if (!resp.ok) {
+    alert('Kunne ikke velge produkt: ' + (resp.error || 'ukjent feil'));
+    return;
+  }
+  // Reload this row's data from the response
+  const row = allRows.find(r => r.dedup_idx === dedupIdx);
+  if (row && resp.row) {
+    row.candidates = resp.row.candidates;
+    row.selected_candidate_idx = resp.row.selected_candidate_idx;
+    row.our_unit_price = resp.row.our_unit_price;
+    row.our_comparable_line_price = resp.row.our_comparable_line_price;
+    row.savings_amount = resp.row.savings_amount;
+    row.match_status = 'matched';
+  }
+  openSearchPanels[dedupIdx] = false;
+  applyFilters(true);
+}
+
+// --- Comment ---
+
 function debounceExtra(field, dedupIdx, value) {
-  // Separate debounce keys for comment vs strategy to avoid cancelling each other
   const key = field + '-' + dedupIdx;
   if (debounceTimers[key]) clearTimeout(debounceTimers[key]);
   debounceTimers[key] = setTimeout(() => {
-    if (field === 'comment') saveExtra(dedupIdx, value, null);
-    else saveExtra(dedupIdx, null, value);
+    saveExtra(dedupIdx, value);
   }, 800);
 }
 
-async function saveExtra(dedupIdx, comment, strategy) {
+async function saveExtra(dedupIdx, comment) {
   if (locked) return;
   const body = { dedup_idx: dedupIdx };
-  if (comment !== null) body.comment = comment;
-  if (strategy !== null) body.strategy = strategy;
+  if (comment !== null && comment !== undefined) body.comment = comment;
   await postJson('/v2/review/' + JOB_ID + '/extras', body);
   const row = allRows.find(r => r.dedup_idx === dedupIdx);
-  if (row) {
-    if (comment !== null) row.comment = comment;
-    if (strategy !== null) row.strategy = strategy;
+  if (row && comment !== null && comment !== undefined) {
+    row.comment = comment;
   }
 }
+
+// --- Lock ---
 
 async function toggleLock() {
   if (locked) {
@@ -376,8 +551,11 @@ async function toggleLock() {
 }
 
 function updateSummaryFromRows() {
-  const s = { approved: 0, rejected: 0, pending: 0 };
-  for (const r of allRows) s[r.review_status || 'pending']++;
+  const s = { approved: 0, rejected: 0, pending: 0, deleted: 0 };
+  for (const r of allRows) {
+    if (r.deleted) { s.deleted++; continue; }
+    s[r.review_status || 'pending']++;
+  }
   updateSummary(s);
 }
 
@@ -419,7 +597,7 @@ function savingsHtml(v) {
 }
 
 async function commitToDb() {
-  const approved = allRows.filter(r => r.review_status === 'approved').length;
+  const approved = allRows.filter(r => r.review_status === 'approved' && !r.deleted).length;
   if (approved === 0) {
     alert('Ingen godkjente rader. Godkjenn rader for du lagrer til prisdatabasen.');
     return;

@@ -66,7 +66,6 @@ def _build_record(row: Dict[str, Any], job_id: str, committed_at: str) -> Dict[s
         "savings_amount": row.get("savings_amount"),
         "review_status": row.get("review_status", "pending"),
         "comment": row.get("comment", ""),
-        "strategy": row.get("strategy", ""),
         "merge_warning": bool(row.get("merge_warning", False)),
         "merged_from_count": row.get("merged_from_count", 1),
         "inconsistent_fields": row.get("inconsistent_fields", []),
@@ -86,7 +85,7 @@ def commit_job(job_id: str, review_rows: List[Dict[str, Any]]) -> int:
     # Build new records (approved only)
     new_records = []
     for row in review_rows:
-        if row.get("review_status") != "approved":
+        if row.get("review_status") != "approved" or row.get("deleted"):
             continue
         new_records.append(_build_record(row, job_id, now))
 
