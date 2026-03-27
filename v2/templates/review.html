@@ -49,9 +49,15 @@
     .cand-row.disabled { cursor: default; opacity: 0.7; }
     .cand-row.disabled:hover { background: transparent; }
     .cand-row .artnr { font-weight: 600; min-width: 70px; }
+    .cand-row .artnr a { color: #1F4E79; }
+    .cand-row .link-icon { font-size: 11px; min-width: 16px; }
+    .cand-row .link-icon a { color: #6b7280; }
+    .cand-row .link-icon a:hover { color: #1F4E79; }
+    .cand-row .name { flex: 1; color: #374151; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cand-row .spec { flex: 0.6; color: #6b7280; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cand-row .price { min-width: 90px; text-align: right; }
+    .cand-row .score { min-width: 60px; text-align: right; color: #6b7280; }
     .cand-row .desc { flex: 1; color: #374151; }
-    .cand-row .price { min-width: 70px; text-align: right; }
-    .cand-row .savings { min-width: 80px; text-align: right; }
     .savings-pos { color: #16a34a; font-weight: 600; }
     .savings-neg { color: #dc2626; font-weight: 600; }
     .extras { display: flex; gap: 10px; margin-top: 8px; align-items: flex-start; }
@@ -68,9 +74,6 @@
     .search-results { max-height: 200px; overflow-y: auto; }
     .search-result-row { display: flex; align-items: center; gap: 8px; padding: 4px 6px; border-radius: 4px; font-size: 12px; cursor: pointer; }
     .search-result-row:hover { background: #e5e7eb; }
-    .search-result-row .artnr { font-weight: 600; min-width: 70px; }
-    .search-result-row .desc { flex: 1; color: #374151; }
-    .search-result-row .price { min-width: 70px; text-align: right; }
     .search-spinner { color: #6b7280; font-size: 12px; padding: 4px; }
     .deleted-label { display: inline-block; padding: 2px 8px; background: #f3f4f6; color: #6b7280; border-radius: 4px; font-size: 11px; font-weight: 600; margin-left: 8px; }
     /* Expandable row */
@@ -317,16 +320,14 @@ function renderCard(r) {
   // Candidates
   if (cands.length > 0) {
     html += '<div class="candidates">';
-    html += '<div class="muted" style="margin-bottom:4px;">Kandidater:</div>';
+    html += '<div class="muted" style="margin-bottom:4px; display:flex; gap:8px; font-size:11px; padding:0 8px;">';
+    html += '<span style="min-width:70px;">Art.Nr</span><span style="min-width:16px;"></span><span style="flex:1;">Navn</span><span style="flex:0.6;">Spesifikasjon</span><span style="min-width:90px;text-align:right;">Pris</span><span style="min-width:60px;text-align:right;">Score</span>';
+    html += '</div>';
     for (const c of cands) {
       const isSel = c.candidate_idx === selIdx;
       const candCls = 'cand-row' + (isSel ? ' selected' : '') + (locked ? ' disabled' : '');
       html += '<div class="' + candCls + '" onclick="selectCandidate(' + idx + ',' + c.candidate_idx + ')">';
-      html += artnrWithLink(c.our_artnr, c.our_gid);
-      html += '<span class="desc">' + esc(c.our_description || '') + '</span>';
-      html += '<span class="price">' + money(c.our_unit_price) + '/enh</span>';
-      html += '<span class="savings">' + savingsHtml(c.savings_amount) + '</span>';
-      html += '<span class="muted">' + esc(c.match_quality || '') + '</span>';
+      html += renderProductCols(c);
       html += '</div>';
     }
     if (!locked) {
@@ -520,11 +521,8 @@ async function searchCatalog(dedupIdx, query) {
     return;
   }
   container.innerHTML = results.map(r =>
-    '<div class="search-result-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
-    artnrWithLink(r.our_artnr, r.our_gid) +
-    '<span class="desc">' + esc(r.our_description || '') + (r.our_specification ? ' – ' + esc(r.our_specification) : '') + '</span>' +
-    '<span class="price">' + money(r.our_unit_price) + '/enh</span>' +
-    '<span class="muted">' + esc(r.matched_from || '') + '</span>' +
+    '<div class="cand-row" onclick="selectSearchResult(' + dedupIdx + ', \'' + escAttr(r.our_artnr) + '\')">' +
+    renderProductCols(r) +
     '</div>'
   ).join('');
 }
@@ -613,6 +611,20 @@ async function postJson(url, body) {
 
 // --- Formatting ---
 
+function renderProductCols(p) {
+  // Shared column rendering: Art.Nr | Link | Navn | Spesifikasjon | Pris | Score
+  let h = artnrWithLink(p.our_artnr, p.our_gid);
+  if (p.our_gid) {
+    h += '<span class="link-icon"><a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(p.our_gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt">&#x2197;</a></span>';
+  } else {
+    h += '<span class="link-icon"></span>';
+  }
+  h += '<span class="name">' + esc(p.our_description || '') + '</span>';
+  h += '<span class="spec">' + esc(p.our_specification || '') + '</span>';
+  h += '<span class="price">' + money(p.our_unit_price) + '</span>';
+  h += '<span class="score">' + esc(p.match_quality || '') + '</span>';
+  return h;
+}
 function productLink(gid, label) {
   if (!gid) return esc(label || '');
   return '<a href="https://www.onemed.no/nb-no/products/' + encodeURIComponent(gid) + '" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Se produkt hos OneMed">' + esc(label || gid) + '</a>';
