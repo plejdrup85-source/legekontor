@@ -73,6 +73,18 @@
     .search-result-row .price { min-width: 70px; text-align: right; }
     .search-spinner { color: #6b7280; font-size: 12px; padding: 4px; }
     .deleted-label { display: inline-block; padding: 2px 8px; background: #f3f4f6; color: #6b7280; border-radius: 4px; font-size: 11px; font-weight: 600; margin-left: 8px; }
+    /* Expandable row */
+    .card-summary { display: flex; align-items: center; gap: 10px; cursor: pointer; user-select: none; }
+    .card-summary:hover { background: #f9fafb; margin: -4px -6px; padding: 4px 6px; border-radius: 6px; }
+    .card-chevron { font-size: 11px; color: #9ca3af; transition: transform 0.15s; min-width: 16px; text-align: center; }
+    .card-chevron.open { transform: rotate(90deg); }
+    .card-summary .sum-desc { flex: 1; font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-summary .sum-match { font-size: 12px; color: #374151; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-summary .sum-price { font-size: 12px; min-width: 80px; text-align: right; }
+    .card-summary .sum-savings { font-size: 12px; min-width: 90px; text-align: right; }
+    .card-summary .sum-status { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 10px; }
+    .card-detail { padding-top: 10px; border-top: 1px solid #f3f4f6; margin-top: 10px; }
+    .card-detail.hidden { display: none; }
   </style>
 </head>
 <body>
@@ -130,6 +142,7 @@ const PAGE_SIZE = 25;
 let currentPage = 0;
 let debounceTimers = {};
 let openSearchPanels = {};
+let expandedRows = {};
 
 async function loadReview() {
   const resp = await fetch('/v2/review/' + JOB_ID);
@@ -232,20 +245,33 @@ function renderCard(r) {
   const selIdx = r.selected_candidate_idx;
   const cands = r.candidates || [];
   const dis = (locked || isDeleted) ? 'disabled' : '';
+  const isOpen = !!expandedRows[idx];
 
   let html = '<div class="card ' + (isDeleted ? '' : st) + warnCls + deletedCls + '" id="card-' + idx + '">';
 
-  // Header
-  html += '<div class="card-header"><div>';
-  html += '<span class="card-title">' + esc(r.description || '(ingen beskrivelse)') + '</span>';
-  if (isDeleted) {
-    html += '<span class="deleted-label">SLETTET</span>';
-  }
-  if (r.merged_from_count > 1) {
-    html += '<span class="merged-info">Slatt sammen fra ' + r.merged_from_count + ' rader</span>';
-  }
-  html += '</div><div class="decision-btns">';
+  // --- Clickable summary row ---
+  const selCand = (selIdx != null && cands[selIdx]) ? cands[selIdx] : null;
+  const matchLabel = selCand ? esc(selCand.our_artnr) + ' ' + esc(selCand.our_description || '') : (cands.length ? cands.length + ' kandidater' : 'Ingen match');
+  const statusBadge = {approved:'badge-approved', rejected:'badge-rejected', pending:'badge-pending'}[st] || 'badge-pending';
+  const statusText = {approved:'Godkjent', rejected:'Avvist', pending:'Pending'}[st] || st;
 
+  html += '<div class="card-summary" onclick="toggleExpand(' + idx + ')">';
+  html += '<span class="card-chevron' + (isOpen ? ' open' : '') + '" id="chevron-' + idx + '">&#9654;</span>';
+  html += '<span class="sum-desc">' + esc(r.description || '(ingen beskrivelse)');
+  if (isDeleted) html += ' <span class="deleted-label">SLETTET</span>';
+  if (r.merged_from_count > 1) html += '<span class="merged-info">(' + r.merged_from_count + ' slatt sammen)</span>';
+  html += '</span>';
+  html += '<span class="sum-match muted">' + matchLabel + '</span>';
+  html += '<span class="sum-price">' + money(r.our_unit_price) + '</span>';
+  html += '<span class="sum-savings">' + savingsHtml(r.savings_amount) + '</span>';
+  html += '<span class="sum-status ' + statusBadge + '">' + statusText + '</span>';
+  html += '</div>';
+
+  // --- Expandable detail ---
+  html += '<div class="card-detail' + (isOpen ? '' : ' hidden') + '" id="detail-' + idx + '">';
+
+  // Decision buttons
+  html += '<div style="display:flex;justify-content:flex-end;gap:4px;margin-bottom:8px;">';
   if (isDeleted) {
     html += '<button class="sm warn-btn" onclick="restoreRow(' + idx + ')" ' + (locked ? 'disabled' : '') + '>Gjenopprett</button>';
   } else {
@@ -254,14 +280,14 @@ function renderCard(r) {
     html += '<button class="sm ' + (st === 'pending' ? '' : 'secondary') + '" onclick="decide(' + idx + ',\'pending\')" ' + dis + '>Pending</button>';
     html += '<button class="sm danger" onclick="deleteRow(' + idx + ')" ' + dis + ' title="Slett rad">Slett</button>';
   }
-  html += '</div></div>';
+  html += '</div>';
 
   if (isDeleted) {
-    html += '</div>';
+    html += '</div></div>';
     return html;
   }
 
-  // Meta grid
+  // Meta grid (input data)
   const effectiveUnits = r.quantity_override || r.total_units;
   const hasOverride = r.quantity_override != null;
   html += '<div class="card-grid">';
@@ -326,7 +352,8 @@ function renderCard(r) {
   html += '<textarea placeholder="Kommentar..." onchange="saveExtra(' + idx + ',this.value)" oninput="debounceExtra(\'comment\',' + idx + ',this.value)"' + (locked ? ' disabled' : '') + '>' + esc(r.comment || '') + '</textarea>';
   html += '</div>';
 
-  html += '</div>';
+  html += '</div>'; // close detail
+  html += '</div>'; // close card
   return html;
 }
 
@@ -346,6 +373,15 @@ function goPage(p) {
   currentPage = p;
   renderPage();
   window.scrollTo(0, 0);
+}
+
+function toggleExpand(idx, evt) {
+  if (evt) evt.stopPropagation();
+  expandedRows[idx] = !expandedRows[idx];
+  const chevron = document.getElementById('chevron-' + idx);
+  const detail = document.getElementById('detail-' + idx);
+  if (chevron) chevron.classList.toggle('open', expandedRows[idx]);
+  if (detail) detail.classList.toggle('hidden', !expandedRows[idx]);
 }
 
 // --- API calls ---

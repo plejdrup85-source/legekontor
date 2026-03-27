@@ -33,6 +33,8 @@ def _extract_candidate_fields(artnr: str, best_row: Optional[Dict[str, Any]],
     specification = ""
     producer = ""
 
+    gid = ""
+
     if isinstance(best_row, dict):
         description = str(
             best_row.get("Katalog: Item Description")
@@ -52,12 +54,20 @@ def _extract_candidate_fields(artnr: str, best_row: Optional[Dict[str, Any]],
             or best_row.get("Produsent")
             or ""
         )
+        gid = str(
+            best_row.get("Katalog: GID")
+            or best_row.get("GID")
+            or ""
+        )
+        if gid.lower() == "nan":
+            gid = ""
 
     return {
         "our_artnr": str(artnr or ""),
         "our_description": description,
         "our_specification": specification,
         "our_producer": producer,
+        "our_gid": gid,
         "our_unit_price": price,
         "price_source": price_source,
         "match_quality": quality,

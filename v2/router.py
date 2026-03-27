@@ -608,6 +608,20 @@ async def v2_select_candidate(job_id: str, request: Request):
         return JSONResponse({"error": "dedup_idx og candidate_idx er påkrevd"}, status_code=400)
 
     rv.save_selection(job_id, int(dedup_idx), int(candidate_idx))
+
+    # Record learning from selection
+    try:
+        review_rows = rv.load_review(job_id)
+        if review_rows:
+            for r in review_rows:
+                if r.get("dedup_idx") == int(dedup_idx):
+                    cands = r.get("candidates", [])
+                    if 0 <= int(candidate_idx) < len(cands):
+                        record_selection_learning(job_id, r, cands[int(candidate_idx)])
+                    break
+    except Exception as e:
+        logger.warning(f"V2 learning on select failed: {e}")
+
     return {"ok": True, "dedup_idx": dedup_idx, "candidate_idx": candidate_idx}
 
 
@@ -660,6 +674,23 @@ async def v2_decide(job_id: str, request: Request):
         )
 
     rv.save_decision(job_id, int(dedup_idx), status)
+
+    # Record learning when approving
+    if status == "approved":
+        try:
+            review_rows = rv.load_review(job_id)
+            if review_rows:
+                sels = rv.load_selections(job_id)
+                for r in review_rows:
+                    if r.get("dedup_idx") == int(dedup_idx):
+                        sel_idx = sels.get(str(dedup_idx), r.get("selected_candidate_idx"))
+                        cands = r.get("candidates", [])
+                        if sel_idx is not None and 0 <= sel_idx < len(cands):
+                            record_approval_learning(job_id, r, cands[sel_idx])
+                        break
+        except Exception as e:
+            logger.warning(f"V2 learning on approve failed: {e}")
+
     return {"ok": True, "dedup_idx": dedup_idx, "status": status}
 
 
@@ -751,29 +782,52 @@ async def v2_search_catalog(job_id: str, request: Request):
     results = []
     seen = set()
 
-    # Search both catalogs
+    def _extract_gid(row_data):
+        if not isinstance(row_data, dict):
+            return ""
+        gid = str(row_data.get("Katalog: GID") or row_data.get("GID") or "")
+        return "" if gid.lower() == "nan" else gid
+
+    def _extract_result(artnr, best_row, quality, source):
+        price, psrc = bundle.price_for_artnr(artnr)
+        desc = ""
+        spec = ""
+        producer = ""
+        gid = ""
+        if isinstance(best_row, dict):
+            desc = str(best_row.get("Katalog: Item Description") or best_row.get("Item Description") or best_row.get("Description") or "")
+            spec = str(best_row.get("Katalog: Specification") or best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
+            producer = str(best_row.get("Katalog: Producer Name") or best_row.get("Producer Name") or best_row.get("Produsent") or "")
+            gid = _extract_gid(best_row)
+        return {
+            "our_artnr": str(artnr),
+            "our_description": desc,
+            "our_specification": spec,
+            "our_producer": producer,
+            "our_gid": gid,
+            "our_unit_price": price,
+            "matched_from": source,
+            "match_quality": quality,
+        }
+
+    # Search both catalogs, collecting best + alternatives
     for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
         try:
-            artnr, _alts, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
+            artnr, alts, best_row, quality = catalog.match_row(search_row, top_n=limit * 3)
             if artnr and artnr not in seen:
-                price, psrc = bundle.price_for_artnr(artnr)
-                desc = ""
-                spec = ""
-                producer = ""
-                if isinstance(best_row, dict):
-                    desc = str(best_row.get("Katalog: Item Description") or best_row.get("Item Description") or best_row.get("Description") or "")
-                    spec = str(best_row.get("Katalog: Specification") or best_row.get("Specification") or best_row.get("Spesifikasjon") or "")
-                    producer = str(best_row.get("Katalog: Producer Name") or best_row.get("Producer Name") or best_row.get("Produsent") or "")
-                results.append({
-                    "our_artnr": str(artnr),
-                    "our_description": desc,
-                    "our_specification": spec,
-                    "our_producer": producer,
-                    "our_unit_price": price,
-                    "matched_from": source,
-                    "match_quality": quality,
-                })
+                results.append(_extract_result(artnr, best_row, quality, source))
                 seen.add(artnr)
+            # Also include alternatives from the matcher
+            if alts:
+                for alt in alts:
+                    alt_artnr = alt.get("artnr") or (alt.artnr if hasattr(alt, "artnr") else "")
+                    if alt_artnr and alt_artnr not in seen:
+                        alt_row = alt.get("row") or (alt.row if hasattr(alt, "row") else None)
+                        alt_quality = alt.get("quality", quality)
+                        results.append(_extract_result(alt_artnr, alt_row, alt_quality, source))
+                        seen.add(alt_artnr)
+                        if len(results) >= limit:
+                            break
         except Exception as e:
             logger.warning(f"V2 catalog search failed for source={source}: {e}")
 
@@ -808,6 +862,7 @@ async def v2_replace_candidate(job_id: str, request: Request):
     desc = ""
     spec = ""
     producer = ""
+    gid = ""
     for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
         for item in catalog.items:
             if str(getattr(item, "artnr", "")).strip() == our_artnr:
@@ -816,6 +871,8 @@ async def v2_replace_candidate(job_id: str, request: Request):
                     desc = str(row_data.get("Katalog: Item Description") or row_data.get("Item Description") or row_data.get("Description") or "")
                     spec = str(row_data.get("Katalog: Specification") or row_data.get("Specification") or row_data.get("Spesifikasjon") or "")
                     producer = str(row_data.get("Katalog: Producer Name") or row_data.get("Producer Name") or row_data.get("Produsent") or "")
+                    gid_raw = str(row_data.get("Katalog: GID") or row_data.get("GID") or "")
+                    gid = "" if gid_raw.lower() == "nan" else gid_raw
                 break
         if desc:
             break
@@ -844,6 +901,7 @@ async def v2_replace_candidate(job_id: str, request: Request):
         "our_description": desc,
         "our_specification": spec,
         "our_producer": producer,
+        "our_gid": gid,
         "our_unit_price": price,
         "price_source": price_source,
         "match_quality": "Manuelt valgt",
@@ -933,6 +991,115 @@ async def v2_restore_row(job_id: str, request: Request):
     return {"ok": True, "dedup_idx": dedup_idx, "deleted": False}
 
 
+@v2_router.post("/review/{job_id}/add-row")
+async def v2_add_row(job_id: str, request: Request):
+    """Add a manual row to the review. Body: {description, price, competitor_name?, competitor_artnr?, specification?, quantity?}
+
+    Creates a new review row, runs matching, and returns the full row.
+    """
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+
+    body = await request.json()
+    description = (body.get("description") or "").strip()
+    price = body.get("price")
+    if not description:
+        return JSONResponse({"error": "Beskrivelse er påkrevd"}, status_code=400)
+    if price is None:
+        return JSONResponse({"error": "Pris er påkrevd"}, status_code=400)
+    try:
+        price = float(price)
+    except (ValueError, TypeError):
+        return JSONResponse({"error": "Ugyldig pris"}, status_code=400)
+
+    competitor_name = (body.get("competitor_name") or "").strip()
+    competitor_artnr = (body.get("competitor_artnr") or "").strip()
+    specification = (body.get("specification") or "").strip()
+    quantity = body.get("quantity")
+    if quantity is not None:
+        try:
+            quantity = float(quantity)
+        except (ValueError, TypeError):
+            quantity = 1.0
+    else:
+        quantity = 1.0
+
+    review_rows = rv.load_review(job_id)
+    if review_rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+
+    # Assign next dedup_idx
+    max_idx = max((r.get("dedup_idx", 0) for r in review_rows), default=-1)
+    new_idx = max_idx + 1
+
+    total_units = quantity
+    competitor_line_amount = round(price * total_units, 2)
+
+    # Build the new row with all fields used by export/UI
+    new_row = {
+        "dedup_idx": new_idx,
+        "description": description,
+        "competitor": competitor_name,
+        "competitor_artnr": competitor_artnr,
+        "specification": specification,
+        "quantity_purchased": quantity,
+        "packaging_text": "",
+        "packaging_count": 1,
+        "total_units": total_units,
+        "competitor_unit_price": price,
+        "competitor_line_amount": competitor_line_amount,
+        "merged_from_count": 1,
+        "merge_warning": False,
+        "inconsistent_fields": [],
+        "manual_row": True,
+        # Review fields
+        "review_status": "pending",
+        "selected_candidate_idx": None,
+        "comment": "",
+        "deleted": False,
+        "candidates": [],
+        "best_candidate_idx": None,
+        "match_status": "no_match",
+        "our_unit_price": None,
+        "our_comparable_line_price": None,
+        "savings_amount": None,
+    }
+
+    # Run matching if catalog is available
+    bundle = _get_catalog_bundle()
+    if bundle:
+        try:
+            from v2.matching import _match_single_row
+            matched = _match_single_row(new_row, bundle, top_n=5, prefer_own_brands=True)
+            # Merge matched fields into new_row
+            new_row["candidates"] = matched.get("candidates", [])
+            new_row["best_candidate_idx"] = matched.get("best_candidate_idx")
+            new_row["match_status"] = matched.get("match_status", "no_match")
+            new_row["our_unit_price"] = matched.get("our_unit_price")
+            new_row["our_comparable_line_price"] = matched.get("our_comparable_line_price")
+            new_row["savings_amount"] = matched.get("savings_amount")
+            if new_row["best_candidate_idx"] is not None:
+                new_row["selected_candidate_idx"] = new_row["best_candidate_idx"]
+        except Exception as e:
+            logger.warning(f"V2 add-row matching failed: {e}")
+
+    # Init review fields
+    from v2.persistence import init_review
+    review_ready = init_review(job_id, [new_row])
+    final_row = review_ready[0] if review_ready else new_row
+
+    # Append to review.json
+    review_rows.append(final_row)
+    rv.save_review(job_id, review_rows)
+
+    # Apply overrides to return the proper state
+    overridden = rv.apply_overrides([final_row], job_id)
+    out = overridden[0] if overridden else final_row
+
+    return {"ok": True, "row": out}
+
+
 @v2_router.post("/review/{job_id}/lock")
 async def v2_lock(job_id: str, request: Request):
     """Lock the job to prevent further edits."""
@@ -955,6 +1122,78 @@ def v2_unlock(job_id: str):
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     rv.set_lock(job_id, False)
     return {"ok": True, "locked": False}
+
+
+# ============================================================
+# V2 LEARNING – simple learning from review decisions
+# ============================================================
+_LEARNING_DIR = V2_DIR / "learning"
+_LEARNING_DIR.mkdir(parents=True, exist_ok=True)
+_LEARNING_FILE = _LEARNING_DIR / "learnings.jsonl"
+
+
+def _save_learning(entry: Dict[str, Any]) -> None:
+    """Append a learning entry to the JSONL file."""
+    entry["learned_at"] = _utc_now_iso()
+    try:
+        with open(_LEARNING_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        logger.warning(f"V2 learning: kunne ikke lagre: {e}")
+
+
+def load_learnings() -> List[Dict[str, Any]]:
+    """Load all learning entries."""
+    if not _LEARNING_FILE.exists():
+        return []
+    entries = []
+    try:
+        with open(_LEARNING_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    return entries
+
+
+def record_selection_learning(job_id: str, row: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """Record when a user selects a match (positive signal)."""
+    _save_learning({
+        "type": "selection",
+        "job_id": job_id,
+        "competitor_description": row.get("description", ""),
+        "competitor_artnr": row.get("competitor_artnr", ""),
+        "competitor": row.get("competitor", ""),
+        "our_artnr": candidate.get("our_artnr", ""),
+        "our_description": candidate.get("our_description", ""),
+        "match_quality": candidate.get("match_quality", ""),
+    })
+
+
+def record_approval_learning(job_id: str, row: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+    """Record when a user approves a row (strong positive signal)."""
+    _save_learning({
+        "type": "approval",
+        "job_id": job_id,
+        "competitor_description": row.get("description", ""),
+        "competitor_artnr": row.get("competitor_artnr", ""),
+        "competitor": row.get("competitor", ""),
+        "our_artnr": candidate.get("our_artnr", ""),
+        "our_description": candidate.get("our_description", ""),
+        "match_quality": candidate.get("match_quality", ""),
+    })
+
+
+@v2_router.get("/learning")
+def v2_get_learnings(limit: int = 200):
+    """Get recorded learnings."""
+    entries = load_learnings()
+    return {"count": len(entries), "learnings": entries[-limit:]}
 
 
 @v2_router.get("/review/{job_id}/ui", response_class=HTMLResponse)
