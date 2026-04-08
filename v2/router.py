@@ -329,6 +329,17 @@ def _parse_job_files(job_id: str) -> None:
     task["deduped_rows"] = deduped_rows
     task["deduped_count"] = len(deduped_rows)
 
+    # Track price availability across all rows
+    rows_with_price = sum(1 for r in all_rows if r.get("price_before_discount") is not None)
+    rows_without_price = len(all_rows) - rows_with_price
+    task["rows_with_price"] = rows_with_price
+    task["rows_without_price"] = rows_without_price
+
+    logger.info(
+        f"V2 parsing: {rows_with_price} rader med pris, "
+        f"{rows_without_price} rader uten pris (pris er valgfritt)"
+    )
+
     # Persist both raw and deduped rows to disk
     job_dir = V2_UPLOADS_DIR / job_id
     try:
@@ -379,6 +390,9 @@ def v2_status(job_id: str):
         "matched_ok": t.get("matched_ok"),
         "no_match": t.get("no_match"),
         "match_error": t.get("match_error"),
+        # Enhanced pipeline info
+        "rows_with_price": t.get("rows_with_price"),
+        "rows_without_price": t.get("rows_without_price"),
     }
 
 
@@ -450,9 +464,42 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
 
     deduped = task.get("deduped_rows", [])
     if not deduped:
+        # Build a detailed error message explaining why there are no rows
+        files = task.get("files", [])
+        parse_warnings = []
+        for f in files:
+            meta = f.get("parse_meta", {})
+            warning = meta.get("parse_warning", "")
+            if warning:
+                parse_warnings.append(f"{f.get('filename', '?')}: {warning}")
+
+        if parse_warnings:
+            detail = " | ".join(parse_warnings)
+            error_msg = f"Ingen varelinjer funnet. {detail}"
+        else:
+            # Check what happened during parsing
+            any_ocr = any(f.get("parse_meta", {}).get("ocr_used") for f in files)
+            any_pdf = any(f.get("type") == "pdf" for f in files)
+            if any_pdf and not any_ocr:
+                error_msg = (
+                    "Ingen varelinjer funnet. PDF-en ble analysert, "
+                    "men verken vanlig tekstuttrekk eller OCR ga brukbare resultater."
+                )
+            elif any_ocr:
+                error_msg = (
+                    "OCR fullført, men parsing av varetabell ga 0 strukturerte rader. "
+                    "Sjekk at dokumentet inneholder varelinjer med varenummer og/eller produktnavn."
+                )
+            else:
+                error_msg = (
+                    "Ingen dedupliserte rader å matche. "
+                    "Filene ble analysert, men ga ingen gjenkjennbare produktlinjer."
+                )
+
         task["status"] = "error"
-        task["match_error"] = "Ingen dedupliserte rader å matche"
-        _append_v2_job({"job_id": job_id, "status": "error", "match_error": task["match_error"]})
+        task["match_error"] = error_msg
+        _append_v2_job({"job_id": job_id, "status": "error", "match_error": error_msg})
+        logger.warning(f"V2 matching: ingen rader for job={job_id}: {error_msg}")
         return
 
     def progress_cb(p: float):
@@ -1521,6 +1568,10 @@ function updateStatusDisplay(data) {
       label += ', ' + data.deduped_count + ' unike';
     label += ')';
   }
+  // Show price info — missing price is NOT an error
+  if (data.rows_without_price > 0 && data.total_rows > 0) {
+    label += ' — ' + data.rows_with_price + ' med pris, ' + data.rows_without_price + ' uten pris (OK)';
+  }
   if (data.status === 'matching' && data.match_progress != null) {
     label += ' ' + Math.round(data.match_progress * 100) + '%';
   }
@@ -1528,7 +1579,7 @@ function updateStatusDisplay(data) {
     label += ' — ' + (data.matched_ok || 0) + ' treff, ' + (data.no_match || 0) + ' uten';
   }
   if (data.match_error) {
-    label += ' — Feil: ' + data.match_error;
+    label += ' — ' + data.match_error;
   }
   document.getElementById('resultStatus').textContent = label;
 }
@@ -1609,13 +1660,35 @@ function showDetailedFileResults(files) {
     let tags = '<span class="tag tag-' + (f.type || 'xlsx') + '">' + esc((f.type || '').toUpperCase()) + '</span> ';
     if (parseStatus === 'parsed') tags += '<span class="tag tag-parsed">Analysert</span> ';
     if (parseStatus === 'error') tags += '<span class="tag tag-error">' + esc(f.parse_error || 'Feil') + '</span> ';
-    if (meta.ocr_used) tags += '<span class="tag tag-ocr">OCR</span> ';
+    if (meta.ocr_used) tags += '<span class="tag tag-ocr">OCR brukt</span> ';
+    if (meta.ocr_needed && !meta.ocr_used) tags += '<span class="tag tag-error">OCR feilet</span> ';
+    if (meta.parse_method === 'generic_ocr') tags += '<span class="tag tag-ocr">Generisk parser</span> ';
+    if (meta.parse_method === 'norengros') tags += '<span class="tag tag-parsed">NorEngros</span> ';
 
     let detail = '';
     if (f.type === 'pdf' && parseStatus === 'parsed') {
-      detail = (meta.page_count || '?') + ' sider, ' + (meta.text_length || 0) + ' tegn';
+      detail = (meta.page_count || '?') + ' sider';
+      if (meta.text_length) detail += ', ' + meta.text_length + ' tegn';
       if (meta.detected_source) detail += ', kilde: ' + meta.detected_source;
-      if (meta.ocr_needed && !meta.ocr_used) detail += ', OCR ikke tilgjengelig';
+
+      // Show OCR quality details
+      if (meta.ocr_page_stats) {
+        const s = meta.ocr_page_stats;
+        detail += ' | OCR: ' + s.good + ' gode/' + s.poor + ' svake/' + s.empty + ' tomme sider';
+        if (s.error > 0) detail += ', ' + s.error + ' feil';
+      }
+
+      // Show text quality verdict
+      if (meta.direct_text_quality) {
+        const q = meta.direct_text_quality;
+        detail += ' | Tekstkvalitet: ' + q.verdict + ' (' + q.quality_score + ')';
+      }
+
+      // Show price info
+      if (meta.price_info) detail += ' | ' + meta.price_info;
+
+      // Show parse warning (non-error info)
+      if (meta.parse_warning) detail += ' | ' + meta.parse_warning;
     }
     if (f.type === 'xlsx' && parseStatus === 'parsed') {
       const sheets = meta.sheets || [];

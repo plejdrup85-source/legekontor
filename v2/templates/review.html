@@ -341,6 +341,15 @@ function renderCard(r) {
   html += '<div><dt>Var pris/enhet</dt><dd>' + money(r.our_unit_price) + '</dd></div>';
   html += '<div><dt>Vart linjebelop</dt><dd>' + money(r.our_comparable_line_price) + '</dd></div>';
   html += '<div><dt>Besparelse</dt><dd>' + savingsHtml(r.savings_amount) + '</dd></div>';
+  // Enhanced info: source page, confidence, parse method
+  if (r.source_page) html += '<div><dt>Side</dt><dd>' + r.source_page + '</dd></div>';
+  if (r.confidence != null) {
+    const confPct = Math.round(r.confidence * 100);
+    const confCls = confPct >= 60 ? 'savings-pos' : (confPct >= 30 ? '' : 'savings-neg');
+    html += '<div><dt>Sikkerhet</dt><dd class="' + confCls + '">' + confPct + '%</dd></div>';
+  }
+  if (r.parse_method) html += '<div><dt>Metode</dt><dd>' + esc(r.parse_method) + '</dd></div>';
+  if (r.price_before_discount == null && r.parse_method) html += '<div><dt>Pris</dt><dd class="muted">Ingen pris i kilde</dd></div>';
   html += '</div>';
 
   // Merge warning

@@ -132,6 +132,10 @@ def _merge_rows(group: List[Dict[str, Any]]) -> Dict[str, Any]:
         "price_unit", "price_before_discount", "discount_pct",
     ])
 
+    # Best confidence from the group
+    confidences = [r.get("confidence", 0) for r in group if r.get("confidence") is not None]
+    best_confidence = max(confidences) if confidences else None
+
     merged = {
         # Identity fields — from first row
         "source_file": source_files[0] if len(source_files) == 1 else source_files,
@@ -160,6 +164,11 @@ def _merge_rows(group: List[Dict[str, Any]]) -> Dict[str, Any]:
         # Consistency
         "merge_warning": bool(inconsistent_fields),
         "inconsistent_fields": inconsistent_fields,
+        # Enhanced fields (from first row or best available)
+        "source_page": first.get("source_page", 0),
+        "raw_text": first.get("raw_text", ""),
+        "confidence": best_confidence,
+        "parse_method": first.get("parse_method", ""),
     }
 
     return merged
@@ -191,27 +200,8 @@ def deduplicate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     # Merge groups
     result: List[Dict[str, Any]] = []
 
-    for key, group in groups.items():
-        if len(group) == 1:
-            # Single row — no merge needed, but add traceability fields
-            single = dict(group[0])
-            single["merged_from_count"] = 1
-            single["merge_warning"] = False
-            single["inconsistent_fields"] = []
-            single["source_rows"] = [{
-                "row_idx": single.get("row_idx"),
-                "source_file": single.get("source_file"),
-                "quantity_purchased": single.get("quantity_purchased"),
-                "total_units": single.get("total_units"),
-                "competitor_line_amount": single.get("competitor_line_amount"),
-                "line_amount": single.get("line_amount"),
-            }]
-            result.append(single)
-        else:
-            result.append(_merge_rows(group))
-
-    # Add ungrouped rows (no key → standalone)
-    for row in ungrouped:
+    def _add_traceability(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Add traceability fields to a single (non-merged) row."""
         single = dict(row)
         single["merged_from_count"] = 1
         single["merge_warning"] = False
@@ -224,7 +214,22 @@ def deduplicate(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "competitor_line_amount": single.get("competitor_line_amount"),
             "line_amount": single.get("line_amount"),
         }]
-        result.append(single)
+        # Preserve enhanced fields if present
+        single.setdefault("source_page", 0)
+        single.setdefault("raw_text", "")
+        single.setdefault("confidence", None)
+        single.setdefault("parse_method", "")
+        return single
+
+    for key, group in groups.items():
+        if len(group) == 1:
+            result.append(_add_traceability(group[0]))
+        else:
+            result.append(_merge_rows(group))
+
+    # Add ungrouped rows (no key → standalone)
+    for row in ungrouped:
+        result.append(_add_traceability(row))
 
     # Assign new sequential dedup_idx
     for idx, row in enumerate(result):

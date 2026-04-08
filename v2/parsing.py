@@ -3,19 +3,48 @@ V2 Parsing module – file classification, text extraction, and row extraction.
 
 Handles:
 - PDF text extraction (with OCR fallback)
+- Enhanced OCR with image preprocessing for scanned documents
 - XLSX detection and inspection
 - NorEngros invoice parsing with full field extraction
+- Generic product line parsing for unknown sources (price optional)
+- Page-level resilience and quality scoring
+- Confidence scoring per extracted row
 """
 import logging
 import os
 import re
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# QUALITY SCORING CONSTANTS
+# ============================================================
+
+# Minimum thresholds for text quality assessment
+_OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "80"))
+_OCR_MIN_WORDS = int(os.getenv("OCR_MIN_WORDS", "15"))
+
+# Pattern for lines that look like product lines (item number + text)
+_PRODUCT_LINE_HINT_RE = re.compile(r"\b\d{4,9}\b.*[A-Za-zÆØÅæøå]{3,}")
+
+# Noise patterns to filter out during generic parsing
+_NOISE_PATTERNS = [
+    re.compile(r"^\s*side\s+\d+", re.IGNORECASE),
+    re.compile(r"^\s*\d+\s*$"),  # bare page numbers
+    re.compile(r"^\s*(januar|februar|mars|april|mai|juni|juli|august|september|oktober|november|desember)\s+\d{4}\s*$", re.IGNORECASE),
+    re.compile(r"^\s*dato\s*:", re.IGNORECASE),
+    re.compile(r"^\s*legekontor\s+\d+", re.IGNORECASE),
+    re.compile(r"^\s*(lab|beskyttelse|sårbehandling|diagnostikk|utstyr|forbruk|hygiene)\s*$", re.IGNORECASE),
+    # Common document headers/titles
+    re.compile(r"^\s*(vareliste|faktura|prisliste|bestilling|ordre|følgeseddel)\b.*\d{4}", re.IGNORECASE),
+    re.compile(r"^\s*(vareliste|faktura|prisliste|bestilling|ordre|følgeseddel)\s*$", re.IGNORECASE),
+]
 
 # ============================================================
 # FILE TYPE DETECTION
@@ -87,11 +116,8 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(parts)
 
 
-_OCR_MIN_CHARS = int(os.getenv("OCR_MIN_CHARS", "80"))
-_OCR_MIN_WORDS = int(os.getenv("OCR_MIN_WORDS", "15"))
-
-
 def needs_ocr(text: str) -> bool:
+    """Check if extracted text is too poor and OCR is needed."""
     if not text or not text.strip():
         return True
     stripped = text.strip()
@@ -103,25 +129,145 @@ def needs_ocr(text: str) -> bool:
     return False
 
 
+def assess_text_quality(text: str) -> Dict[str, Any]:
+    """Assess quality of extracted text for logging and decision-making.
+
+    Returns dict with quality metrics:
+      - char_count, word_count, line_count
+      - product_line_hints: number of lines that look like product lines
+      - quality_score: 0.0-1.0 overall quality estimate
+      - verdict: 'good', 'poor', 'empty'
+    """
+    if not text or not text.strip():
+        return {"char_count": 0, "word_count": 0, "line_count": 0,
+                "product_line_hints": 0, "quality_score": 0.0, "verdict": "empty"}
+
+    stripped = text.strip()
+    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+    words = [w for w in re.split(r"\s+", stripped) if len(w) >= 2]
+    product_hints = sum(1 for l in lines if _PRODUCT_LINE_HINT_RE.search(l))
+
+    # Score based on multiple factors
+    score = 0.0
+    if len(stripped) >= _OCR_MIN_CHARS:
+        score += 0.2
+    if len(words) >= _OCR_MIN_WORDS:
+        score += 0.2
+    if len(lines) >= 5:
+        score += 0.2
+    if product_hints >= 2:
+        score += 0.3
+    # Bonus for digit+text lines (typical for product lists)
+    digit_text_lines = sum(1 for l in lines if re.search(r"\d", l) and re.search(r"[A-Za-zÆØÅæøå]", l))
+    if digit_text_lines >= 3:
+        score += 0.1
+
+    score = min(score, 1.0)
+    verdict = "good" if score >= 0.5 else ("poor" if score > 0 else "empty")
+
+    return {
+        "char_count": len(stripped),
+        "word_count": len(words),
+        "line_count": len(lines),
+        "product_line_hints": product_hints,
+        "quality_score": round(score, 2),
+        "verdict": verdict,
+    }
+
+
+def _preprocess_image_for_ocr(img):
+    """Apply image preprocessing to improve OCR quality.
+
+    Steps: grayscale, contrast enhancement, thresholding, optional deskew.
+    """
+    from PIL import ImageEnhance, ImageFilter
+
+    # Convert to grayscale
+    if img.mode != "L":
+        img = img.convert("L")
+
+    # Enhance contrast
+    enhancer = ImageEnhance.Contrast(img)
+    img = enhancer.enhance(1.8)
+
+    # Sharpen slightly
+    img = img.filter(ImageFilter.SHARPEN)
+
+    # Apply adaptive-like thresholding via simple threshold
+    # Convert to binary: pixels above threshold become white, below become black
+    threshold = 140
+    img = img.point(lambda x: 255 if x > threshold else 0, mode="1")
+
+    # Convert back to L mode for tesseract
+    img = img.convert("L")
+
+    return img
+
+
 def ocr_pdf_fallback(pdf_bytes: bytes) -> str:
+    """Legacy compatibility wrapper. Returns concatenated text from all pages."""
+    page_results = ocr_pdf_pages(pdf_bytes)
+    return "\n".join(pr["text"] for pr in page_results if pr.get("text"))
+
+
+def ocr_pdf_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
+    """OCR each page of a PDF individually with preprocessing.
+
+    Returns a list of per-page results:
+      [{"page": 1, "text": "...", "char_count": N, "quality": "good"/"poor"/"empty", "error": None}, ...]
+
+    Page-level resilience: if one page fails, others still process.
+    """
     import fitz
     import pytesseract
     from PIL import Image
     from io import BytesIO as _BytesIO
 
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    parts = []
+    page_results = []
+
     try:
-        for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            img = Image.open(_BytesIO(pix.tobytes("png")))
-            t = pytesseract.image_to_string(img, lang="nor+eng")
-            if t:
-                parts.append(t)
+        for page_num, page in enumerate(doc):
+            page_result = {"page": page_num + 1, "text": "", "char_count": 0,
+                           "quality": "empty", "error": None}
+            try:
+                # Render at 2.5x for better OCR (higher than old 2.0x)
+                mat = fitz.Matrix(2.5, 2.5)
+                pix = page.get_pixmap(matrix=mat)
+                img = Image.open(_BytesIO(pix.tobytes("png")))
+
+                # Preprocess image for better OCR
+                img_processed = _preprocess_image_for_ocr(img)
+
+                # Run OCR with Norwegian + English
+                text = pytesseract.image_to_string(img_processed, lang="nor+eng")
+
+                if text and text.strip():
+                    page_result["text"] = text.strip()
+                    page_result["char_count"] = len(text.strip())
+
+                    # Quick quality check
+                    words = [w for w in text.split() if len(w) >= 2]
+                    has_products = bool(_PRODUCT_LINE_HINT_RE.search(text))
+                    if len(words) >= 5 and has_products:
+                        page_result["quality"] = "good"
+                    elif len(words) >= 3:
+                        page_result["quality"] = "poor"
+
+                logger.debug(
+                    f"OCR side {page_num + 1}: {page_result['char_count']} tegn, "
+                    f"kvalitet={page_result['quality']}"
+                )
+
+            except Exception as e:
+                page_result["error"] = str(e)
+                logger.warning(f"OCR feilet for side {page_num + 1}: {e}")
+
+            page_results.append(page_result)
     finally:
         doc.close()
-    return "\n".join(parts)
+
+    return page_results
 
 
 # ============================================================
@@ -341,6 +487,306 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
 
 
 # ============================================================
+# GENERIC PRODUCT LINE PARSER (for scanned / unknown sources)
+# ============================================================
+# Handles product lists where lines may contain:
+#   item_number  description  (optional packaging)  (optional price)
+# Price is NEVER required. This parser works for scanned PDFs
+# with or without price information.
+
+# Regex for a line starting with what looks like an item number (4-9 digits)
+_GENERIC_ITEM_START_RE = re.compile(r"^(\d{4,9})\s+(.+)")
+
+# Regex for packaging info in parentheses: "(15 STK)", "(50 stk)", "(25 pk)" etc.
+_PACKAGING_RE = re.compile(r"\((\d+)\s*([A-Za-zÆØÅæøå]{1,6})\)")
+
+# Regex for a price at end of line: "199,00" or "1.234,56" or "199.00"
+_TRAILING_PRICE_RE = re.compile(
+    r"\s+(\d[\d\.]*[,\.]\d{2})\s*$"
+)
+
+# Lines that are clearly noise (category headers, page info, etc.)
+def _is_noise_line(line: str) -> bool:
+    """Check if a line is noise (headers, page numbers, dates, categories)."""
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if len(stripped) < 3:
+        return True
+    for pat in _NOISE_PATTERNS:
+        if pat.search(stripped):
+            return True
+    # Lines that are all uppercase and short are likely headers
+    # But not if they look like packaging info "(15 STK)" or contain digits+unit pattern
+    if stripped.isupper() and len(stripped) < 30 and not re.search(r"\d{4,}", stripped):
+        if not re.search(r"\d+\s*[A-ZÆØÅ]{1,6}", stripped):
+            return True
+    return False
+
+
+def _is_continuation_line(line: str) -> bool:
+    """Check if a line looks like it continues a previous product line.
+
+    A continuation line does NOT start with a new item number and contains
+    meaningful text (packaging info, more description, etc.)
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    # Starts with an item number -> not a continuation
+    if re.match(r"^\d{4,9}\s", stripped):
+        return False
+    # Contains packaging pattern like "(15 STK)" - check early, before noise filter
+    if _PACKAGING_RE.search(stripped):
+        return True
+    # Looks like noise
+    if _is_noise_line(stripped):
+        return False
+    # Contains some alphabetic text
+    if re.search(r"[A-Za-zÆØÅæøå]{2,}", stripped):
+        return True
+    return False
+
+
+def parse_generic_product_lines(text: str, source_file: str,
+                                page_texts: Optional[List[Dict[str, Any]]] = None
+                                ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Parse generic product lines from OCR or text output.
+
+    This is the fallback parser when NorEngros format is not detected.
+    It extracts product lines based on item number + description patterns.
+    Price is completely optional.
+
+    Args:
+        text: Full extracted text
+        source_file: Source filename
+        page_texts: Optional per-page OCR results for source_page tracking
+
+    Returns:
+        Tuple of (rows, stats) where:
+        - rows: list of parsed row dicts
+        - stats: dict with parsing statistics for logging/UI
+    """
+    stats = {
+        "total_lines": 0,
+        "noise_lines_skipped": 0,
+        "candidate_lines": 0,
+        "continuation_lines_merged": 0,
+        "rows_with_price": 0,
+        "rows_without_price": 0,
+        "rows_with_item_no": 0,
+        "rows_without_item_no": 0,
+        "discard_reasons": {},
+    }
+
+    # Build page map for source_page tracking
+    page_map: Dict[int, int] = {}  # line_index -> page_number
+    if page_texts:
+        global_line_idx = 0
+        for pr in page_texts:
+            page_num = pr.get("page", 0)
+            page_text = pr.get("text", "")
+            for _ in page_text.splitlines():
+                page_map[global_line_idx] = page_num
+                global_line_idx += 1
+
+    all_lines = text.splitlines()
+    stats["total_lines"] = len(all_lines)
+
+    # Clean lines
+    clean_lines = []
+    for i, raw_line in enumerate(all_lines):
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        if _is_noise_line(line):
+            stats["noise_lines_skipped"] += 1
+            continue
+        if _looks_like_total(line.lower()):
+            stats["noise_lines_skipped"] += 1
+            continue
+        clean_lines.append((i, line))  # (original_index, cleaned_line)
+
+    # Group lines into product entries
+    entries: List[Dict[str, Any]] = []
+    current_entry = None
+
+    for orig_idx, line in clean_lines:
+        item_match = _GENERIC_ITEM_START_RE.match(line)
+
+        if item_match:
+            # Save previous entry
+            if current_entry:
+                entries.append(current_entry)
+
+            stats["candidate_lines"] += 1
+            current_entry = {
+                "item_no": item_match.group(1),
+                "raw_text": line,
+                "rest": item_match.group(2),
+                "source_page": page_map.get(orig_idx, 0),
+                "orig_idx": orig_idx,
+            }
+        elif current_entry and _is_continuation_line(line):
+            # Merge continuation into current entry
+            current_entry["raw_text"] += " " + line
+            current_entry["rest"] += " " + line
+            stats["continuation_lines_merged"] += 1
+        elif not item_match and re.search(r"[A-Za-zÆØÅæøå]{3,}", line):
+            # Line with text but no item number - could be a description-only product
+            # Only keep if it has enough substance
+            words = [w for w in line.split() if len(w) >= 2]
+            if len(words) >= 2 and not _is_noise_line(line):
+                if current_entry:
+                    entries.append(current_entry)
+                current_entry = {
+                    "item_no": "",
+                    "raw_text": line,
+                    "rest": line,
+                    "source_page": page_map.get(orig_idx, 0),
+                    "orig_idx": orig_idx,
+                }
+
+    # Don't forget last entry
+    if current_entry:
+        entries.append(current_entry)
+
+    # Build structured rows from entries
+    rows: List[Dict[str, Any]] = []
+
+    for entry in entries:
+        rest = entry["rest"].strip()
+        item_no = entry["item_no"]
+
+        # Extract packaging info from parentheses
+        pack_info = ""
+        packaging_count = 1
+        pack_match = _PACKAGING_RE.search(rest)
+        if pack_match:
+            packaging_count = int(pack_match.group(1)) or 1
+            pack_unit = pack_match.group(2).upper()
+            pack_info = f"{packaging_count} {pack_unit}"
+            # Remove packaging from description
+            rest = rest[:pack_match.start()] + rest[pack_match.end():]
+            rest = re.sub(r"\s+", " ", rest).strip()
+
+        # Try to extract trailing price
+        price = None
+        price_match = _TRAILING_PRICE_RE.search(rest)
+        if price_match:
+            price = _parse_money(price_match.group(1))
+            if price is not None:
+                rest = rest[:price_match.start()].strip()
+
+        # What remains is the description
+        description = rest.strip()
+        # Clean up stray punctuation at end
+        description = re.sub(r"[\s,;:]+$", "", description)
+
+        # Skip if we have neither item_no nor meaningful description
+        if not item_no and len(description) < 4:
+            reason = "no_item_no_and_short_desc"
+            stats["discard_reasons"][reason] = stats["discard_reasons"].get(reason, 0) + 1
+            continue
+
+        # Calculate confidence
+        confidence = _calculate_confidence(item_no, description, pack_info, price)
+
+        # Skip very low confidence rows (likely OCR garbage)
+        if confidence < 0.2 and not item_no:
+            reason = "low_confidence_no_item"
+            stats["discard_reasons"][reason] = stats["discard_reasons"].get(reason, 0) + 1
+            continue
+
+        # Track stats
+        if price is not None:
+            stats["rows_with_price"] += 1
+        else:
+            stats["rows_without_price"] += 1
+        if item_no:
+            stats["rows_with_item_no"] += 1
+        else:
+            stats["rows_without_item_no"] += 1
+
+        row = {
+            "source_file": source_file,
+            "competitor": "",
+            "competitor_artnr": item_no,
+            "description": description,
+            "quantity_purchased": 1.0,
+            "packaging_text": pack_info,
+            "packaging_count": packaging_count,
+            "unit": "",
+            "price_unit": "",
+            "price_before_discount": price,
+            "discount_pct": None,
+            "line_amount": None,
+            "calculated_unit_price": price,
+            "total_units": float(packaging_count),
+            "competitor_line_amount": price,
+            # Matching placeholders
+            "our_unit_price": None,
+            "our_comparable_line_price": None,
+            "savings_amount": None,
+            # Enhanced fields
+            "source_page": entry.get("source_page", 0),
+            "raw_text": entry["raw_text"],
+            "confidence": confidence,
+            "parse_method": "generic_ocr",
+        }
+
+        rows.append(row)
+
+    return rows, stats
+
+
+def _calculate_confidence(item_no: str, description: str,
+                          pack_info: str, price: Optional[float]) -> float:
+    """Calculate a confidence score (0.0-1.0) for an extracted row.
+
+    Higher confidence when:
+    - Item number is a clean 5-9 digit number
+    - Description is meaningful text (not garbled OCR)
+    - Packaging info is present
+    - Price is present (but absence doesn't heavily penalize)
+    """
+    score = 0.0
+
+    # Item number quality
+    if item_no:
+        if re.match(r"^\d{5,9}$", item_no):
+            score += 0.35  # Clean item number
+        elif re.match(r"^\d{4,}$", item_no):
+            score += 0.25  # Somewhat valid
+        else:
+            score += 0.1
+    else:
+        score += 0.0  # No item number
+
+    # Description quality
+    if description:
+        words = [w for w in description.split() if len(w) >= 2]
+        alpha_ratio = sum(1 for c in description if c.isalpha()) / max(len(description), 1)
+
+        if len(words) >= 2 and alpha_ratio > 0.5:
+            score += 0.35  # Good description
+        elif len(words) >= 1 and alpha_ratio > 0.3:
+            score += 0.2  # Acceptable
+        else:
+            score += 0.05  # Probably garbage
+
+    # Packaging info present
+    if pack_info:
+        score += 0.15
+
+    # Price present (small bonus, not required)
+    if price is not None and price > 0:
+        score += 0.15
+
+    return min(round(score, 2), 1.0)
+
+
+# ============================================================
 # XLSX ROW EXTRACTION (generic competitor format)
 # ============================================================
 
@@ -444,43 +890,217 @@ def parse_file(filename: str, content: bytes) -> Dict[str, Any]:
 
 
 def _parse_pdf(filename: str, content: bytes, result: Dict[str, Any]) -> Dict[str, Any]:
-    """Extract text from PDF, detect source, and parse rows."""
-    try:
-        text = extract_text_from_pdf(content)
-        ocr_needed = needs_ocr(text)
-        ocr_used = False
+    """Extract text from PDF with full pipeline: text extraction -> quality check -> OCR -> parsing.
 
+    Pipeline:
+    1. Try native PDF text extraction
+    2. Assess quality of extracted text
+    3. If quality is poor, run enhanced OCR with preprocessing
+    4. Try NorEngros parser on the text
+    5. If NorEngros yields too few rows, try generic parser
+    6. Return structured rows with confidence scores
+    """
+    pipeline_log: List[str] = []
+    page_count = _count_pdf_pages(content)
+    result["page_count"] = page_count
+    pipeline_log.append(f"PDF mottatt: {filename}, {page_count} sider")
+
+    try:
+        # === Step 1: Native text extraction ===
+        pipeline_log.append("Forsøker vanlig tekstuttrekk...")
+        text = extract_text_from_pdf(content)
+        text_quality = assess_text_quality(text)
+        result["direct_text_quality"] = text_quality
+        pipeline_log.append(
+            f"Tekstuttrekk: {text_quality['char_count']} tegn, "
+            f"{text_quality['word_count']} ord, "
+            f"{text_quality['product_line_hints']} produktlinjer, "
+            f"kvalitet={text_quality['verdict']} (score={text_quality['quality_score']})"
+        )
+
+        ocr_needed = needs_ocr(text) or text_quality["verdict"] == "poor"
+        ocr_used = False
+        ocr_page_results = None
+
+        # === Step 2: OCR if needed ===
         if ocr_needed:
+            pipeline_log.append("Tekstkvalitet for lav - starter OCR med bildeprosessering...")
             try:
-                text = ocr_pdf_fallback(content)
+                ocr_page_results = ocr_pdf_pages(content)
                 ocr_used = True
+
+                # Gather stats
+                good_pages = sum(1 for p in ocr_page_results if p["quality"] == "good")
+                poor_pages = sum(1 for p in ocr_page_results if p["quality"] == "poor")
+                empty_pages = sum(1 for p in ocr_page_results if p["quality"] == "empty")
+                error_pages = sum(1 for p in ocr_page_results if p.get("error"))
+
+                pipeline_log.append(
+                    f"OCR ferdig: {good_pages} gode sider, {poor_pages} svake sider, "
+                    f"{empty_pages} tomme sider, {error_pages} feilede sider"
+                )
+
+                # Build combined text from OCR, but keep page results for tracking
+                ocr_text = "\n".join(p["text"] for p in ocr_page_results if p.get("text"))
+                ocr_quality = assess_text_quality(ocr_text)
+                result["ocr_text_quality"] = ocr_quality
+
+                pipeline_log.append(
+                    f"OCR total: {ocr_quality['char_count']} tegn, "
+                    f"{ocr_quality['word_count']} ord, "
+                    f"kvalitet={ocr_quality['verdict']}"
+                )
+
+                # Use OCR text if it's better than direct extraction
+                if ocr_quality["quality_score"] >= text_quality["quality_score"]:
+                    text = ocr_text
+                    pipeline_log.append("Bruker OCR-tekst (bedre kvalitet)")
+                else:
+                    pipeline_log.append("Beholder direkte tekstuttrekk (bedre enn OCR)")
+
+                result["ocr_page_stats"] = {
+                    "good": good_pages,
+                    "poor": poor_pages,
+                    "empty": empty_pages,
+                    "error": error_pages,
+                }
+
             except Exception as ocr_err:
-                logger.warning(f"V2: OCR-fallback feilet: {ocr_err}")
+                pipeline_log.append(f"OCR feilet: {ocr_err}")
+                logger.warning(f"V2: OCR feilet for {filename}: {ocr_err}")
 
         result["text_length"] = len(text)
         result["ocr_needed"] = ocr_needed
         result["ocr_used"] = ocr_used
-        result["text_preview"] = text[:200] if text else ""
-        result["page_count"] = _count_pdf_pages(content)
+        result["text_preview"] = text[:300] if text else ""
 
-        # Detect source and parse rows
+        # === Step 3: Detect source and parse ===
         source = detect_source(text)
         result["detected_source"] = source
+        pipeline_log.append(f"Kilde detektert: {source}")
 
+        rows: List[Dict[str, Any]] = []
+        parse_method = "none"
+
+        # Try NorEngros parser first
         if source == "norengros":
-            rows = parse_norengros_text(text, source_file=filename)
-            result["rows"] = rows
-            result["row_count"] = len(rows)
+            pipeline_log.append("Prøver NorEngros-parser...")
+            norengros_rows = parse_norengros_text(text, source_file=filename)
+            pipeline_log.append(f"NorEngros-parser: {len(norengros_rows)} rader funnet")
+
+            if norengros_rows:
+                rows = norengros_rows
+                parse_method = "norengros"
+                # Add enhanced fields to NorEngros rows
+                for r in rows:
+                    r.setdefault("source_page", 0)
+                    r.setdefault("raw_text", "")
+                    r.setdefault("confidence", 0.8)  # NorEngros rows are generally reliable
+                    r.setdefault("parse_method", "norengros")
+
+        # === Step 4: Generic parser fallback ===
+        if not rows:
+            pipeline_log.append(
+                "Ingen rader fra spesialisert parser - prøver generisk produktlinje-parser..."
+            )
+            generic_rows, generic_stats = parse_generic_product_lines(
+                text, source_file=filename, page_texts=ocr_page_results
+            )
+            pipeline_log.append(
+                f"Generisk parser: {len(generic_rows)} rader, "
+                f"{generic_stats['rows_with_price']} med pris, "
+                f"{generic_stats['rows_without_price']} uten pris, "
+                f"{generic_stats['noise_lines_skipped']} støylinjer filtrert, "
+                f"{generic_stats['continuation_lines_merged']} sammenslåtte linjer"
+            )
+
+            if generic_stats["discard_reasons"]:
+                pipeline_log.append(
+                    f"Forkastede linjer: {generic_stats['discard_reasons']}"
+                )
+
+            result["generic_parse_stats"] = generic_stats
+
+            if generic_rows:
+                rows = generic_rows
+                parse_method = "generic_ocr"
+
+        # Also try generic parser if NorEngros gave very few rows vs page count
+        elif len(rows) < page_count and page_count >= 2:
+            pipeline_log.append(
+                f"NorEngros ga kun {len(rows)} rader for {page_count} sider - "
+                f"prøver også generisk parser..."
+            )
+            generic_rows, generic_stats = parse_generic_product_lines(
+                text, source_file=filename, page_texts=ocr_page_results
+            )
+            if len(generic_rows) > len(rows):
+                pipeline_log.append(
+                    f"Generisk parser fant {len(generic_rows)} rader "
+                    f"(mer enn NorEngros: {len(rows)}) - bruker generisk resultat"
+                )
+                rows = generic_rows
+                parse_method = "generic_ocr"
+                result["generic_parse_stats"] = generic_stats
+            else:
+                pipeline_log.append(
+                    f"Generisk parser fant {len(generic_rows)} rader "
+                    f"- beholder NorEngros-resultat ({len(rows)} rader)"
+                )
+
+        result["rows"] = rows
+        result["row_count"] = len(rows)
+        result["parse_method"] = parse_method
+        result["pipeline_log"] = pipeline_log
+
+        # === Step 5: Set parse status with detailed info ===
+        if rows:
             result["parse_status"] = "parsed"
+            rows_with_price = sum(1 for r in rows if r.get("price_before_discount") is not None)
+            rows_without_price = len(rows) - rows_with_price
+            result["rows_with_price"] = rows_with_price
+            result["rows_without_price"] = rows_without_price
+            result["price_info"] = (
+                f"{rows_with_price} rader med pris, {rows_without_price} uten"
+                if rows_without_price > 0
+                else f"Alle {rows_with_price} rader har pris"
+            )
+            pipeline_log.append(
+                f"Ferdig: {len(rows)} strukturerte varelinjer "
+                f"({rows_with_price} med pris, {rows_without_price} uten pris)"
+            )
         else:
-            # Other sources not yet implemented — mark as parsed but with 0 rows
-            result["rows"] = []
-            result["row_count"] = 0
             result["parse_status"] = "parsed"
+            # Build a specific explanation of why no rows were found
+            if not text or not text.strip():
+                result["parse_warning"] = (
+                    "Kunne ikke hente ut lesbar tekst fra PDF. "
+                    "OCR ga ingen brukbare varelinjer."
+                )
+            elif ocr_used and not ocr_page_results:
+                result["parse_warning"] = (
+                    "PDF ser ut til å være bildebasert. "
+                    "OCR ble forsøkt, men resultatet var for svakt."
+                )
+            elif text_quality["verdict"] != "empty":
+                result["parse_warning"] = (
+                    "PDF analysert, men fant ingen varelinjer som matcher "
+                    "forventet format (varenummer + beskrivelse)."
+                )
+            else:
+                result["parse_warning"] = (
+                    "OCR fullført, men parsing av varetabell ga 0 strukturerte rader."
+                )
+            pipeline_log.append(f"Ingen strukturerte rader funnet. {result['parse_warning']}")
+
+        # Log the full pipeline
+        for line in pipeline_log:
+            logger.info(f"V2 PDF pipeline [{filename}]: {line}")
 
     except Exception as e:
         result["parse_status"] = "error"
         result["error"] = f"PDF-lesing feilet: {e}"
+        logger.exception(f"V2: PDF parsing feilet for {filename}")
 
     return result
 
