@@ -367,6 +367,24 @@ def _parse_job_files(job_id: str) -> None:
         f"rows={len(all_rows)}, deduped={len(deduped_rows)}"
     )
 
+    # === Auto-matching: if we have deduped rows, trigger matching automatically ===
+    if deduped_rows:
+        bundle = _get_catalog_bundle()
+        if bundle is not None:
+            logger.info(
+                f"V2 auto-match: triggering matching for job={job_id}, "
+                f"rows={len(deduped_rows)}, price_rows={rows_with_price}"
+            )
+            task["status"] = "matching"
+            _append_v2_job({"job_id": job_id, "status": "matching"})
+            # Run matching in the same background thread (we're already in one)
+            _run_matching(job_id, bundle, prefer_own_brands=True)
+        else:
+            logger.info(
+                f"V2 auto-match: katalog ikke lastet for job={job_id}, "
+                f"venter på manuell matching"
+            )
+
 
 @v2_router.get("/status/{job_id}")
 def v2_status(job_id: str):
@@ -434,9 +452,9 @@ def v2_start_matching(job_id: str, prefer_own_brands: bool = True):
     if not t:
         return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
 
-    if t["status"] not in ("parsed", "partial_error", "error"):
+    if t["status"] not in ("parsed", "partial_error", "error", "matched", "review"):
         return JSONResponse(
-            {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed' eller 'error'."},
+            {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed', 'matched', eller 'error'."},
             status_code=400,
         )
 
@@ -463,6 +481,13 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
         return
 
     deduped = task.get("deduped_rows", [])
+
+    # Log matching start with price info
+    rows_with_price = sum(1 for r in deduped if r.get("price_before_discount") is not None)
+    logger.info(
+        f"V2 matching starter: job={job_id}, rader={len(deduped)}, "
+        f"price_rows={rows_with_price}, prefer_own_brands={prefer_own_brands}"
+    )
     if not deduped:
         # Build a detailed error message explaining why there are no rows
         files = task.get("files", [])
@@ -524,6 +549,7 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
         task["no_match"] = no_match
 
         task["status"] = "matched"
+        logger.info(f"V2 matching fullført: job={job_id}, matched={matched_ok}, no_match={no_match}")
 
         # Persist matched rows
         job_dir = V2_UPLOADS_DIR / job_id
@@ -538,6 +564,7 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
             review_rows = rv.init_review(job_id, matched)
             rv.save_review(job_id, review_rows)
             task["status"] = "review"
+            logger.info(f"V2 review klar: job={job_id}, status=review — klar for gjennomgang")
         except Exception as e:
             logger.warning(f"V2: Kunne ikke initialisere review: {e}")
             # Fall back to matched status — review can be retried
@@ -1533,11 +1560,42 @@ async function pollParseStatus(jobId) {
       return;
     }
 
-    // Show match button when parsing is done
+    // If auto-matching kicked in, continue polling through matching phase
+    if (data.status === 'matching') {
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('btnMatch').disabled = true;
+      document.getElementById('matchStatus').textContent = 'Matcher automatisk...';
+      pollMatchStatus(jobId);
+      return;
+    }
+
+    // If auto-matching already completed (fast), go straight to review link
+    if (data.status === 'review' || data.status === 'matched') {
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('matchActions').innerHTML = '<a href="/v2/review/' + jobId + '/ui"><button>Apne review</button></a>';
+      loadJobs();
+      return;
+    }
+
+    // Show match button when parsing is done but auto-match didn't run
+    // (e.g. catalog not loaded yet)
     if (data.status === 'parsed' || data.status === 'partial_error') {
       document.getElementById('matchActions').style.display = 'block';
-      document.getElementById('btnMatch').disabled = false;
-      document.getElementById('matchStatus').textContent = '';
+      if (data.deduped_count > 0) {
+        document.getElementById('btnMatch').disabled = false;
+        document.getElementById('matchStatus').textContent = '';
+      } else {
+        document.getElementById('btnMatch').disabled = true;
+        document.getElementById('matchStatus').textContent =
+          'Ingen varelinjer funnet. Kan ikke starte matching.';
+      }
+    }
+
+    // Show error details
+    if (data.status === 'error') {
+      document.getElementById('matchActions').style.display = 'block';
+      document.getElementById('btnMatch').disabled = (data.deduped_count || 0) === 0;
+      document.getElementById('matchStatus').textContent = data.match_error || '';
     }
 
     loadJobs();
@@ -1550,10 +1608,10 @@ function statusLabel(s) {
   const map = {
     'uploaded': 'Lastet opp',
     'parsing': 'Analyserer...',
-    'parsed': 'Ferdig analysert',
-    'partial_error': 'Delvis feil',
-    'matching': 'Matcher...',
-    'matched': 'Matchet',
+    'parsed': 'Ferdig analysert — klar for matching',
+    'partial_error': 'Delvis feil — kan fortsatt matches',
+    'matching': 'Matcher mot katalog...',
+    'matched': 'Matching fullfort',
     'review': 'Klar for review',
     'error': 'Feil',
   };
@@ -1620,9 +1678,14 @@ async function pollMatchStatus(jobId) {
       document.getElementById('matchActions').style.display = 'block';
       document.getElementById('matchActions').innerHTML = '<a href="/v2/review/' + jobId + '/ui"><button>Apne review</button></a>';
     } else if (data.status === 'error') {
-      // Re-enable match button so user can retry
+      // Re-enable match button so user can retry (only if there are rows)
       document.getElementById('matchActions').style.display = 'block';
-      document.getElementById('btnMatch').disabled = false;
+      document.getElementById('matchActions').innerHTML =
+        '<button id="btnMatch" onclick="startMatching()"' +
+        ((data.deduped_count || 0) === 0 ? ' disabled' : '') +
+        '>Prov matching pa nytt</button>' +
+        '<span id="matchStatus" class="muted" style="margin-left:12px;">' +
+        esc(data.match_error || '') + '</span>';
     } else {
       document.getElementById('matchActions').style.display = 'none';
     }
