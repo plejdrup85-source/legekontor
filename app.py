@@ -701,7 +701,8 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
     if "epion" in low:
         rows: List[Dict[str, Any]] = []
 
-        # Finn header-linje for varetabellen
+        # --- Strategy A: Traditional Epion invoice table format ---
+        # Header: "Beskrivelse  Antall  Enh.pris  Beløp eks. mva  MVA  Beløp inkl. mva"
         start = 0
         for i, l in enumerate(lines):
             ll = l.lower()
@@ -757,6 +758,93 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 "Konkurrent Item Description": desc,
                 "Konkurrent Specification": "",
                 "Antall": qty if qty else "",
+                "Konkurrent salgsenhet": "",
+                "Konkurrent Pris": unit_price if unit_price is not None else "",
+            })
+
+        if rows:
+            return rows
+
+        # --- Strategy B: Epion order confirmation (card layout) ---
+        # Products displayed as:
+        #   Product Name
+        #   NN stk. pr. pakke
+        #   N/N sendt
+        #   unit_price,-   X qty   total,-
+        _epion_pqt_re = re.compile(
+            r"(\d[\d\s.]*),[-–]\s+X\s*(\d+)\s+(\d[\d\s.]*),[-–]"
+        )
+        _epion_price_only = re.compile(r"^(\d[\d\s.]*),[-–]\s*$")
+        _epion_qty_only = re.compile(r"^X\s*(\d+)\s*$")
+        _epion_delivery = re.compile(r"^\d+/\d+\s+sendt\s*$", re.IGNORECASE)
+        _epion_pack_line = re.compile(
+            r"(\d+)\s+(?:(?:stk|rull|pk)\.?\s+)?pr\.?\s*pakke", re.IGNORECASE
+        )
+        _epion_skip_kw = [
+            "ordre #", "fullført", "ordr.dato", "sist oppdatert", "varer sendt",
+            "bestilt", "faktura", "totaloversikt", "alle varer", "delleveranse",
+            "bruksanvisning", "epion faqs", "brosjyre", "https://epion", "epion.no",
+            "sum eks", "frakt", "totalpris",
+        ]
+
+        # Merge multi-line price patterns
+        merged: List[str] = []
+        idx = 0
+        while idx < len(lines):
+            l = lines[idx]
+            if _epion_price_only.match(l) and idx + 2 < len(lines):
+                n1, n2 = lines[idx + 1], lines[idx + 2]
+                if _epion_qty_only.match(n1) and _epion_price_only.match(n2):
+                    merged.append(f"{l} {n1} {n2}")
+                    idx += 3
+                    continue
+            if idx + 1 < len(lines):
+                combo = f"{l} {lines[idx + 1]}"
+                if _epion_pqt_re.search(combo):
+                    merged.append(combo)
+                    idx += 2
+                    continue
+            merged.append(l)
+            idx += 1
+
+        # Find price lines and look back for descriptions
+        for pi, ml in enumerate(merged):
+            m3 = _epion_pqt_re.search(ml)
+            if not m3:
+                continue
+
+            up_raw = m3.group(1).replace(" ", "").replace(".", "")
+            qty_val = int(m3.group(2))
+            unit_price = _parse_money_local(up_raw)
+
+            desc_parts: List[str] = []
+            j = pi - 1
+            lookback = 0
+            while j >= 0 and lookback < 6:
+                prev = merged[j].strip()
+                prev_low = prev.lower()
+                if _epion_pqt_re.search(prev):
+                    break
+                if any(k in prev_low for k in _epion_skip_kw) or _looks_like_total(prev_low):
+                    j -= 1; lookback += 1; continue
+                if _epion_delivery.match(prev):
+                    j -= 1; lookback += 1; continue
+                if _epion_pack_line.search(prev):
+                    j -= 1; lookback += 1; continue
+                if len(prev) >= 3 and len(desc_parts) < 2:
+                    desc_parts.insert(0, prev)
+                j -= 1; lookback += 1
+
+            desc = " ".join(desc_parts).strip()
+            if not desc or desc.lower().startswith("frakt"):
+                continue
+
+            rows.append({
+                "Konkurrent Navn": "Epion",
+                "Konkurrent Art.Nr": "",
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Antall": float(qty_val) if qty_val else "",
                 "Konkurrent salgsenhet": "",
                 "Konkurrent Pris": unit_price if unit_price is not None else "",
             })

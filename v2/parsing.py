@@ -487,6 +487,206 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
 
 
 # ============================================================
+# EPION ORDER CONFIRMATION PARSER
+# ============================================================
+# Epion order confirmations (from epion.no/ordrer/XXXXX) display
+# products in a card layout:
+#
+#   Product Name
+#   NN stk. pr. pakke       (optional packaging info)
+#   N/N sendt               (delivery status)
+#   unit_price,-   X qty   total,-
+#
+# Price format uses ",-" suffix (no øre): "1 635,-", "60,-"
+# The summary section has "Sum eks. mva", "Frakt", "MVA", "Totalpris".
+
+# Price+qty+total on one line: "835,- X 5 4 175,-"
+_EPION_PRICE_QTY_TOTAL_RE = re.compile(
+    r"(\d[\d\s.]*),[-–]\s+X\s*(\d+)\s+(\d[\d\s.]*),[-–]"
+)
+
+# Just a standalone price: "835,-" or "1 317,-"
+_EPION_PRICE_ONLY_RE = re.compile(r"^(\d[\d\s.]*),[-–]\s*$")
+
+# Just a quantity: "X 5" or "X 10"
+_EPION_QTY_ONLY_RE = re.compile(r"^X\s*(\d+)\s*$")
+
+# Packaging info: "100 stk. pr. pakke", "2 rull pr. pakke", "100 pr. pakke"
+_EPION_PACK_LINE_RE = re.compile(
+    r"(\d+)\s+(?:(?:stk|rull|pk)\.?\s+)?pr\.?\s*pakke", re.IGNORECASE
+)
+
+# Delivery status: "N/N sendt"
+_EPION_DELIVERY_RE = re.compile(r"^\d+/\d+\s+sendt\s*$", re.IGNORECASE)
+
+# Packaging in product name parentheses: "(100 stk)", "(15 stk)", "(200 stk)"
+_EPION_PACK_IN_NAME_RE = re.compile(r"\((\d+)\s*(stk|pk|rull)\)", re.IGNORECASE)
+
+# Keywords marking lines to skip (metadata, navigation, summaries)
+_EPION_SKIP_KEYWORDS = [
+    "ordre #", "fullført", "ordr.dato", "sist oppdatert", "varer sendt",
+    "bestilt av", "bestilt:", "faktura og sending", "faktura for",
+    "totaloversikt", "alle varer", "delleveranse", "bruksanvisning",
+    "epion faqs", "brosjyre", "https://epion", "epion.no",
+    "sum eks", "frakt", "totalpris",
+]
+
+
+def _epion_should_skip(line_low: str) -> bool:
+    """Check if a line is Epion metadata/navigation that should be skipped."""
+    return any(kw in line_low for kw in _EPION_SKIP_KEYWORDS)
+
+
+def parse_epion_text(text: str, source_file: str) -> List[Dict[str, Any]]:
+    """Parse Epion order confirmation text into structured V2 rows.
+
+    Handles both single-line and multi-line price patterns from PDF extraction.
+    Returns list of row dicts in the standard V2 format.
+    """
+    raw_lines = [re.sub(r"\s+", " ", (l or "")).strip() for l in text.splitlines()]
+    raw_lines = [l for l in raw_lines if l]
+
+    # --- Phase 1: Merge multi-line price patterns ---
+    # PDF text extraction may split "835,- X 5 4 175,-" across 2-3 lines
+    lines: List[str] = []
+    i = 0
+    while i < len(raw_lines):
+        line = raw_lines[i]
+
+        # Try 3-line merge: "price,-" + "X qty" + "total,-"
+        if _EPION_PRICE_ONLY_RE.match(line) and i + 2 < len(raw_lines):
+            next1 = raw_lines[i + 1]
+            next2 = raw_lines[i + 2]
+            if _EPION_QTY_ONLY_RE.match(next1) and _EPION_PRICE_ONLY_RE.match(next2):
+                lines.append(f"{line} {next1} {next2}")
+                i += 3
+                continue
+
+        # Try 2-line merge: "price,- X qty" + "total,-" or "price,-" + "X qty total,-"
+        if i + 1 < len(raw_lines):
+            combined = f"{line} {raw_lines[i + 1]}"
+            if _EPION_PRICE_QTY_TOTAL_RE.search(combined):
+                lines.append(combined)
+                i += 2
+                continue
+
+        lines.append(line)
+        i += 1
+
+    # --- Phase 2: Find product blocks anchored by price lines ---
+    rows: List[Dict[str, Any]] = []
+    price_indices: List[int] = []
+
+    for idx, line in enumerate(lines):
+        if _EPION_PRICE_QTY_TOTAL_RE.search(line):
+            price_indices.append(idx)
+
+    for pi in price_indices:
+        m = _EPION_PRICE_QTY_TOTAL_RE.search(lines[pi])
+        if not m:
+            continue
+
+        # Parse price values (remove thousands separators)
+        unit_price_raw = m.group(1).replace(" ", "").replace(".", "")
+        qty = int(m.group(2))
+        total_raw = m.group(3).replace(" ", "").replace(".", "")
+
+        unit_price = _to_float(unit_price_raw)
+        total = _to_float(total_raw)
+
+        # --- Look backwards to find product name and packaging ---
+        packaging_text = ""
+        packaging_count = 1
+        desc_parts: List[str] = []
+
+        j = pi - 1
+        lookback = 0
+        while j >= 0 and lookback < 6:
+            prev = lines[j].strip()
+            prev_low = prev.lower()
+
+            # Stop at another price line (start of previous product)
+            if _EPION_PRICE_QTY_TOTAL_RE.search(prev):
+                break
+
+            # Skip metadata/noise lines
+            if _epion_should_skip(prev_low) or _looks_like_total(prev_low):
+                j -= 1
+                lookback += 1
+                continue
+
+            # Skip delivery status lines (e.g. "5/5 sendt")
+            if _EPION_DELIVERY_RE.match(prev):
+                j -= 1
+                lookback += 1
+                continue
+
+            # Check for packaging info line (e.g. "100 stk. pr. pakke")
+            pack_m = _EPION_PACK_LINE_RE.search(prev)
+            if pack_m and packaging_count == 1:
+                packaging_count = int(pack_m.group(1)) or 1
+                packaging_text = prev
+                j -= 1
+                lookback += 1
+                continue
+
+            # This is likely a description line (take up to 2)
+            if len(prev) >= 3 and len(desc_parts) < 2:
+                desc_parts.insert(0, prev)
+
+            j -= 1
+            lookback += 1
+
+        description = " ".join(desc_parts).strip()
+
+        if not description:
+            continue
+
+        # Extract packaging from description parentheses if not found separately
+        if packaging_count == 1:
+            pack_in_name = _EPION_PACK_IN_NAME_RE.search(description)
+            if pack_in_name:
+                packaging_count = int(pack_in_name.group(1)) or 1
+
+        # --- Calculate derived fields ---
+        total_units = float(qty * packaging_count)
+        competitor_line_amount = total if total else (
+            round(unit_price * qty, 2) if unit_price else None
+        )
+        calculated_unit_price = (
+            round(unit_price / packaging_count, 4)
+            if unit_price and packaging_count > 0 else unit_price
+        )
+
+        rows.append({
+            "source_file": source_file,
+            "competitor": "Epion",
+            "competitor_artnr": "",
+            "description": description,
+            "quantity_purchased": float(qty),
+            "packaging_text": packaging_text,
+            "packaging_count": packaging_count,
+            "unit": "",
+            "price_unit": "",
+            "price_before_discount": unit_price,
+            "discount_pct": None,
+            "line_amount": total,
+            "calculated_unit_price": calculated_unit_price,
+            "total_units": total_units,
+            "competitor_line_amount": competitor_line_amount,
+            "our_unit_price": None,
+            "our_comparable_line_price": None,
+            "savings_amount": None,
+            "source_page": 0,
+            "raw_text": lines[pi],
+            "confidence": 0.85,
+            "parse_method": "epion",
+        })
+
+    return rows
+
+
+# ============================================================
 # GENERIC PRODUCT LINE PARSER (for scanned / unknown sources)
 # ============================================================
 # Handles product lists where lines may contain:
@@ -897,8 +1097,9 @@ def _parse_pdf(filename: str, content: bytes, result: Dict[str, Any]) -> Dict[st
     2. Assess quality of extracted text
     3. If quality is poor, run enhanced OCR with preprocessing
     4. Try NorEngros parser on the text
-    5. If NorEngros yields too few rows, try generic parser
-    6. Return structured rows with confidence scores
+    5. Try Epion parser for Epion order confirmations
+    6. If no specialized parser matched, try generic parser
+    7. Return structured rows with confidence scores
     """
     pipeline_log: List[str] = []
     page_count = _count_pdf_pages(content)
@@ -997,6 +1198,16 @@ def _parse_pdf(filename: str, content: bytes, result: Dict[str, Any]) -> Dict[st
                     r.setdefault("raw_text", "")
                     r.setdefault("confidence", 0.8)  # NorEngros rows are generally reliable
                     r.setdefault("parse_method", "norengros")
+
+        # Try Epion parser for Epion order confirmations
+        if not rows and source == "epion":
+            pipeline_log.append("Prøver Epion-parser...")
+            epion_rows = parse_epion_text(text, source_file=filename)
+            pipeline_log.append(f"Epion-parser: {len(epion_rows)} rader funnet")
+
+            if epion_rows:
+                rows = epion_rows
+                parse_method = "epion"
 
         # === Step 4: Generic parser fallback ===
         if not rows:
