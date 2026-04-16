@@ -570,7 +570,7 @@ def _ocr_pdf_fallback(pdf_bytes: bytes) -> str:
     parts = []
     try:
         for page in doc:
-            mat = fitz.Matrix(2.0, 2.0)
+            mat = fitz.Matrix(4.17, 4.17)  # ~300 DPI for Tesseract
             pix = page.get_pixmap(matrix=mat)
             img = Image.open(_BytesIO(pix.tobytes("png")))
             t = pytesseract.image_to_string(img, lang="nor+eng")
