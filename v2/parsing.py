@@ -546,9 +546,21 @@ _EPION_SKIP_KEYWORDS = [
 _EPION_SUMMARY_KEYWORDS = ["sum eks", "totalpris ink"]
 
 
+# Date/timestamp lines: "14.04.2026, 13:34" or "14.04.2026"
+_EPION_DATE_RE = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}")
+# Page numbers: "2/4", "3/4", "1/4" at end of line, or "Side N"
+_EPION_PAGENO_RE = re.compile(r"^\d+/\d+\s*$|^\s*side\s+\d+", re.IGNORECASE)
+
+
 def _epion_should_skip(line_low: str) -> bool:
     """Check if a line is Epion metadata/navigation that should be skipped."""
-    return any(kw in line_low for kw in _EPION_SKIP_KEYWORDS)
+    if any(kw in line_low for kw in _EPION_SKIP_KEYWORDS):
+        return True
+    if _EPION_DATE_RE.match(line_low):
+        return True
+    if _EPION_PAGENO_RE.match(line_low):
+        return True
+    return False
 
 
 def _epion_is_summary(line_low: str) -> bool:
@@ -660,8 +672,12 @@ def _epion_strategy_price_anchor(
             lines, pi
         )
 
+        # Use packaging text or a placeholder if description is empty
+        # (happens when product name is handwritten and OCR fails)
+        if not desc and packaging_text:
+            desc = packaging_text
         if not desc:
-            continue
+            desc = f"Ukjent produkt (linje: {lines[pi][:40]})"
 
         rows.append(_build_epion_row(
             desc, qty, unit_price, total, packaging_text, packaging_count,
@@ -753,7 +769,7 @@ def _epion_strategy_delivery_anchor(
 
         j = i - 1
         lookback = 0
-        while j >= 0 and lookback < 6:
+        while j >= 0 and lookback < 10:
             prev = raw_lines[j].strip()
             prev_low = prev.lower()
 
@@ -790,8 +806,12 @@ def _epion_strategy_delivery_anchor(
             lookback += 1
 
         description = " ".join(desc_parts).strip()
+
+        # Use packaging text or placeholder if description is empty
+        if not description and packaging_text:
+            description = packaging_text
         if not description:
-            continue
+            description = f"Ukjent produkt (linje: {raw_lines[i][:40]})"
 
         # Extract packaging from description parentheses
         if packaging_count == 1:
@@ -817,7 +837,7 @@ def _epion_lookback_description(
 
     j = price_idx - 1
     lookback = 0
-    while j >= 0 and lookback < 6:
+    while j >= 0 and lookback < 10:
         prev = lines[j].strip()
         prev_low = prev.lower()
 
@@ -1273,11 +1293,23 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
 # ============================================================
 
 def detect_source(text: str) -> str:
-    """Detect invoice source from extracted text. Returns source name or 'unknown'."""
+    """Detect invoice source from extracted text. Returns source name or 'unknown'.
+
+    For Epion, also checks for the distinctive price pattern (N,- X N N,-)
+    because OCR on scanned pages may fail to read the 'Epion' brand text.
+    """
     low = text.lower()
     if "norengros" in low:
         return "norengros"
     if "epion" in low:
+        return "epion"
+    # Fallback: detect Epion by its unique price+qty pattern and delivery status
+    # Pattern: "N,- X N N,-" with delivery status "N/N sendt"
+    has_epion_prices = bool(re.search(
+        r"\d[\d\s.]*,[" + _DASH_CHARS + r"]\s*[" + _MULT_CHARS + r"]\s*\d+", text
+    ))
+    has_delivery_status = bool(re.search(r"\d+/\d+\s+sendt", low))
+    if has_epion_prices and has_delivery_status:
         return "epion"
     return "unknown"
 
@@ -1430,6 +1462,24 @@ def _parse_pdf(filename: str, content: bytes, result: Dict[str, Any]) -> Dict[st
             if epion_rows:
                 rows = epion_rows
                 parse_method = "epion"
+
+        # Try Epion parser even for unknown sources if text has Epion-like patterns
+        # (OCR on scanned pages may fail to read the 'Epion' brand text)
+        if not rows and source == "unknown":
+            has_delivery = bool(re.search(r"\d+/\d+\s+sendt", text, re.IGNORECASE))
+            has_price_x = bool(re.search(
+                r"\d[,.][-–—−]\s*[Xx×]\s*\d", text
+            ))
+            if has_delivery and has_price_x:
+                pipeline_log.append(
+                    "Kilde ukjent, men tekst inneholder Epion-lignende mønster "
+                    "(leveringsstatus + prismønster) - prøver Epion-parser..."
+                )
+                epion_rows = parse_epion_text(text, source_file=filename)
+                pipeline_log.append(f"Epion-parser (fallback): {len(epion_rows)} rader funnet")
+                if epion_rows:
+                    rows = epion_rows
+                    parse_method = "epion_fallback"
 
         # === Step 4: Generic parser fallback ===
         if not rows:
