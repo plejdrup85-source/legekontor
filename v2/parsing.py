@@ -178,7 +178,9 @@ def assess_text_quality(text: str) -> Dict[str, Any]:
 def _preprocess_image_for_ocr(img):
     """Apply image preprocessing to improve OCR quality.
 
-    Steps: grayscale, contrast enhancement, thresholding, optional deskew.
+    Steps: grayscale, moderate contrast enhancement, sharpen.
+    NOTE: No binary thresholding — it destroys anti-aliased text from
+    browser-to-PDF printouts and reduces Tesseract accuracy.
     """
     from PIL import ImageEnhance, ImageFilter
 
@@ -186,20 +188,12 @@ def _preprocess_image_for_ocr(img):
     if img.mode != "L":
         img = img.convert("L")
 
-    # Enhance contrast
+    # Moderate contrast enhancement (1.8 was too aggressive with thresholding)
     enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(1.8)
+    img = enhancer.enhance(1.4)
 
-    # Sharpen slightly
+    # Sharpen slightly to help with scanned text edges
     img = img.filter(ImageFilter.SHARPEN)
-
-    # Apply adaptive-like thresholding via simple threshold
-    # Convert to binary: pixels above threshold become white, below become black
-    threshold = 140
-    img = img.point(lambda x: 255 if x > threshold else 0, mode="1")
-
-    # Convert back to L mode for tesseract
-    img = img.convert("L")
 
     return img
 
@@ -231,8 +225,8 @@ def ocr_pdf_pages(pdf_bytes: bytes) -> List[Dict[str, Any]]:
             page_result = {"page": page_num + 1, "text": "", "char_count": 0,
                            "quality": "empty", "error": None}
             try:
-                # Render at 2.5x for better OCR (higher than old 2.0x)
-                mat = fitz.Matrix(2.5, 2.5)
+                # Render at ~300 DPI for Tesseract (72 * 4.17 ≈ 300)
+                mat = fitz.Matrix(4.17, 4.17)
                 pix = page.get_pixmap(matrix=mat)
                 img = Image.open(_BytesIO(pix.tobytes("png")))
 
@@ -1232,47 +1226,146 @@ def _calculate_confidence(item_no: str, description: str,
 # XLSX ROW EXTRACTION (generic competitor format)
 # ============================================================
 
+def _match_xlsx_column(actual_columns: List[str], candidates: List[str]) -> Optional[str]:
+    """Find which actual column name matches any of the candidate names (case-insensitive).
+
+    Returns the actual column name or None if no match found.
+    """
+    for actual in actual_columns:
+        actual_low = str(actual).strip().lower()
+        for cand in candidates:
+            if actual_low == cand.lower():
+                return str(actual).strip()
+    # Fuzzy: check if any candidate is contained in actual column name
+    for actual in actual_columns:
+        actual_low = str(actual).strip().lower()
+        for cand in candidates:
+            if cand.lower() in actual_low:
+                return str(actual).strip()
+    return None
+
+
 def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
     """
-    Read rows from an XLSX file in the standard competitor input format.
+    Read rows from an XLSX file with flexible column name matching.
 
-    Expected columns (flexible matching):
-      Konkurrent Navn, Konkurrent Art.Nr, Konkurrent Item Description,
-      Konkurrent Specification, Konkurrent Pris, Konkurrent salgsenhet, Antall
+    Recognizes multiple variants of column names (Norwegian/English, with/without
+    'Konkurrent' prefix, different casing). Falls back to positional reading
+    if no columns match the expected names.
     """
     try:
         df = pd.read_excel(BytesIO(content), engine="openpyxl")
     except Exception as e:
         raise ValueError(f"Kunne ikke lese XLSX: {e}")
 
+    if df.empty:
+        return []
+
+    actual_cols = [str(c).strip() for c in df.columns.tolist()]
+
+    # Map each logical field to a list of possible column name variants
+    _COL_VARIANTS = {
+        "competitor": [
+            "Konkurrent Navn", "Konkurrent", "Leverandør", "Supplier",
+            "Competitor", "Kilde", "Firma",
+        ],
+        "artnr": [
+            "Konkurrent Art.Nr", "Art.Nr", "Artikkelnr", "Artikkel",
+            "Art.nr", "Varenr", "Varenummer", "Item No", "SKU",
+            "Konkurrent Artikkelnummer",
+        ],
+        "description": [
+            "Konkurrent Item Description", "Item Description", "Beskrivelse",
+            "Produktnavn", "Produkt", "Description", "Varenavn", "Navn",
+            "Konkurrent Beskrivelse",
+        ],
+        "specification": [
+            "Konkurrent Specification", "Specification", "Spesifikasjon",
+            "Spec", "Detaljer",
+        ],
+        "price": [
+            "Konkurrent Pris", "Pris", "Price", "Enhetspris", "Stk.pris",
+            "Stkpris", "Unit Price",
+        ],
+        "unit": [
+            "Konkurrent salgsenhet", "Salgsenhet", "Enhet", "Unit",
+            "Pakningsenhet",
+        ],
+        "quantity": [
+            "Antall", "Kvantum", "Quantity", "Qty", "Mengde", "Ant",
+            "Bestilt antall",
+        ],
+    }
+
+    # Resolve actual column names for each field
+    col_map = {}
+    for field, variants in _COL_VARIANTS.items():
+        col_map[field] = _match_xlsx_column(actual_cols, variants)
+
+    # If no description or artnr column found, try positional fallback:
+    # assume first text-heavy column is description
+    if not col_map["description"] and not col_map["artnr"]:
+        logger.info(
+            f"XLSX {source_file}: Ingen kjente kolonner funnet "
+            f"(kolonner: {actual_cols}). Prøver posisjonell fallback."
+        )
+        # Find first column with mostly string values
+        for c in actual_cols:
+            sample = df[c].dropna().head(5)
+            if len(sample) > 0 and all(isinstance(v, str) for v in sample):
+                col_map["description"] = c
+                break
+        # Find first numeric column for price
+        for c in actual_cols:
+            if c == col_map.get("description"):
+                continue
+            sample = df[c].dropna().head(5)
+            if len(sample) > 0:
+                try:
+                    [float(v) for v in sample]
+                    col_map["price"] = c
+                    break
+                except (ValueError, TypeError):
+                    continue
+
+    logger.debug(f"XLSX column mapping for {source_file}: {col_map}")
+
     rows: List[Dict[str, Any]] = []
 
     for idx, r in df.iterrows():
         row_dict = r.to_dict()
-        desc = str(row_dict.get("Konkurrent Item Description", "") or "").strip()
-        art = str(row_dict.get("Konkurrent Art.Nr", "") or "").strip()
+
+        def _get(field: str, default: str = "") -> str:
+            col = col_map.get(field)
+            if col is None:
+                return default
+            val = row_dict.get(col)
+            if val is None or (isinstance(val, float) and pd.isna(val)):
+                return default
+            return str(val).strip()
+
+        desc = _get("description")
+        art = _get("artnr")
 
         if not desc and not art:
             continue
 
-        price = _to_float(row_dict.get("Konkurrent Pris"))
-        qty = _to_float(row_dict.get("Antall"))
+        price = _to_float(_get("price")) if col_map.get("price") else None
+        qty = _to_float(_get("quantity")) if col_map.get("quantity") else None
 
         qty_val = qty if qty else 0.0
-        # For generic XLSX: no packaging info, so total_units = quantity
         total_units = qty_val * 1  # packaging_count = 1
-        # competitor_line_amount: qty × price if available
         competitor_line_amount = round(qty_val * price, 2) if (price is not None and qty_val) else None
 
         rows.append({
             "source_file": source_file,
-            "competitor": str(row_dict.get("Konkurrent Navn", "") or "").strip(),
+            "competitor": _get("competitor"),
             "competitor_artnr": art,
             "description": desc,
             "quantity_purchased": qty_val,
             "packaging_text": "",
             "packaging_count": 1,
-            "unit": str(row_dict.get("Konkurrent salgsenhet", "") or "").strip(),
+            "unit": _get("unit"),
             "price_unit": "",
             "price_before_discount": price,
             "discount_pct": None,
