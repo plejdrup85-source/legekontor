@@ -499,25 +499,37 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
 #
 # Price format uses ",-" suffix (no øre): "1 635,-", "60,-"
 # The summary section has "Sum eks. mva", "Frakt", "MVA", "Totalpris".
+#
+# IMPORTANT: Epion's web pages use × (multiplication sign U+00D7) for
+# quantity, not the letter X. PDF extraction may also produce various
+# dash characters (en dash, em dash, minus sign) for the ",-" suffix.
+
+# Unicode-safe character classes for Epion patterns
+_DASH_CHARS = r"\-\–\—\−"           # hyphen, en-dash, em-dash, minus sign
+_MULT_CHARS = r"Xx×✕"               # letter X, lowercase x, multiplication sign, heavy mult X
 
 # Price+qty+total on one line: "835,- X 5 4 175,-"
 _EPION_PRICE_QTY_TOTAL_RE = re.compile(
-    r"(\d[\d\s.]*),[-–]\s+X\s*(\d+)\s+(\d[\d\s.]*),[-–]"
+    r"(\d[\d\s.]*)[,.]([" + _DASH_CHARS + r"])\s*[" + _MULT_CHARS + r"]\s*(\d+)\s+(\d[\d\s.]*)[,.]([" + _DASH_CHARS + r"])"
 )
 
 # Just a standalone price: "835,-" or "1 317,-"
-_EPION_PRICE_ONLY_RE = re.compile(r"^(\d[\d\s.]*),[-–]\s*$")
+_EPION_PRICE_ONLY_RE = re.compile(
+    r"^(\d[\d\s.]*)[,.]([" + _DASH_CHARS + r"])\s*$"
+)
 
-# Just a quantity: "X 5" or "X 10"
-_EPION_QTY_ONLY_RE = re.compile(r"^X\s*(\d+)\s*$")
+# Just a quantity: "X 5", "× 10", "x 3"
+_EPION_QTY_ONLY_RE = re.compile(
+    r"^[" + _MULT_CHARS + r"]\s*(\d+)\s*$"
+)
 
 # Packaging info: "100 stk. pr. pakke", "2 rull pr. pakke", "100 pr. pakke"
 _EPION_PACK_LINE_RE = re.compile(
     r"(\d+)\s+(?:(?:stk|rull|pk)\.?\s+)?pr\.?\s*pakke", re.IGNORECASE
 )
 
-# Delivery status: "N/N sendt"
-_EPION_DELIVERY_RE = re.compile(r"^\d+/\d+\s+sendt\s*$", re.IGNORECASE)
+# Delivery status: "N/N sendt" — flexible (may have surrounding text)
+_EPION_DELIVERY_RE = re.compile(r"\d+/\d+\s+sendt", re.IGNORECASE)
 
 # Packaging in product name parentheses: "(100 stk)", "(15 stk)", "(200 stk)"
 _EPION_PACK_IN_NAME_RE = re.compile(r"\((\d+)\s*(stk|pk|rull)\)", re.IGNORECASE)
@@ -528,8 +540,10 @@ _EPION_SKIP_KEYWORDS = [
     "bestilt av", "bestilt:", "faktura og sending", "faktura for",
     "totaloversikt", "alle varer", "delleveranse", "bruksanvisning",
     "epion faqs", "brosjyre", "https://epion", "epion.no",
-    "sum eks", "frakt", "totalpris",
 ]
+
+# Summary-section keywords (separate from product-level skip)
+_EPION_SUMMARY_KEYWORDS = ["sum eks", "totalpris ink"]
 
 
 def _epion_should_skip(line_low: str) -> bool:
@@ -537,32 +551,80 @@ def _epion_should_skip(line_low: str) -> bool:
     return any(kw in line_low for kw in _EPION_SKIP_KEYWORDS)
 
 
+def _epion_is_summary(line_low: str) -> bool:
+    """Check if a line starts the summary section (Sum eks. mva, Totalpris)."""
+    return any(kw in line_low for kw in _EPION_SUMMARY_KEYWORDS)
+
+
+def _epion_is_price_only(line: str) -> bool:
+    """Check if a line is just a standalone price like '835,-' or '1 317,-'."""
+    return bool(_EPION_PRICE_ONLY_RE.match(line.strip()))
+
+
+def _epion_is_qty_only(line: str) -> bool:
+    """Check if a line is just a quantity like 'X 5' or '× 10'."""
+    return bool(_EPION_QTY_ONLY_RE.match(line.strip()))
+
+
+def _epion_extract_price(text: str) -> Optional[float]:
+    """Extract a price value from text like '835,-' or '1 317,-'."""
+    m = re.search(r"(\d[\d\s.]*)[,.][" + _DASH_CHARS + r"]", text)
+    if m:
+        raw = m.group(1).replace(" ", "").replace(".", "")
+        return _to_float(raw)
+    return None
+
+
+def _epion_extract_qty(text: str) -> Optional[int]:
+    """Extract quantity from text like 'X 5' or '× 10'."""
+    m = re.search(r"[" + _MULT_CHARS + r"]\s*(\d+)", text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 def parse_epion_text(text: str, source_file: str) -> List[Dict[str, Any]]:
     """Parse Epion order confirmation text into structured V2 rows.
 
-    Handles both single-line and multi-line price patterns from PDF extraction.
+    Uses two strategies:
+    1. Primary: Anchor on "price,- × qty total,-" lines (handles multi-line splits)
+    2. Fallback: Anchor on "N/N sendt" delivery status lines and find prices nearby
+
     Returns list of row dicts in the standard V2 format.
     """
     raw_lines = [re.sub(r"\s+", " ", (l or "")).strip() for l in text.splitlines()]
     raw_lines = [l for l in raw_lines if l]
 
+    rows = _epion_strategy_price_anchor(raw_lines, source_file)
+
+    # Fallback: use delivery status as anchor if price-line strategy found nothing
+    if not rows:
+        rows = _epion_strategy_delivery_anchor(raw_lines, source_file)
+
+    return rows
+
+
+def _epion_strategy_price_anchor(
+    raw_lines: List[str], source_file: str
+) -> List[Dict[str, Any]]:
+    """Strategy 1: Find products by anchoring on price+qty+total lines."""
+
     # --- Phase 1: Merge multi-line price patterns ---
-    # PDF text extraction may split "835,- X 5 4 175,-" across 2-3 lines
     lines: List[str] = []
     i = 0
     while i < len(raw_lines):
         line = raw_lines[i]
 
         # Try 3-line merge: "price,-" + "X qty" + "total,-"
-        if _EPION_PRICE_ONLY_RE.match(line) and i + 2 < len(raw_lines):
+        if _epion_is_price_only(line) and i + 2 < len(raw_lines):
             next1 = raw_lines[i + 1]
             next2 = raw_lines[i + 2]
-            if _EPION_QTY_ONLY_RE.match(next1) and _EPION_PRICE_ONLY_RE.match(next2):
+            if _epion_is_qty_only(next1) and _epion_is_price_only(next2):
                 lines.append(f"{line} {next1} {next2}")
                 i += 3
                 continue
 
-        # Try 2-line merge: "price,- X qty" + "total,-" or "price,-" + "X qty total,-"
+        # Try 2-line merge in both directions
         if i + 1 < len(raw_lines):
             combined = f"{line} {raw_lines[i + 1]}"
             if _EPION_PRICE_QTY_TOTAL_RE.search(combined):
@@ -586,42 +648,132 @@ def parse_epion_text(text: str, source_file: str) -> List[Dict[str, Any]]:
         if not m:
             continue
 
-        # Parse price values (remove thousands separators)
+        # Parse price values (groups: 1=unit_price, 2=dash, 3=qty, 4=total, 5=dash)
         unit_price_raw = m.group(1).replace(" ", "").replace(".", "")
-        qty = int(m.group(2))
-        total_raw = m.group(3).replace(" ", "").replace(".", "")
+        qty = int(m.group(3))
+        total_raw = m.group(4).replace(" ", "").replace(".", "")
 
         unit_price = _to_float(unit_price_raw)
         total = _to_float(total_raw)
 
-        # --- Look backwards to find product name and packaging ---
+        desc, packaging_text, packaging_count = _epion_lookback_description(
+            lines, pi
+        )
+
+        if not desc:
+            continue
+
+        rows.append(_build_epion_row(
+            desc, qty, unit_price, total, packaging_text, packaging_count,
+            source_file, lines[pi],
+        ))
+
+    return rows
+
+
+def _epion_strategy_delivery_anchor(
+    raw_lines: List[str], source_file: str
+) -> List[Dict[str, Any]]:
+    """Strategy 2: Find products by anchoring on 'N/N sendt' delivery status lines.
+
+    Each product block in Epion order confirmations has a delivery status line.
+    We find these, then look above for the product name/packaging and below
+    for the price information.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    for i, line in enumerate(raw_lines):
+        if not _EPION_DELIVERY_RE.search(line):
+            continue
+
+        # Stop if we've reached the summary section
+        if _epion_is_summary(line.lower()):
+            break
+
+        # --- Look below for price and quantity ---
+        unit_price = None
+        qty = None
+        total = None
+
+        # Check remaining text on the delivery status line itself
+        # (sometimes price is on the same line)
+        pqt_m = _EPION_PRICE_QTY_TOTAL_RE.search(line)
+        if pqt_m:
+            unit_price_raw = pqt_m.group(1).replace(" ", "").replace(".", "")
+            qty = int(pqt_m.group(3))
+            total_raw = pqt_m.group(4).replace(" ", "").replace(".", "")
+            unit_price = _to_float(unit_price_raw)
+            total = _to_float(total_raw)
+        else:
+            # Look at lines below for price info (within 4 lines)
+            prices_found: List[float] = []
+            for k in range(i + 1, min(i + 5, len(raw_lines))):
+                below = raw_lines[k]
+                below_low = below.lower()
+
+                # Stop at next delivery status or summary
+                if _EPION_DELIVERY_RE.search(below) or _epion_is_summary(below_low):
+                    break
+
+                # Check for full price+qty+total line
+                pqt_m2 = _EPION_PRICE_QTY_TOTAL_RE.search(below)
+                if pqt_m2:
+                    unit_price_raw = pqt_m2.group(1).replace(" ", "").replace(".", "")
+                    qty = int(pqt_m2.group(3))
+                    total_raw = pqt_m2.group(4).replace(" ", "").replace(".", "")
+                    unit_price = _to_float(unit_price_raw)
+                    total = _to_float(total_raw)
+                    break
+
+                # Check for standalone components
+                p = _epion_extract_price(below)
+                if p is not None:
+                    prices_found.append(p)
+                q = _epion_extract_qty(below)
+                if q is not None:
+                    qty = q
+
+            # If we found standalone prices but no combined line
+            if unit_price is None and prices_found and qty is not None:
+                if len(prices_found) >= 2:
+                    # First price = unit price, last = total
+                    unit_price = prices_found[0]
+                    total = prices_found[-1]
+                elif len(prices_found) == 1:
+                    unit_price = prices_found[0]
+                    total = prices_found[0] * qty if qty else None
+
+        if qty is None:
+            continue
+
+        # --- Look above for product name and packaging ---
+        desc_parts: List[str] = []
         packaging_text = ""
         packaging_count = 1
-        desc_parts: List[str] = []
 
-        j = pi - 1
+        j = i - 1
         lookback = 0
         while j >= 0 and lookback < 6:
-            prev = lines[j].strip()
+            prev = raw_lines[j].strip()
             prev_low = prev.lower()
 
-            # Stop at another price line (start of previous product)
+            # Stop at another delivery status (start of previous product)
+            if _EPION_DELIVERY_RE.search(prev):
+                break
+            # Stop at a price line (from previous product)
             if _EPION_PRICE_QTY_TOTAL_RE.search(prev):
                 break
+            # Stop at standalone price
+            if _epion_is_price_only(prev):
+                break
 
-            # Skip metadata/noise lines
-            if _epion_should_skip(prev_low) or _looks_like_total(prev_low):
+            # Skip metadata/noise
+            if _epion_should_skip(prev_low) or _epion_is_summary(prev_low):
                 j -= 1
                 lookback += 1
                 continue
 
-            # Skip delivery status lines (e.g. "5/5 sendt")
-            if _EPION_DELIVERY_RE.match(prev):
-                j -= 1
-                lookback += 1
-                continue
-
-            # Check for packaging info line (e.g. "100 stk. pr. pakke")
+            # Check for packaging info
             pack_m = _EPION_PACK_LINE_RE.search(prev)
             if pack_m and packaging_count == 1:
                 packaging_count = int(pack_m.group(1)) or 1
@@ -638,52 +790,122 @@ def parse_epion_text(text: str, source_file: str) -> List[Dict[str, Any]]:
             lookback += 1
 
         description = " ".join(desc_parts).strip()
-
         if not description:
             continue
 
-        # Extract packaging from description parentheses if not found separately
+        # Extract packaging from description parentheses
         if packaging_count == 1:
             pack_in_name = _EPION_PACK_IN_NAME_RE.search(description)
             if pack_in_name:
                 packaging_count = int(pack_in_name.group(1)) or 1
 
-        # --- Calculate derived fields ---
-        total_units = float(qty * packaging_count)
-        competitor_line_amount = total if total else (
-            round(unit_price * qty, 2) if unit_price else None
-        )
-        calculated_unit_price = (
-            round(unit_price / packaging_count, 4)
-            if unit_price and packaging_count > 0 else unit_price
-        )
-
-        rows.append({
-            "source_file": source_file,
-            "competitor": "Epion",
-            "competitor_artnr": "",
-            "description": description,
-            "quantity_purchased": float(qty),
-            "packaging_text": packaging_text,
-            "packaging_count": packaging_count,
-            "unit": "",
-            "price_unit": "",
-            "price_before_discount": unit_price,
-            "discount_pct": None,
-            "line_amount": total,
-            "calculated_unit_price": calculated_unit_price,
-            "total_units": total_units,
-            "competitor_line_amount": competitor_line_amount,
-            "our_unit_price": None,
-            "our_comparable_line_price": None,
-            "savings_amount": None,
-            "source_page": 0,
-            "raw_text": lines[pi],
-            "confidence": 0.85,
-            "parse_method": "epion",
-        })
+        rows.append(_build_epion_row(
+            description, qty, unit_price, total, packaging_text, packaging_count,
+            source_file, raw_lines[i],
+        ))
 
     return rows
+
+
+def _epion_lookback_description(
+    lines: List[str], price_idx: int
+) -> tuple:
+    """Look backwards from a price line to find the product description and packaging."""
+    desc_parts: List[str] = []
+    packaging_text = ""
+    packaging_count = 1
+
+    j = price_idx - 1
+    lookback = 0
+    while j >= 0 and lookback < 6:
+        prev = lines[j].strip()
+        prev_low = prev.lower()
+
+        # Stop at another price line (start of previous product)
+        if _EPION_PRICE_QTY_TOTAL_RE.search(prev):
+            break
+        # Stop at a standalone price (from previous product's split lines)
+        if _epion_is_price_only(prev):
+            break
+
+        # Skip metadata/noise lines
+        if _epion_should_skip(prev_low) or _epion_is_summary(prev_low):
+            j -= 1
+            lookback += 1
+            continue
+
+        # Skip delivery status lines (e.g. "5/5 sendt")
+        if re.match(r"^\d+/\d+\s+sendt\s*$", prev, re.IGNORECASE):
+            j -= 1
+            lookback += 1
+            continue
+
+        # Check for packaging info line (e.g. "100 stk. pr. pakke")
+        pack_m = _EPION_PACK_LINE_RE.search(prev)
+        if pack_m and packaging_count == 1:
+            packaging_count = int(pack_m.group(1)) or 1
+            packaging_text = prev
+            j -= 1
+            lookback += 1
+            continue
+
+        # This is likely a description line (take up to 2)
+        if len(prev) >= 3 and len(desc_parts) < 2:
+            desc_parts.insert(0, prev)
+
+        j -= 1
+        lookback += 1
+
+    description = " ".join(desc_parts).strip()
+
+    # Extract packaging from description parentheses if not found separately
+    if packaging_count == 1 and description:
+        pack_in_name = _EPION_PACK_IN_NAME_RE.search(description)
+        if pack_in_name:
+            packaging_count = int(pack_in_name.group(1)) or 1
+
+    return description, packaging_text, packaging_count
+
+
+def _build_epion_row(
+    description: str, qty: int, unit_price: Optional[float],
+    total: Optional[float], packaging_text: str, packaging_count: int,
+    source_file: str, raw_text: str,
+) -> Dict[str, Any]:
+    """Build a V2 row dict from parsed Epion product fields."""
+    total_units = float(qty * packaging_count)
+    competitor_line_amount = total if total else (
+        round(unit_price * qty, 2) if unit_price else None
+    )
+    calculated_unit_price = (
+        round(unit_price / packaging_count, 4)
+        if unit_price and packaging_count > 0 else unit_price
+    )
+
+    return {
+        "source_file": source_file,
+        "competitor": "Epion",
+        "competitor_artnr": "",
+        "description": description,
+        "quantity_purchased": float(qty),
+        "packaging_text": packaging_text,
+        "packaging_count": packaging_count,
+        "unit": "",
+        "price_unit": "",
+        "price_before_discount": unit_price,
+        "discount_pct": None,
+        "line_amount": total,
+        "calculated_unit_price": calculated_unit_price,
+        "total_units": total_units,
+        "competitor_line_amount": competitor_line_amount,
+        "our_unit_price": None,
+        "our_comparable_line_price": None,
+        "savings_amount": None,
+        "source_page": 0,
+        "raw_text": raw_text,
+        "confidence": 0.85,
+        "parse_method": "epion",
+    }
 
 
 # ============================================================
