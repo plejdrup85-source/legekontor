@@ -795,6 +795,18 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
         def _epion_is_summary(ll: str) -> bool:
             return any(k in ll for k in _epion_summary_kw)
 
+        _epion_date_re = re.compile(r"^\d{1,2}\.\d{1,2}\.\d{4}")
+        _epion_pageno_re = re.compile(r"^\d+/\d+\s*$|^\s*side\s+\d+", re.IGNORECASE)
+
+        def _epion_skip_line(ll: str) -> bool:
+            if any(k in ll for k in _epion_skip_kw):
+                return True
+            if _epion_date_re.match(ll):
+                return True
+            if _epion_pageno_re.match(ll):
+                return True
+            return False
+
         # --- B1: Price-line anchor strategy ---
         # Merge multi-line price patterns
         merged: List[str] = []
@@ -829,12 +841,12 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
             desc_parts: List[str] = []
             j = pi - 1
             lookback = 0
-            while j >= 0 and lookback < 6:
+            while j >= 0 and lookback < 10:
                 prev = merged[j].strip()
                 prev_low = prev.lower()
                 if _epion_pqt_re.search(prev) or _epion_price_only.match(prev):
                     break
-                if any(k in prev_low for k in _epion_skip_kw) or _epion_is_summary(prev_low):
+                if _epion_skip_line(prev_low) or _epion_is_summary(prev_low):
                     j -= 1; lookback += 1; continue
                 if re.match(r"^\d+/\d+\s+sendt\s*$", prev, re.IGNORECASE):
                     j -= 1; lookback += 1; continue
@@ -845,7 +857,9 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 j -= 1; lookback += 1
 
             desc = " ".join(desc_parts).strip()
-            if not desc or desc.lower().startswith("frakt"):
+            if not desc:
+                desc = f"Ukjent produkt ({up_raw},-)"
+            if desc.lower().startswith("frakt"):
                 continue
 
             rows.append({
@@ -898,14 +912,14 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
             desc_parts = []
             j = i - 1
             lookback = 0
-            while j >= 0 and lookback < 6:
+            while j >= 0 and lookback < 10:
                 prev = lines[j].strip()
                 prev_low = prev.lower()
                 if _epion_delivery.search(prev) or _epion_pqt_re.search(prev):
                     break
                 if _epion_price_only.match(prev):
                     break
-                if any(k in prev_low for k in _epion_skip_kw) or _epion_is_summary(prev_low):
+                if _epion_skip_line(prev_low) or _epion_is_summary(prev_low):
                     j -= 1; lookback += 1; continue
                 if _epion_pack_line.search(prev):
                     j -= 1; lookback += 1; continue
@@ -914,7 +928,9 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 j -= 1; lookback += 1
 
             desc = " ".join(desc_parts).strip()
-            if not desc or desc.lower().startswith("frakt"):
+            if not desc:
+                desc = "Ukjent produkt"
+            if desc.lower().startswith("frakt"):
                 continue
 
             rows.append({
