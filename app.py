@@ -770,23 +770,32 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
         #   Product Name
         #   NN stk. pr. pakke
         #   N/N sendt
-        #   unit_price,-   X qty   total,-
+        #   unit_price,-   × qty   total,-
+        # NOTE: Epion uses × (multiplication sign U+00D7), not letter X.
+        # Dashes can be hyphen, en-dash, em-dash, or minus sign.
+        _dc = r"\-\–\—\−"                  # dash characters
+        _mc = r"Xx×✕"                       # multiplication characters
         _epion_pqt_re = re.compile(
-            r"(\d[\d\s.]*),[-–]\s+X\s*(\d+)\s+(\d[\d\s.]*),[-–]"
+            r"(\d[\d\s.]*)[,.]([" + _dc + r"])\s*[" + _mc + r"]\s*(\d+)\s+(\d[\d\s.]*)[,.]([" + _dc + r"])"
         )
-        _epion_price_only = re.compile(r"^(\d[\d\s.]*),[-–]\s*$")
-        _epion_qty_only = re.compile(r"^X\s*(\d+)\s*$")
-        _epion_delivery = re.compile(r"^\d+/\d+\s+sendt\s*$", re.IGNORECASE)
+        _epion_price_only = re.compile(r"^(\d[\d\s.]*)[,.]([" + _dc + r"])\s*$")
+        _epion_qty_only = re.compile(r"^[" + _mc + r"]\s*(\d+)\s*$")
+        _epion_delivery = re.compile(r"\d+/\d+\s+sendt", re.IGNORECASE)
         _epion_pack_line = re.compile(
             r"(\d+)\s+(?:(?:stk|rull|pk)\.?\s+)?pr\.?\s*pakke", re.IGNORECASE
         )
+        _epion_pack_in_name = re.compile(r"\((\d+)\s*(stk|pk|rull)\)", re.IGNORECASE)
         _epion_skip_kw = [
             "ordre #", "fullført", "ordr.dato", "sist oppdatert", "varer sendt",
             "bestilt", "faktura", "totaloversikt", "alle varer", "delleveranse",
             "bruksanvisning", "epion faqs", "brosjyre", "https://epion", "epion.no",
-            "sum eks", "frakt", "totalpris",
         ]
+        _epion_summary_kw = ["sum eks", "totalpris ink"]
 
+        def _epion_is_summary(ll: str) -> bool:
+            return any(k in ll for k in _epion_summary_kw)
+
+        # --- B1: Price-line anchor strategy ---
         # Merge multi-line price patterns
         merged: List[str] = []
         idx = 0
@@ -814,7 +823,7 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
                 continue
 
             up_raw = m3.group(1).replace(" ", "").replace(".", "")
-            qty_val = int(m3.group(2))
+            qty_val = int(m3.group(3))
             unit_price = _parse_money_local(up_raw)
 
             desc_parts: List[str] = []
@@ -823,11 +832,80 @@ def _parse_invoice_text_heuristic(text: str) -> List[Dict[str, Any]]:
             while j >= 0 and lookback < 6:
                 prev = merged[j].strip()
                 prev_low = prev.lower()
-                if _epion_pqt_re.search(prev):
+                if _epion_pqt_re.search(prev) or _epion_price_only.match(prev):
                     break
-                if any(k in prev_low for k in _epion_skip_kw) or _looks_like_total(prev_low):
+                if any(k in prev_low for k in _epion_skip_kw) or _epion_is_summary(prev_low):
                     j -= 1; lookback += 1; continue
-                if _epion_delivery.match(prev):
+                if re.match(r"^\d+/\d+\s+sendt\s*$", prev, re.IGNORECASE):
+                    j -= 1; lookback += 1; continue
+                if _epion_pack_line.search(prev):
+                    j -= 1; lookback += 1; continue
+                if len(prev) >= 3 and len(desc_parts) < 2:
+                    desc_parts.insert(0, prev)
+                j -= 1; lookback += 1
+
+            desc = " ".join(desc_parts).strip()
+            if not desc or desc.lower().startswith("frakt"):
+                continue
+
+            rows.append({
+                "Konkurrent Navn": "Epion",
+                "Konkurrent Art.Nr": "",
+                "Konkurrent Item Description": desc,
+                "Konkurrent Specification": "",
+                "Antall": float(qty_val) if qty_val else "",
+                "Konkurrent salgsenhet": "",
+                "Konkurrent Pris": unit_price if unit_price is not None else "",
+            })
+
+        if rows:
+            return rows
+
+        # --- B2: Delivery-status anchor fallback ---
+        # If price-line strategy failed, use "N/N sendt" as anchor
+        for i, l in enumerate(lines):
+            if not _epion_delivery.search(l):
+                continue
+            if _epion_is_summary(l.lower()):
+                break
+
+            # Look below for price info
+            qty_val = None
+            unit_price = None
+            for k in range(i + 1, min(i + 5, len(lines))):
+                below = lines[k]
+                if _epion_delivery.search(below) or _epion_is_summary(below.lower()):
+                    break
+                m_pqt = _epion_pqt_re.search(below)
+                if m_pqt:
+                    up_raw = m_pqt.group(1).replace(" ", "").replace(".", "")
+                    qty_val = int(m_pqt.group(3))
+                    unit_price = _parse_money_local(up_raw)
+                    break
+                # Try standalone components
+                q_m = re.search(r"[" + _mc + r"]\s*(\d+)", below)
+                if q_m:
+                    qty_val = int(q_m.group(1))
+                p_m = re.search(r"(\d[\d\s.]*)[,.][" + _dc + r"]", below)
+                if p_m and unit_price is None:
+                    p_raw = p_m.group(1).replace(" ", "").replace(".", "")
+                    unit_price = _parse_money_local(p_raw)
+
+            if qty_val is None:
+                continue
+
+            # Look above for product name
+            desc_parts = []
+            j = i - 1
+            lookback = 0
+            while j >= 0 and lookback < 6:
+                prev = lines[j].strip()
+                prev_low = prev.lower()
+                if _epion_delivery.search(prev) or _epion_pqt_re.search(prev):
+                    break
+                if _epion_price_only.match(prev):
+                    break
+                if any(k in prev_low for k in _epion_skip_kw) or _epion_is_summary(prev_low):
                     j -= 1; lookback += 1; continue
                 if _epion_pack_line.search(prev):
                     j -= 1; lookback += 1; continue
