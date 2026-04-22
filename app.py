@@ -1224,9 +1224,6 @@ def load_catalog_from_disk() -> None:
 
 @app.on_event("startup")
 def startup_event():
-    # Fail closed: hvis passordbeskyttelse er aktiv men credentials mangler, stopp oppstart
-    if _auth_enabled() and not (BASIC_AUTH_USER and BASIC_AUTH_PASS):
-        raise RuntimeError("REQUIRE_AUTH=1 men BASIC_AUTH_USER/BASIC_AUTH_PASS er ikke satt. Sett disse i Render Environment.")
     load_catalog_from_disk()
     threading.Thread(target=_watchdog_loop, daemon=True).start()
     logger.info("Startup complete (catalog loaded without embeddings). Ready to accept requests.")
