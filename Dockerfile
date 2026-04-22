@@ -30,6 +30,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Kopier resten av applikasjonen
 COPY . .
 
+# Run as non-root
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 # Eksponer port (Render bruker 10000)
 EXPOSE 10000
 

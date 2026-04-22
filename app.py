@@ -12,12 +12,11 @@ from typing import Dict, Any, Optional, Callable, Tuple, List
 
 import pandas as pd
 from pypdf import PdfReader
-from fastapi import FastAPI, UploadFile, File, Form, Depends, Request
+from fastapi import FastAPI, UploadFile, File, Form, Depends, Request, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, RedirectResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
-import secrets
 
 from matcher import Catalog, CancelledError
+from sso_auth import require_sso, sso_callback, sso_logout, User
 from v2.router import v2_router
 
 logging.basicConfig(level=logging.INFO)
@@ -49,81 +48,42 @@ CATALOG_MAPPING_PATH = DATA_DIR / "catalog_mapping.json"
 JOBS_INDEX = DATA_DIR / "jobs.jsonl"
 COMPETITOR_REGISTER_PATH = DATA_DIR / "competitor_price_register.xlsx"
 
+MAX_UPLOAD_SIZE = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))
+
+
+def _check_upload_size(request: Request) -> None:
+    cl = request.headers.get("content-length")
+    if cl and int(cl) > MAX_UPLOAD_SIZE:
+        raise HTTPException(413, "Fil er for stor")
+
 # ============================================================
 # APP STATE
 # ============================================================
 app = FastAPI(title=APP_TITLE, version=os.getenv("APP_VERSION", "2.6"))
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 app.include_router(v2_router, prefix="/v2")
 
 # ============================================================
-# BASIC AUTH (PASSORDBESKYTTELSE)
+# SSO ROUTES (handoff callback + logout)
 # ============================================================
-BASIC_AUTH_USER = os.getenv("BASIC_AUTH_USER", "").strip()
-BASIC_AUTH_PASS = os.getenv("BASIC_AUTH_PASS", "").strip()
-REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "1").strip().lower() in ("1","true","yes","on")
-security = HTTPBasic(auto_error=False)
-
-def _auth_enabled() -> bool:
-    return bool(REQUIRE_AUTH)
-
-def verify_basic_auth(credentials: HTTPBasicCredentials = Depends(security)):
-    """
-    Passordbeskyttelse via HTTP Basic Auth.
-
-    - Standard: aktiv (REQUIRE_AUTH=1).
-    - Krever at BASIC_AUTH_USER og BASIC_AUTH_PASS er satt i environment.
-    """
-    if not _auth_enabled():
-        return True
-
-    from fastapi import HTTPException
-
-    # Fail closed: Hvis auth er på men creds mangler, stopp med tydelig feil
-    if not (BASIC_AUTH_USER and BASIC_AUTH_PASS):
-        raise HTTPException(
-            status_code=500,
-            detail="Auth er aktiv (REQUIRE_AUTH=1) men BASIC_AUTH_USER/BASIC_AUTH_PASS er ikke satt i environment.",
-        )
-
-    if credentials is None:
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-
-    ok_user = secrets.compare_digest(credentials.username or "", BASIC_AUTH_USER)
-    ok_pass = secrets.compare_digest(credentials.password or "", BASIC_AUTH_PASS)
-    if not (ok_user and ok_pass):
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return True
+@app.get("/sso/callback")
+def handle_sso_callback(token: str, redirect: str = "/"):
+    return sso_callback(token, redirect)
 
 
-# ============================================================
-# ADMIN AUTH (KUN KATALOG-OPPLASTING)
-# Sett ADMIN_AUTH_USER / ADMIN_AUTH_PASS i Render for å kreve eget passord på /upload_catalog.
-# Hvis ikke satt, faller vi tilbake til BASIC_AUTH (hvis aktivert), ellers åpen.
-# ============================================================
-ADMIN_AUTH_USER = os.getenv("ADMIN_AUTH_USER", "").strip()
-ADMIN_AUTH_PASS = os.getenv("ADMIN_AUTH_PASS", "").strip()
-admin_security = HTTPBasic(auto_error=False)
+@app.get("/logout")
+def handle_logout():
+    return sso_logout()
 
-def _admin_auth_enabled() -> bool:
-    return bool(ADMIN_AUTH_USER and ADMIN_AUTH_PASS)
 
-def verify_admin_auth(credentials: HTTPBasicCredentials = Depends(admin_security)):
-    if not _admin_auth_enabled():
-        # No dedicated admin creds -> require basic auth if enabled, else allow.
-        if _auth_enabled():
-            return verify_basic_auth(credentials)  # type: ignore
-        return True
-    if credentials is None:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    ok_user = secrets.compare_digest(credentials.username or "", ADMIN_AUTH_USER)
-    ok_pass = secrets.compare_digest(credentials.password or "", ADMIN_AUTH_PASS)
-    if not (ok_user and ok_pass):
-        from fastapi import HTTPException
-        raise HTTPException(status_code=401, detail="Unauthorized", headers={"WWW-Authenticate": "Basic"})
-    return True
-
-# (Auth middleware removed) - we protect only admin endpoints with verify_admin_auth.
 CATALOG_BUNDLE = None  # Legekontor: holder to kataloger + prisoppslag
 
 TASKS: Dict[str, Dict[str, Any]] = {}
@@ -1934,7 +1894,7 @@ loadHistory();
 
 
 @app.get("/static/logo.png")
-def static_logo(_ok: bool = Depends(verify_basic_auth)):
+def static_logo(_: User = Depends(require_sso)):
     try:
         if not LOGO_PATH.exists():
             return JSONResponse({"error": "Logo ikke funnet"}, status_code=404)
@@ -1948,7 +1908,7 @@ def static_logo(_ok: bool = Depends(verify_basic_auth)):
 # ROUTES
 # ============================================================
 @app.get("/template")
-def template(_ok: bool = Depends(verify_basic_auth)):
+def template(_: User = Depends(require_sso)):
     xlsx = generate_input_template_bytes()
     return StreamingResponse(
         BytesIO(xlsx),
@@ -1958,15 +1918,15 @@ def template(_ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/", response_class=HTMLResponse)
-def index(_ok: bool = Depends(verify_basic_auth)):
+def index(_: User = Depends(require_sso)):
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
-def admin_page(_admin_ok: bool = Depends(verify_admin_auth)):
+def admin_page(_: User = Depends(require_sso)):
     return HTMLResponse(INDEX_HTML)
 
 
 @app.get("/catalog_status")
-def catalog_status(_ok: bool = Depends(verify_basic_auth)):
+def catalog_status(_: User = Depends(require_sso)):
     meta = catalog_meta()
     meta["exists"] = CATALOG_PATH.exists()
     meta["loaded"] = CATALOG_BUNDLE is not None
@@ -1975,8 +1935,9 @@ def catalog_status(_ok: bool = Depends(verify_basic_auth)):
 
 
 @app.post("/preview_catalog")
-async def preview_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
+async def preview_catalog(request: Request, file: UploadFile = File(...), _: User = Depends(require_sso)):
     """Preview catalog file: return sheet names, columns, sample data, and auto-mapping suggestions."""
+    _check_upload_size(request)
     content = await file.read()
     filename = (file.filename or "").lower()
 
@@ -2024,13 +1985,14 @@ async def preview_catalog(file: UploadFile = File(...), _admin_ok: bool = Depend
 
 
 @app.post("/upload_catalog")
-async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends(verify_admin_auth)):
+async def upload_catalog(request: Request, file: UploadFile = File(...), _: User = Depends(require_sso)):
     """
     Katalog-opplasting (kun .xlsx).
     NB: Denne endpointen skal IKKE forsoeke a parse PDF - det er kun for /match.
     """
     global CATALOG_BUNDLE
 
+    _check_upload_size(request)
     content = await file.read()
     filename = (file.filename or "").lower()
 
@@ -2057,13 +2019,14 @@ async def upload_catalog(file: UploadFile = File(...), _admin_ok: bool = Depends
 
 
 @app.post("/upload_catalog_mapped")
-async def upload_catalog_mapped(request: Request, _admin_ok: bool = Depends(verify_admin_auth)):
+async def upload_catalog_mapped(request: Request, _: User = Depends(require_sso)):
     """Upload catalog with explicit column mapping.
 
     Expects multipart form: file + mapping (JSON string).
     """
     global CATALOG_BUNDLE
 
+    _check_upload_size(request)
     form = await request.form()
     file = form.get("file")
     mapping_json = form.get("mapping", "{}")
@@ -2118,11 +2081,14 @@ async def upload_catalog_mapped(request: Request, _admin_ok: bool = Depends(veri
     return {"ok": True, "items": CATALOG_BUNDLE.items_count() if CATALOG_BUNDLE else 0}
 
 @app.post("/match")
+@limiter.limit("10/minute")
 async def match(
+    request: Request,
     file: UploadFile = File(...),
     prefer_own_brands: str = Form("1"),
-    _ok: bool = Depends(verify_basic_auth),
+    _: User = Depends(require_sso),
 ):
+    _check_upload_size(request)
     if CATALOG_BUNDLE is None:
         return JSONResponse({"error": "Last opp katalog først"}, status_code=400)
 
@@ -2278,7 +2244,7 @@ async def match(
     return {"ok": True, "task_id": task_id}
 
 @app.post("/cancel/{task_id}")
-def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def cancel(task_id: str, _: User = Depends(require_sso)):
     t = TASKS.get(task_id)
     if not t:
         return JSONResponse({"error": "Ukjent task_id"}, status_code=404)
@@ -2306,7 +2272,7 @@ def cancel(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/progress/{task_id}")
-def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def progress(task_id: str, _: User = Depends(require_sso)):
     t = TASKS.get(task_id)
     if not t:
         return {"status": "unknown", "progress": 0.0}
@@ -2319,7 +2285,7 @@ def progress(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/download/{task_id}")
-def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
+def download(task_id: str, _: User = Depends(require_sso)):
     path = RESULTS_DIR / f"{task_id}.xlsx"
     if not path.exists():
         return JSONResponse({"error": "Fil finnes ikke"}, status_code=404)
@@ -2340,5 +2306,5 @@ def download(task_id: str, _ok: bool = Depends(verify_basic_auth)):
 
 
 @app.get("/history")
-def history(limit: int = 200, _ok: bool = Depends(verify_basic_auth)):
+def history(limit: int = 200, _: User = Depends(require_sso)):
     return {"jobs": load_jobs(limit=limit)}
