@@ -1916,6 +1916,9 @@ def template(_: User = Depends(require_sso)):
 
 @app.get("/", response_class=HTMLResponse)
 def index(_: User = Depends(require_sso)):
+    return RedirectResponse(url="/v2/", status_code=302)
+@app.get("/v1", response_class=HTMLResponse)
+def v1_legacy(_: User = Depends(require_sso)):
     return HTMLResponse(INDEX_HTML)
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_: User = Depends(require_sso)):

@@ -1458,7 +1458,7 @@ V2_INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <div style="margin-bottom:12px;"><a href="/">&larr; Tilbake til V1</a> &nbsp; <a href="/v2/pricedb/ui">Prisdatabase</a></div>
+  <div style="margin-bottom:12px;"><a href="/v2/pricedb/ui">Prisdatabase</a> &nbsp; <a href="/admin">Admin (katalog)</a></div>
   <div class="card">
     <h2>Prisammenligning V2</h2>
 
