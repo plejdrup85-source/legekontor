@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -40,6 +41,50 @@ V2_TASKS: Dict[str, Dict[str, Any]] = {}
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _to_jsonable(value: Any) -> Any:
+    """Recursively convert a value into something the FastAPI JSON encoder
+    will accept.
+
+    Starlette's JSONResponse renders with ``allow_nan=False``, so any NaN /
+    Inf left in the response — typically introduced by pandas / numpy values
+    flowing through matching — turns the whole reply into a 500 with an HTML
+    error body. The browser then trips on ``await resp.json()`` and shows
+    "Polling feilet".
+
+    This walks dicts/lists/tuples and:
+      - replaces NaN/Inf floats with ``None``
+      - unwraps numpy scalar types via ``.item()`` (and re-checks for NaN)
+      - leaves all other JSON-safe types untouched
+    """
+    if value is None:
+        return None
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+    if isinstance(value, (str, int, bool)):
+        return value
+    # numpy scalars expose .item() returning a native Python scalar
+    item_fn = getattr(value, "item", None)
+    if callable(item_fn) and not isinstance(value, (dict, list, tuple, set)):
+        try:
+            unwrapped = item_fn()
+        except Exception:
+            unwrapped = None
+        if unwrapped is not None and unwrapped is not value:
+            return _to_jsonable(unwrapped)
+    if isinstance(value, dict):
+        return {str(k): _to_jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(v) for v in value]
+    # Anything else (datetime, Decimal, np.ndarray, pandas types, ...) is
+    # coerced to a string so the JSON encoder cannot fail.
+    try:
+        return str(value)
+    except Exception:
+        return None
 
 
 def _get_task(job_id: str) -> Optional[Dict[str, Any]]:
@@ -389,29 +434,39 @@ def _parse_job_files(job_id: str) -> None:
 @v2_router.get("/status/{job_id}")
 def v2_status(job_id: str):
     """Get status for a V2 job, including per-file parse results."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
-    return {
-        "job_id": t["job_id"],
-        "status": t["status"],
-        "created_at": t.get("created_at"),
-        "files": t.get("files", []),
-        "total_files": t.get("total_files", 0),
-        "uploaded_files": t.get("uploaded_files", 0),
-        "error_files": t.get("error_files", 0),
-        "parsed_files": t.get("parsed_files"),
-        "parse_error_files": t.get("parse_error_files"),
-        "total_rows": t.get("total_rows", 0),
-        "deduped_count": t.get("deduped_count"),
-        "match_progress": t.get("match_progress"),
-        "matched_ok": t.get("matched_ok"),
-        "no_match": t.get("no_match"),
-        "match_error": t.get("match_error"),
-        # Enhanced pipeline info
-        "rows_with_price": t.get("rows_with_price"),
-        "rows_without_price": t.get("rows_without_price"),
-    }
+    try:
+        t = _get_task(job_id)
+        if not t:
+            return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+        payload = {
+            "job_id": t["job_id"],
+            "status": t["status"],
+            "created_at": t.get("created_at"),
+            "files": t.get("files", []),
+            "total_files": t.get("total_files", 0),
+            "uploaded_files": t.get("uploaded_files", 0),
+            "error_files": t.get("error_files", 0),
+            "parsed_files": t.get("parsed_files"),
+            "parse_error_files": t.get("parse_error_files"),
+            "total_rows": t.get("total_rows", 0),
+            "deduped_count": t.get("deduped_count"),
+            "match_progress": t.get("match_progress"),
+            "matched_ok": t.get("matched_ok"),
+            "no_match": t.get("no_match"),
+            "match_error": t.get("match_error"),
+            # Enhanced pipeline info
+            "rows_with_price": t.get("rows_with_price"),
+            "rows_without_price": t.get("rows_without_price"),
+        }
+        return _to_jsonable(payload)
+    except Exception as e:
+        # Never let this 500 — the frontend polls in a tight loop and a single
+        # 500 response interrupts the whole flow with "Polling feilet".
+        logger.exception(f"v2_status failed for job={job_id}")
+        return JSONResponse(
+            {"error": f"Statusoppslag feilet: {e}", "job_id": job_id},
+            status_code=500,
+        )
 
 
 @v2_router.get("/rows/{job_id}")
@@ -539,6 +594,12 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
             progress_cb=progress_cb,
         )
 
+        # Strip NaN/Inf and unwrap numpy/pandas scalars before anything else
+        # touches these rows. Otherwise they leak into JSON responses (where
+        # Starlette's allow_nan=False makes the whole response 500) and into
+        # review.json on disk.
+        matched = _to_jsonable(matched)
+
         task["matched_rows"] = matched
         task["matched_count"] = len(matched)
         task["match_progress"] = 1.0
@@ -604,14 +665,14 @@ def v2_matched_rows(job_id: str):
             status_code=400,
         )
     rows = t.get("matched_rows", [])
-    return {
+    return _to_jsonable({
         "job_id": job_id,
         "status": "matched",
         "count": len(rows),
         "matched_ok": t.get("matched_ok", 0),
         "no_match": t.get("no_match", 0),
         "rows": rows,
-    }
+    })
 
 
 # ============================================================
@@ -658,14 +719,14 @@ def v2_review(job_id: str):
     pending = sum(1 for r in rows if r.get("review_status") == "pending" and not r.get("deleted"))
     deleted = sum(1 for r in rows if r.get("deleted"))
 
-    return {
+    return _to_jsonable({
         "job_id": job_id,
         "status": t.get("status"),
         "lock": lock,
         "count": len(rows),
         "summary": {"approved": approved, "rejected": rejected, "pending": pending, "deleted": deleted},
         "rows": rows,
-    }
+    })
 
 
 @v2_router.post("/review/{job_id}/select")
