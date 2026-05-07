@@ -481,6 +481,156 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
 
 
 # ============================================================
+# MASKE ORDER CONFIRMATION PARSER
+# ============================================================
+# Maske (maske.no) "ORDREBEKREFTELSE" PDFs use a flat table layout.
+#
+# Two sections appear:
+#   "Blir levert"   (will be delivered)
+#       Columns: Varenr | Varetekst | Estimert lev.dato | Pris |
+#                Bestilt | Lev | Salgsenhet | Rabatt | Beløp
+#   "Kommer senere" (back-ordered)
+#       Columns: Varenr | Varetekst | Estimert lev.dato | Pris |
+#                Bestilt | Gjenstår | Salgsenhet | Rabatt | (Beløp)
+#
+# Row example:
+#   3362759  Bandasje Exufiber 10x10cm  16.03.2026  868,48  2  2  ESK         868,48
+#
+# - Varenr is a 7-digit article number anchored at start of line.
+# - Pris is the unit list price for one Salgsenhet (no per-piece field).
+# - Rabatt is shown as a percentage when present (e.g. "5,0 %"), otherwise blank.
+# - Beløp is the line total. When discount is 0 it equals Pris × Bestilt.
+# - The "Kommer senere" section may render the Beløp column as blank in the
+#   header but still emit a value in the row; making it optional keeps both
+#   variants matchable.
+
+# Maske unit codes seen on order confirmations (Salgsenhet)
+_MASKE_UNITS = "ESK|PSE|STK|PAK|PAR|BKS|KAR|RLL|FLA|FL|DUN|SET|KRT|POS"
+
+_MASKE_LINE_RE = re.compile(
+    r"^(?P<art>\d{7})\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<date>\d{2}\.\d{2}\.\d{4})\s+"
+    r"(?P<price>\d[\d\.\s]*,\d{2})\s+"
+    r"(?P<bestilt>\d+)\s+"
+    r"(?P<lev>\d+)\s+"
+    r"(?P<unit>" + _MASKE_UNITS + r")"
+    r"(?:\s+(?P<rab>\d+(?:,\d+)?)\s*%)?"
+    r"(?:\s+(?P<amount>\d[\d\.\s]*,\d{2}))?"
+    r"\s*$"
+)
+
+# Skip lines that belong to the summary/footer block
+_MASKE_FOOTER_KEYWORDS = [
+    "sum eks", "utgaende mva", "utgående mva", "sluttbeløp", "sluttbelop",
+    "varer m", "totalt", "maske as", "maske.no", "kundeservice@maske",
+    "org.nr",
+]
+
+
+def _maske_should_skip(line_low: str) -> bool:
+    if not line_low:
+        return True
+    if any(kw in line_low for kw in _MASKE_FOOTER_KEYWORDS):
+        return True
+    if _looks_like_total(line_low):
+        return True
+    return False
+
+
+def parse_maske_text(text: str, source_file: str) -> List[Dict[str, Any]]:
+    """Parse a Maske order confirmation into structured V2 rows.
+
+    Walks line-by-line. Rows are recognised by a 7-digit article number at
+    the start of the line followed by the standard Maske column layout.
+    Lines that do not match the row regex are silently skipped (headers,
+    footers, the "Blir levert" / "Kommer senere" labels, etc.).
+    """
+    raw_lines = [
+        re.sub(r"\s+", " ", (line or "")).strip()
+        for line in text.splitlines()
+    ]
+    raw_lines = [line for line in raw_lines if line]
+
+    rows: List[Dict[str, Any]] = []
+    for line in raw_lines:
+        low = line.lower()
+        if _maske_should_skip(low):
+            continue
+        if not re.match(r"^\d{7}\b", line):
+            continue
+        m = _MASKE_LINE_RE.match(line)
+        if not m:
+            continue
+        row = _build_maske_row(m, source_file)
+        if row:
+            rows.append(row)
+
+    return rows
+
+
+def _build_maske_row(m: re.Match, source_file: str) -> Optional[Dict[str, Any]]:
+    art = (m.group("art") or "").strip()
+    desc = (m.group("desc") or "").strip()
+    if not art or not desc:
+        return None
+
+    bestilt = _to_float(m.group("bestilt")) or 0.0
+    lev = _to_float(m.group("lev")) or 0.0
+    unit = (m.group("unit") or "").strip()
+
+    price_before_discount = _parse_money(m.group("price"))
+
+    rab_raw = m.groupdict().get("rab")
+    discount_pct = _to_float(rab_raw) if rab_raw else None
+
+    amount_raw = m.groupdict().get("amount")
+    line_amount = _parse_money(amount_raw) if amount_raw else None
+
+    # Maske quotes price per Salgsenhet (one sales unit). There is no
+    # explicit "items per package" field on the document, so each ordered
+    # Salgsenhet counts as one purchasable unit.
+    packaging_count = 1
+
+    discount_factor = 1.0 - (discount_pct / 100.0) if discount_pct is not None else 1.0
+    calculated_unit_price = (
+        round(price_before_discount * discount_factor, 4)
+        if price_before_discount is not None
+        else None
+    )
+
+    competitor_line_amount = line_amount
+    if competitor_line_amount is None and price_before_discount is not None:
+        competitor_line_amount = round(
+            price_before_discount * discount_factor * bestilt, 2
+        )
+
+    return {
+        "source_file": source_file,
+        "competitor": "Maske",
+        "competitor_artnr": art,
+        "description": desc,
+        "quantity_purchased": bestilt,
+        "packaging_text": "",
+        "packaging_count": packaging_count,
+        "unit": unit,
+        "price_unit": unit,
+        "price_before_discount": price_before_discount,
+        "discount_pct": discount_pct,
+        "line_amount": line_amount,
+        "calculated_unit_price": calculated_unit_price,
+        "total_units": bestilt * packaging_count,
+        "competitor_line_amount": competitor_line_amount,
+        # Extra field — useful for diagnostics/UI but ignored by matching:
+        "delivered_qty": lev,
+        # Placeholders — set during matching step:
+        "our_unit_price": None,
+        "our_comparable_line_price": None,
+        "savings_amount": None,
+    }
+
+
+# ============================================================
 # EPION ORDER CONFIRMATION PARSER
 # ============================================================
 # Epion order confirmations (from epion.no/ordrer/XXXXX) display
@@ -1394,6 +1544,11 @@ def detect_source(text: str) -> str:
     low = text.lower()
     if "norengros" in low:
         return "norengros"
+    # Maske order confirmations carry the brand name and the document title.
+    # Require both signals to avoid false positives (e.g. a competitor merely
+    # mentioning Maske in a footer).
+    if ("maske" in low and "ordrebekreftelse" in low) or "maske.no" in low:
+        return "maske"
     if "epion" in low:
         return "epion"
     # Fallback: detect Epion by its unique price+qty pattern and delivery status
@@ -1545,6 +1700,21 @@ def _parse_pdf(filename: str, content: bytes, result: Dict[str, Any]) -> Dict[st
                     r.setdefault("raw_text", "")
                     r.setdefault("confidence", 0.8)  # NorEngros rows are generally reliable
                     r.setdefault("parse_method", "norengros")
+
+        # Try Maske parser for Maske order confirmations
+        if not rows and source == "maske":
+            pipeline_log.append("Prøver Maske-parser...")
+            maske_rows = parse_maske_text(text, source_file=filename)
+            pipeline_log.append(f"Maske-parser: {len(maske_rows)} rader funnet")
+
+            if maske_rows:
+                rows = maske_rows
+                parse_method = "maske"
+                for r in rows:
+                    r.setdefault("source_page", 0)
+                    r.setdefault("raw_text", "")
+                    r.setdefault("confidence", 0.85)
+                    r.setdefault("parse_method", "maske")
 
         # Try Epion parser for Epion order confirmations
         if not rows and source == "epion":
