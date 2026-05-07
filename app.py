@@ -1460,51 +1460,36 @@ INDEX_HTML = """
 <body>
   <div style="margin-bottom:18px;"><img src="/static/logo.png" alt="Logo" onerror="this.style.display='none';"/></div>
   <div style="margin: -6px 0 14px 0; color:#555;" id="subtitle">__APP_SUBTITLE__</div>
-  <div style="margin-bottom:12px;"><a href="/v2/">Prisammenligning V2 &rarr;</a></div>
+  <div style="margin-bottom:12px;"><a href="/v2/">&larr; Tilbake til Prissammenligning</a></div>
   <div class="card">
-    <div class="row">
-      <div class="col">
-        <h3>1) Katalog (Legekontor)</h3>
-        <div id="catalogInfo" class="muted"></div>
-        <input id="catalog" type="file" accept=".xlsx"/>
-        <button id="btnCatalog">Last opp med kolonnemapping</button>
-        <button id="btnCatalogDirect" class="secondary" style="margin-left:4px;" title="Last opp direkte uten mapping (bruker automatisk kolonnegjenkjenning)">Direkte opplasting</button>
-        <div id="catStatus" class="muted" style="margin-top:6px;"></div>
-        <div class="muted" style="margin-top:8px; font-size:12px; line-height:1.5;">
-          <b>Kolonnemapping</b> lar deg velge hvilke kolonner i din fil som tilsvarer systemets felter.
-          Anbefales hvis kolonnene har uvanlige navn. <b>Direkte opplasting</b> bruker automatisk gjenkjenning.
-        </div>
-      </div>
-
-      <div class="col">
-        <h3>2) Prissammenligning</h3>
-        <p class="muted">Last opp konkurrentfil i input-format og start matching.</p>
-        <p class="muted"><a href="/template">Last ned input-template.xlsx</a></p>
-        <div class="muted" style="margin:10px 0 6px 0;">
-          <b>Preferer egne merkevarer?</b>
-          <label style="margin-left:10px;"><input type="radio" name="prefer" value="1" checked> Ja</label>
-          <label style="margin-left:10px;"><input type="radio" name="prefer" value="0"> Nei</label>
-        </div>
-        <input id="input" type="file" accept=".xlsx,.pdf"/>
-        <button id="btnMatch" disabled>Start matching</button>
-        <button id="btnCancel" disabled class="secondary">Avbryt</button>
-        <div id="matchStatus" class="muted"></div>
-        <div style="margin-top:12px;">
-          <div class="bar-wrap"><div id="bar" class="bar"></div></div>
-        </div>
-        <div id="download" style="margin-top:10px;"></div>
-      </div>
+    <h3>Katalog (Legekontor)</h3>
+    <div id="catalogInfo" class="muted"></div>
+    <input id="catalog" type="file" accept=".xlsx"/>
+    <button id="btnCatalog">Last opp med kolonnemapping</button>
+    <button id="btnCatalogDirect" class="secondary" style="margin-left:4px;" title="Last opp direkte uten mapping (bruker automatisk kolonnegjenkjenning)">Direkte opplasting</button>
+    <div id="catStatus" class="muted" style="margin-top:6px;"></div>
+    <div class="muted" style="margin-top:8px; font-size:12px; line-height:1.5;">
+      <b>Kolonnemapping</b> lar deg velge hvilke kolonner i din fil som tilsvarer systemets felter.
+      Anbefales hvis kolonnene har uvanlige navn. <b>Direkte opplasting</b> bruker automatisk gjenkjenning.
     </div>
 
     <hr style="border:none;border-top:1px solid #eee;margin:18px 0;"/>
-
-    <h3>Historikk</h3>
-    <p class="muted">Tidspunkt vises i Oslo-tid.</p>
-    <div id="history"></div>
+    <p class="muted">Selve prissammenligningen og review gjøres i <a href="/v2/">Prissammenligning</a>.</p>
 
     <hr style="border:none;border-top:1px solid #eee;margin:18px 0;"/>
     <h3>Debug</h3>
     <pre id="debug"></pre>
+  </div>
+
+  <!-- Hidden legacy elements kept so existing JS does not throw -->
+  <div style="display:none;">
+    <input id="input" type="file"/>
+    <button id="btnMatch" disabled></button>
+    <button id="btnCancel" disabled></button>
+    <div id="matchStatus"></div>
+    <div id="bar" class="bar"></div>
+    <div id="download"></div>
+    <div id="history"></div>
   </div>
 
   <!-- Column Mapping Modal -->
@@ -1914,9 +1899,13 @@ def template(_: User = Depends(require_sso)):
     )
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def index(_: User = Depends(require_sso)):
-    return HTMLResponse(INDEX_HTML)
+    # V2 is the default interface. The legacy V1 page is retired but its
+    # catalog-management UI remains available at /admin.
+    return RedirectResponse(url="/v2/", status_code=302)
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_page(_: User = Depends(require_sso)):
     return HTMLResponse(INDEX_HTML)

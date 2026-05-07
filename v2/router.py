@@ -1458,9 +1458,9 @@ V2_INDEX_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <div style="margin-bottom:12px;"><a href="/">&larr; Tilbake til V1</a> &nbsp; <a href="/v2/pricedb/ui">Prisdatabase</a></div>
+  <div style="margin-bottom:12px;"><a href="/admin">Last opp katalog</a> &nbsp; <a href="/v2/pricedb/ui">Prisdatabase</a></div>
   <div class="card">
-    <h2>Prisammenligning V2</h2>
+    <h2>Prisammenligning</h2>
 
     <h3>Last opp filer</h3>
     <p class="muted">Velg en eller flere PDF-fakturaer og/eller Excel-filer (.xlsx).</p>
