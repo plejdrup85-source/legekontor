@@ -313,7 +313,73 @@ def _tokenize(s: str) -> List[str]:
                 if syn and syn not in STOPWORDS and len(syn) > 1:
                     expanded.append(syn)
 
+            # Fuzzy variants — produce extra tokens that bridge common
+            # spelling differences between PDF order confirmations and the
+            # catalog Excel:
+            #   - Norwegian char folding   (sårvask ↔ sarvask)
+            #   - K/C alternation          (glukose ↔ glucose, kompress ↔ compress)
+            #   - Short-prefix tokens      (glucopro ↔ glucosepro, natur ↔ natural)
+            for fv in _fuzzy_variants(p):
+                if fv != p and fv not in STOPWORDS:
+                    expanded.append(fv)
+
     return expanded
+
+
+def _fuzzy_variants(token: str) -> List[str]:
+    """Return additional tokens to emit alongside ``token`` so the BM25
+    index can match across common spelling drift.
+
+    Both the catalog (Excel) and the parsed competitor row run through
+    ``_tokenize`` → emitting the same fuzzy variants on both sides means
+    BM25 sees the variants as ordinary tokens with normal IDF, no score
+    hacks needed.
+    """
+    out: List[str] = []
+
+    # Fold Norwegian / common European diacritics down to ASCII
+    folded = (
+        token
+        .replace("å", "a").replace("æ", "a").replace("ø", "o")
+        .replace("é", "e").replace("è", "e").replace("ê", "e")
+        .replace("ä", "a").replace("ö", "o").replace("ü", "u")
+    )
+    if folded != token and len(folded) > 1:
+        out.append(folded)
+
+    # K ↔ C alternation on the folded form. Norwegian medical/chemistry
+    # terms drift between Norwegian-with-K (kompress, glukose, klorid) and
+    # international-with-C (compress, glucose, chlorid).
+    base = folded
+    if "k" in base and len(base) >= 4:
+        c_variant = base.replace("k", "c")
+        if c_variant != base:
+            out.append(c_variant)
+    if "c" in base and len(base) >= 4:
+        k_variant = base.replace("c", "k")
+        if k_variant != base:
+            out.append(k_variant)
+
+    # Short prefixes so partial words still hook up:
+    #   "natural"[:5]    == "natur"        (matches the literal token "natur")
+    #   "glucopro"[:4]   == "gluc"         (also produced by "glucosepro")
+    #   "exufiber"[:5]   == "exufi"        (matches truncated catalog forms)
+    # 4-char prefix is emitted at length ≥ 6, 5-char prefix at length ≥ 7,
+    # which keeps short common words from collapsing to noise.
+    if len(base) >= 7:
+        out.append(base[:5])
+    if len(base) >= 6:
+        out.append(base[:4])
+
+    # Dedupe while preserving order; drop anything too short or stop-wordy
+    seen = set()
+    res: List[str] = []
+    for x in out:
+        if not x or len(x) <= 1 or x in STOPWORDS or x in seen:
+            continue
+        seen.add(x)
+        res.append(x)
+    return res
 
 
 def _norm_text_for_sim(s: str) -> str:
