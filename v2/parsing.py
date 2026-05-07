@@ -496,35 +496,71 @@ def _build_norengros_row(m: re.Match, source_file: str) -> Optional[Dict[str, An
 # Row example:
 #   3362759  Bandasje Exufiber 10x10cm  16.03.2026  868,48  2  2  ESK         868,48
 #
-# - Varenr is a 7-digit article number anchored at start of line.
-# - Pris is the unit list price for one Salgsenhet (no per-piece field).
-# - Rabatt is shown as a percentage when present (e.g. "5,0 %"), otherwise blank.
-# - Beløp is the line total. When discount is 0 it equals Pris × Bestilt.
-# - The "Kommer senere" section may render the Beløp column as blank in the
-#   header but still emit a value in the row; making it optional keeps both
-#   variants matchable.
+# Real PDFs are messy: pypdf may split a single row across two lines, OCR may
+# drop the date column or replace digits with letters, and the unit code can
+# be anything Maske invents (ESK, PSE, STK, PAK, RLL, KIT, BNT, …).
+#
+# The parser uses three passes per line:
+#   1) strict regex (full layout, requires every column)
+#   2) lenient regex (date optional, any 1-5-letter uppercase unit code,
+#      optional rabatt, optional Beløp) — handles "Kommer senere" rows and
+#      OCR-flaky dates
+#   3) bare-bones fallback (artnr + description + first money amount) so
+#      products don't disappear entirely when only the price column survives
+#
+# All three accept lines after combining with the next line, so wrapped
+# product names recover too.
 
-# Maske unit codes seen on order confirmations (Salgsenhet)
-_MASKE_UNITS = "ESK|PSE|STK|PAK|PAR|BKS|KAR|RLL|FLA|FL|DUN|SET|KRT|POS"
-
+# Strict layout — clean text extraction
 _MASKE_LINE_RE = re.compile(
     r"^(?P<art>\d{7})\s+"
     r"(?P<desc>.+?)\s+"
-    r"(?P<date>\d{2}\.\d{2}\.\d{4})\s+"
+    r"(?P<date>\d{1,2}\.\d{1,2}\.\d{4})\s+"
     r"(?P<price>\d[\d\.\s]*,\d{2})\s+"
-    r"(?P<bestilt>\d+)\s+"
-    r"(?P<lev>\d+)\s+"
-    r"(?P<unit>" + _MASKE_UNITS + r")"
-    r"(?:\s+(?P<rab>\d+(?:,\d+)?)\s*%)?"
+    r"(?P<bestilt>\d+(?:[,.]\d+)?)\s+"
+    r"(?P<lev>\d+(?:[,.]\d+)?)\s+"
+    r"(?P<unit>[A-ZÆØÅ]{1,5})"
+    r"(?:\s+(?P<rab>\d+(?:[,.]\d+)?)\s*%)?"
     r"(?:\s+(?P<amount>\d[\d\.\s]*,\d{2}))?"
     r"\s*$"
 )
 
-# Skip lines that belong to the summary/footer block
+# Lenient — date optional, allows trailing junk after the amount (OCR garbage)
+_MASKE_LENIENT_RE = re.compile(
+    r"^(?P<art>\d{7})\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?:(?P<date>\d{1,2}\.\d{1,2}\.\d{4})\s+)?"
+    r"(?P<price>\d[\d\.\s]*,\d{2})\s+"
+    r"(?P<bestilt>\d+(?:[,.]\d+)?)\s+"
+    r"(?P<lev>\d+(?:[,.]\d+)?)\s+"
+    r"(?P<unit>[A-ZÆØÅ]{1,5})"
+    r"(?:\s+(?P<rab>\d+(?:[,.]\d+)?)\s*%)?"
+    r"(?:\s+(?P<amount>\d[\d\.\s]*,\d{2}))?"
+    r".*$"
+)
+
+# Bare-bones — artnr + description + at least one price-shaped number.
+# Fields that aren't on the line stay empty so matching can still proceed
+# from artnr/description alone.
+_MASKE_BAREBONES_RE = re.compile(
+    r"^(?P<art>\d{7})\s+"
+    r"(?P<desc>.+?)\s+"
+    r"(?P<price>\d[\d\.\s]*,\d{2})"
+    r".*$"
+)
+
+_MASKE_PRICE_TOKEN_RE = re.compile(r"\d[\d\.\s]*,\d{2}")
+_MASKE_QTY_TOKEN_RE = re.compile(r"\b\d{1,4}(?:[,.]\d+)?\b")
+_MASKE_UNIT_TOKEN_RE = re.compile(r"\b[A-ZÆØÅ]{1,5}\b")
+_MASKE_DATE_TOKEN_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\.\d{4}\b")
+_MASKE_PCT_TOKEN_RE = re.compile(r"\b(\d+(?:[,.]\d+)?)\s*%")
+
+# Skip lines that belong to the summary/footer block. Keep this tight so
+# legitimate product descriptions are not filtered out.
 _MASKE_FOOTER_KEYWORDS = [
     "sum eks", "utgaende mva", "utgående mva", "sluttbeløp", "sluttbelop",
-    "varer m", "totalt", "maske as", "maske.no", "kundeservice@maske",
-    "org.nr",
+    "fakturasum", "totalpris", "maske as", "maske.no", "kundeservice@maske",
+    "org.nr.", "organisasjonsnr",
 ]
 
 
@@ -533,8 +569,6 @@ def _maske_should_skip(line_low: str) -> bool:
         return True
     if any(kw in line_low for kw in _MASKE_FOOTER_KEYWORDS):
         return True
-    if _looks_like_total(line_low):
-        return True
     return False
 
 
@@ -542,9 +576,10 @@ def parse_maske_text(text: str, source_file: str) -> List[Dict[str, Any]]:
     """Parse a Maske order confirmation into structured V2 rows.
 
     Walks line-by-line. Rows are recognised by a 7-digit article number at
-    the start of the line followed by the standard Maske column layout.
-    Lines that do not match the row regex are silently skipped (headers,
-    footers, the "Blir levert" / "Kommer senere" labels, etc.).
+    the start of a line. Three regexes are tried in turn (strict → lenient
+    → bare-bones); if none of them match the current line alone, the line
+    is joined with the next one and the regexes run again, which recovers
+    rows where pypdf split the description across two lines.
     """
     raw_lines = [
         re.sub(r"\s+", " ", (line or "")).strip()
@@ -553,20 +588,144 @@ def parse_maske_text(text: str, source_file: str) -> List[Dict[str, Any]]:
     raw_lines = [line for line in raw_lines if line]
 
     rows: List[Dict[str, Any]] = []
-    for line in raw_lines:
+    seen_artnrs: set = set()
+    i = 0
+    n = len(raw_lines)
+
+    while i < n:
+        line = raw_lines[i]
         low = line.lower()
-        if _maske_should_skip(low):
+
+        if _maske_should_skip(low) or not re.match(r"^\d{7}\b", line):
+            i += 1
             continue
-        if not re.match(r"^\d{7}\b", line):
+
+        consumed, row = _maske_match_line(line, source_file)
+
+        # Try joining with the next line if the current one didn't yield a row
+        if row is None and i + 1 < n:
+            joined = (line + " " + raw_lines[i + 1]).strip()
+            joined_low = joined.lower()
+            if not _maske_should_skip(joined_low):
+                consumed_joined, row = _maske_match_line(joined, source_file)
+                if row is not None:
+                    consumed = 2  # we ate the next line too
+
+        if row is not None:
+            artnr = row.get("competitor_artnr", "")
+            # Avoid duplicating the same product when bare-bones matches the
+            # same line that the strict pass already accepted (defensive — the
+            # strict→lenient→barebones order makes this rare).
+            if artnr and artnr not in seen_artnrs:
+                seen_artnrs.add(artnr)
+                rows.append(row)
+            i += consumed
             continue
-        m = _MASKE_LINE_RE.match(line)
-        if not m:
-            continue
-        row = _build_maske_row(m, source_file)
-        if row:
-            rows.append(row)
+
+        i += 1
 
     return rows
+
+
+def _maske_match_line(line: str, source_file: str):
+    """Try the three Maske regexes against ``line``.
+
+    Returns ``(consumed_lines, row_dict_or_None)``.
+    """
+    for regex in (_MASKE_LINE_RE, _MASKE_LENIENT_RE):
+        m = regex.match(line)
+        if m:
+            row = _build_maske_row(m, source_file)
+            if row is not None:
+                return 1, row
+
+    m = _MASKE_BAREBONES_RE.match(line)
+    if m:
+        row = _build_maske_barebones_row(m, line, source_file)
+        if row is not None:
+            return 1, row
+
+    return 1, None
+
+
+def _build_maske_barebones_row(
+    m: re.Match, line: str, source_file: str,
+) -> Optional[Dict[str, Any]]:
+    """Build a row from minimal info — used when the strict layout breaks.
+
+    Recovers what's available on the line: the article number, description,
+    price, and any obvious qty/unit/date tokens. Missing fields stay None
+    so downstream logic can still match on artnr + description.
+    """
+    art = (m.group("art") or "").strip()
+    desc_raw = (m.group("desc") or "").strip()
+    if not art or not desc_raw:
+        return None
+
+    # Cut a leading date out of the description if present
+    date_m = _MASKE_DATE_TOKEN_RE.search(desc_raw)
+    if date_m and date_m.start() > 0:
+        desc = desc_raw[: date_m.start()].strip()
+    else:
+        desc = desc_raw
+    if not desc:
+        desc = desc_raw
+
+    price_before_discount = _parse_money(m.group("price"))
+
+    tail = line[m.end():]
+
+    qty_match = _MASKE_QTY_TOKEN_RE.search(tail)
+    bestilt = _to_float(qty_match.group(0)) if qty_match else None
+    lev = bestilt
+
+    unit_match = _MASKE_UNIT_TOKEN_RE.search(tail)
+    unit = unit_match.group(0) if unit_match else ""
+
+    pct_match = _MASKE_PCT_TOKEN_RE.search(tail)
+    discount_pct = _to_float(pct_match.group(1)) if pct_match else None
+
+    money_tokens = _MASKE_PRICE_TOKEN_RE.findall(tail)
+    line_amount = _parse_money(money_tokens[-1]) if money_tokens else None
+
+    bestilt_val = bestilt if bestilt is not None else 0.0
+    discount_factor = (
+        1.0 - (discount_pct / 100.0) if discount_pct is not None else 1.0
+    )
+    calculated_unit_price = (
+        round(price_before_discount * discount_factor, 4)
+        if price_before_discount is not None
+        else None
+    )
+    competitor_line_amount = line_amount
+    if competitor_line_amount is None and price_before_discount is not None and bestilt_val:
+        competitor_line_amount = round(
+            price_before_discount * discount_factor * bestilt_val, 2
+        )
+
+    return {
+        "source_file": source_file,
+        "competitor": "Maske",
+        "competitor_artnr": art,
+        "description": desc,
+        "quantity_purchased": bestilt_val,
+        "packaging_text": "",
+        "packaging_count": 1,
+        "unit": unit,
+        "price_unit": unit,
+        "price_before_discount": price_before_discount,
+        "discount_pct": discount_pct,
+        "line_amount": line_amount,
+        "calculated_unit_price": calculated_unit_price,
+        "total_units": bestilt_val,
+        "competitor_line_amount": competitor_line_amount,
+        "delivered_qty": lev or 0.0,
+        "parse_method": "maske_lenient",
+        "confidence": 0.6,
+        "our_unit_price": None,
+        "our_comparable_line_price": None,
+        "savings_amount": None,
+    }
 
 
 def _build_maske_row(m: re.Match, source_file: str) -> Optional[Dict[str, Any]]:
