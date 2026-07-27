@@ -1,6 +1,7 @@
 import json
 import logging
 import math
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -8,7 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, UploadFile, File, Request
+from fastapi import APIRouter, UploadFile, File, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from v2.parsing import classify_file, parse_file
@@ -17,13 +18,25 @@ from v2.matching import match_deduped_rows
 from v2 import persistence as rv
 from v2.export import generate_export_xlsx, generate_export_pdf
 from v2 import pricedb
+from sso_auth import require_sso, require_role, is_admin, User
+from ratelimit import limiter
 
 logger = logging.getLogger(__name__)
 
 # ============================================================
 # V2 STORAGE (completely separate from V1)
 # ============================================================
-_DATA_DIR = Path(__import__("os").getenv("DATA_DIR", "/var/data")).resolve()
+_DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data")).resolve()
+
+# Grenser (anti-abuse / kostkontroll)
+V2_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))
+V2_MAX_TOTAL_UPLOAD_BYTES = int(os.getenv("V2_MAX_TOTAL_UPLOAD_BYTES", str(100 * 1024 * 1024)))
+V2_MAX_FILES = int(os.getenv("V2_MAX_FILES", "20"))
+V2_MAX_ROWS = int(os.getenv("V2_MAX_ROWS", "2000"))
+
+# Tilgang til gamle jobber uten registrert eier (fra før tilgangskontroll).
+# Default av (sikker): kun admin når eier mangler.
+V2_ALLOW_LEGACY_JOBS = os.getenv("V2_ALLOW_LEGACY_JOBS", "0").strip() == "1"
 
 V2_DIR = _DATA_DIR / "v2"
 V2_DIR.mkdir(parents=True, exist_ok=True)
@@ -93,6 +106,27 @@ def _get_task(job_id: str) -> Optional[Dict[str, Any]]:
     if t is not None:
         return t
     return _rehydrate_task(job_id)
+
+
+def _authorize(job_id: str, user: User):
+    """Hent task og håndhev eierskap.
+
+    Returnerer (task, None) ved tilgang, eller (None, JSONResponse) ved avslag.
+    Bruker 404 (ikke 403) for å ikke bekrefte eksistensen av andres jobber.
+    """
+    t = _get_task(job_id)
+    if not t:
+        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    owner = t.get("owner_sub")
+    if owner is None:
+        if is_admin(user) or V2_ALLOW_LEGACY_JOBS:
+            return t, None
+        logger.warning(f"V2 tilgang avvist (eierløs jobb) sub={user.sub} job={job_id}")
+        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    if owner != user.sub and not is_admin(user):
+        logger.warning(f"V2 IDOR-forsøk avvist sub={user.sub} owner={owner} job={job_id}")
+        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    return t, None
 
 
 def _rehydrate_task(job_id: str) -> Optional[Dict[str, Any]]:
@@ -222,8 +256,14 @@ def v2_index():
 
 
 @v2_router.post("/upload")
-async def v2_upload(files: List[UploadFile] = File(...)):
+@limiter.limit("20/minute")
+async def v2_upload(request: Request, files: List[UploadFile] = File(...), user: User = Depends(require_sso)):
     """Accept one or more PDF/XLSX files, create a V2 job, and start parsing."""
+    if len(files) > V2_MAX_FILES:
+        return JSONResponse(
+            {"error": f"For mange filer (maks {V2_MAX_FILES})."}, status_code=400
+        )
+
     job_id = uuid.uuid4().hex
     now = _utc_now_iso()
 
@@ -232,6 +272,7 @@ async def v2_upload(files: List[UploadFile] = File(...)):
     job_upload_dir.mkdir(parents=True, exist_ok=True)
 
     file_results: List[Dict[str, Any]] = []
+    total_bytes = 0
 
     for f in files:
         filename = (f.filename or "unknown").strip()
@@ -244,6 +285,19 @@ async def v2_upload(files: List[UploadFile] = File(...)):
                 file_results.append(entry)
                 continue
 
+            if len(content) > V2_MAX_UPLOAD_BYTES:
+                entry["upload_status"] = "error"
+                entry["error"] = "Fil er for stor"
+                file_results.append(entry)
+                continue
+
+            total_bytes += len(content)
+            if total_bytes > V2_MAX_TOTAL_UPLOAD_BYTES:
+                entry["upload_status"] = "error"
+                entry["error"] = "Samlet opplastingsstørrelse er for stor"
+                file_results.append(entry)
+                break
+
             file_type = classify_file(filename, content)
 
             if file_type == "unknown":
@@ -255,8 +309,10 @@ async def v2_upload(files: List[UploadFile] = File(...)):
             entry["type"] = file_type
             entry["size_bytes"] = len(content)
 
-            # Save file to disk
-            safe_name = f"{len(file_results):03d}_{filename}"
+            # Save file to disk. Bruk kun basisnavnet og fjern sti-separatorer
+            # for å hindre sti-manipulasjon via filnavnet.
+            base = os.path.basename(filename).replace("\\", "_").replace("/", "_")
+            safe_name = f"{len(file_results):03d}_{base}"
             dest = job_upload_dir / safe_name
             dest.write_bytes(content)
             entry["stored_as"] = safe_name
@@ -286,11 +342,13 @@ async def v2_upload(files: List[UploadFile] = File(...)):
         "job_id": job_id,
         "created_at": now,
         "status": "parsing",
+        "owner_sub": user.sub,
         "files": file_results,
         "total_files": len(file_results),
         "uploaded_files": uploaded_count,
         "error_files": error_count,
     }
+    logger.info(f"V2 upload: job={job_id} sub={user.sub} filer={uploaded_count}")
 
     V2_TASKS[job_id] = task_entry
     _append_v2_job(task_entry)
@@ -358,6 +416,13 @@ def _parse_job_files(job_id: str) -> None:
 
     # Deduplicate
     deduped_rows = deduplicate(all_rows)
+
+    # Anti-abuse: tak på antall rader som sendes videre til matching (LLM-kost).
+    if len(deduped_rows) > V2_MAX_ROWS:
+        logger.warning(
+            f"V2 job={job_id}: {len(deduped_rows)} unike rader overstiger tak {V2_MAX_ROWS}; kapper."
+        )
+        deduped_rows = deduped_rows[:V2_MAX_ROWS]
 
     # Update overall job status
     if parsed_count == 0 and parse_error_count > 0:
@@ -432,12 +497,12 @@ def _parse_job_files(job_id: str) -> None:
 
 
 @v2_router.get("/status/{job_id}")
-def v2_status(job_id: str):
+def v2_status(job_id: str, user: User = Depends(require_sso)):
     """Get status for a V2 job, including per-file parse results."""
     try:
-        t = _get_task(job_id)
-        if not t:
-            return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+        t, err = _authorize(job_id, user)
+        if err:
+            return err
         payload = {
             "job_id": t["job_id"],
             "status": t["status"],
@@ -464,17 +529,17 @@ def v2_status(job_id: str):
         # 500 response interrupts the whole flow with "Polling feilet".
         logger.exception(f"v2_status failed for job={job_id}")
         return JSONResponse(
-            {"error": f"Statusoppslag feilet: {e}", "job_id": job_id},
+            {"error": "Statusoppslag feilet", "job_id": job_id},
             status_code=500,
         )
 
 
 @v2_router.get("/rows/{job_id}")
-def v2_rows(job_id: str, deduped: bool = True):
+def v2_rows(job_id: str, deduped: bool = True, user: User = Depends(require_sso)):
     """Get rows for a V2 job. Use ?deduped=false for raw parsed rows."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     if t["status"] == "parsing":
         return JSONResponse({"error": "Parsing pågår fortsatt"}, status_code=409)
     if deduped:
@@ -485,9 +550,16 @@ def v2_rows(job_id: str, deduped: bool = True):
 
 
 @v2_router.get("/jobs")
-def v2_jobs(limit: int = 50):
-    """List V2 jobs (most recent first)."""
-    return {"jobs": _load_v2_jobs(limit=limit)}
+def v2_jobs(limit: int = 50, user: User = Depends(require_sso)):
+    """List V2 jobs (most recent first) — kun egne jobber (admin ser alle)."""
+    jobs = _load_v2_jobs(limit=limit)
+    if not is_admin(user):
+        jobs = [
+            j for j in jobs
+            if j.get("owner_sub") == user.sub
+            or (j.get("owner_sub") is None and V2_ALLOW_LEGACY_JOBS)
+        ]
+    return {"jobs": jobs}
 
 
 # ============================================================
@@ -501,11 +573,12 @@ def _get_catalog_bundle():
 
 
 @v2_router.post("/match/{job_id}")
-def v2_start_matching(job_id: str, prefer_own_brands: bool = True):
+@limiter.limit("20/minute")
+def v2_start_matching(request: Request, job_id: str, prefer_own_brands: bool = True, user: User = Depends(require_sso)):
     """Start matching for a parsed V2 job."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
 
     if t["status"] not in ("parsed", "partial_error", "error", "matched", "review"):
         return JSONResponse(
@@ -648,11 +721,11 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
 
 
 @v2_router.get("/matched/{job_id}")
-def v2_matched_rows(job_id: str):
+def v2_matched_rows(job_id: str, user: User = Depends(require_sso)):
     """Get matched rows with candidates for a V2 job."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     if t["status"] == "matching":
         return {
             "job_id": job_id,
@@ -679,11 +752,11 @@ def v2_matched_rows(job_id: str):
 # V2 REVIEW ROUTES
 # ============================================================
 
-def _require_review_job(job_id: str) -> tuple:
-    """Validate job exists and is in review state. Returns (task, error_response)."""
-    t = _get_task(job_id)
-    if not t:
-        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+def _require_review_job(job_id: str, user: User) -> tuple:
+    """Validate job exists, is owned by the user, and is in review state."""
+    t, err = _authorize(job_id, user)
+    if err:
+        return None, err
     if t.get("status") not in ("review", "matched"):
         return None, JSONResponse(
             {"error": f"Jobb er ikke i review-modus (status: {t.get('status')})"},
@@ -695,11 +768,11 @@ def _require_review_job(job_id: str) -> tuple:
 
 
 @v2_router.get("/review/{job_id}")
-def v2_review(job_id: str):
+def v2_review(job_id: str, user: User = Depends(require_sso)):
     """Get full review data with all overrides applied."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     if t.get("status") not in ("review", "matched"):
         return JSONResponse(
             {"error": f"Review ikke tilgjengelig (status: {t.get('status')})"},
@@ -730,9 +803,9 @@ def v2_review(job_id: str):
 
 
 @v2_router.post("/review/{job_id}/select")
-async def v2_select_candidate(job_id: str, request: Request):
+async def v2_select_candidate(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Select a candidate for one row. Body: {dedup_idx: int, candidate_idx: int}"""
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -761,12 +834,12 @@ async def v2_select_candidate(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/batch-select")
-async def v2_batch_select(job_id: str, request: Request):
+async def v2_batch_select(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Auto-select best candidate for all rows that have a match.
 
     Body: {override_existing: bool} — whether to override rows that already have a selection.
     """
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -793,9 +866,9 @@ async def v2_batch_select(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/decide")
-async def v2_decide(job_id: str, request: Request):
+async def v2_decide(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Set review status for one row. Body: {dedup_idx: int, status: 'approved'|'rejected'|'pending'}"""
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -830,9 +903,9 @@ async def v2_decide(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/bulk-decide")
-async def v2_bulk_decide(job_id: str, request: Request):
+async def v2_bulk_decide(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Set review status for multiple rows. Body: {dedup_indices: [int], status: str}"""
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -852,12 +925,12 @@ async def v2_bulk_decide(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/extras")
-async def v2_extras(job_id: str, request: Request):
+async def v2_extras(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Update comment for one row.
 
     Body: {dedup_idx: int, comment?: str}
     """
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -888,13 +961,13 @@ async def v2_extras(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/search-catalog")
-async def v2_search_catalog(job_id: str, request: Request):
+async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Fast interactive catalog search using BM25 only (no Claude/embeddings).
 
     Body: {query: str, limit?: int}
     Returns matching products from both LK and full catalogs, ranked by relevance.
     """
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -997,13 +1070,13 @@ async def v2_search_catalog(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/replace-candidate")
-async def v2_replace_candidate(job_id: str, request: Request):
+async def v2_replace_candidate(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Replace/add a candidate from catalog search. Body: {dedup_idx: int, our_artnr: str}
 
     Looks up the product in the catalog, adds it as a new candidate, and selects it.
     Returns the updated row data.
     """
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -1123,9 +1196,9 @@ async def v2_replace_candidate(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/delete")
-async def v2_delete_row(job_id: str, request: Request):
+async def v2_delete_row(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Soft-delete a row. Body: {dedup_idx: int}"""
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -1139,9 +1212,9 @@ async def v2_delete_row(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/restore")
-async def v2_restore_row(job_id: str, request: Request):
+async def v2_restore_row(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Restore a soft-deleted row. Body: {dedup_idx: int}"""
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -1155,12 +1228,12 @@ async def v2_restore_row(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/add-row")
-async def v2_add_row(job_id: str, request: Request):
+async def v2_add_row(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Add a manual row to the review. Body: {description, price, competitor_name?, competitor_artnr?, specification?, quantity?}
 
     Creates a new review row, runs matching, and returns the full row.
     """
-    t, err = _require_review_job(job_id)
+    t, err = _require_review_job(job_id, user)
     if err:
         return err
 
@@ -1264,25 +1337,25 @@ async def v2_add_row(job_id: str, request: Request):
 
 
 @v2_router.post("/review/{job_id}/lock")
-async def v2_lock(job_id: str, request: Request):
+async def v2_lock(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Lock the job to prevent further edits."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     try:
         body = await request.json()
     except Exception:
         body = {}
-    rv.set_lock(job_id, True, locked_by=body.get("locked_by", ""))
+    rv.set_lock(job_id, True, locked_by=body.get("locked_by", "") or user.email)
     return {"ok": True, "locked": True}
 
 
 @v2_router.post("/review/{job_id}/unlock")
-def v2_unlock(job_id: str):
+def v2_unlock(job_id: str, user: User = Depends(require_sso)):
     """Unlock the job to allow edits."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     rv.set_lock(job_id, False)
     return {"ok": True, "locked": False}
 
@@ -1353,18 +1426,18 @@ def record_approval_learning(job_id: str, row: Dict[str, Any], candidate: Dict[s
 
 
 @v2_router.get("/learning")
-def v2_get_learnings(limit: int = 200):
-    """Get recorded learnings."""
+def v2_get_learnings(limit: int = 200, _: User = Depends(require_role())):
+    """Get recorded learnings (kun admin – inneholder data på tvers av jobber)."""
     entries = load_learnings()
     return {"count": len(entries), "learnings": entries[-limit:]}
 
 
 @v2_router.get("/review/{job_id}/ui", response_class=HTMLResponse)
-def v2_review_ui(job_id: str):
+def v2_review_ui(job_id: str, user: User = Depends(require_sso)):
     """Serve the review UI page."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     html_path = Path(__file__).parent / "templates" / "review.html"
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
@@ -1378,16 +1451,16 @@ V2_EXPORTS_DIR.mkdir(exist_ok=True)
 
 
 @v2_router.get("/export/{job_id}")
-def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True):
+def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True, user: User = Depends(require_sso)):
     """Generate and download export from review state.
 
     Query params:
         format: 'xlsx' (default) or 'pdf'
         show_line_prices: true (default) or false
     """
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     if t.get("status") not in ("review", "matched"):
         return JSONResponse(
             {"error": f"Eksport ikke tilgjengelig (status: {t.get('status')})"},
@@ -1427,9 +1500,9 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True):
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 headers={"Content-Disposition": f'attachment; filename="{filename}"'},
             )
-    except Exception as e:
+    except Exception:
         logger.exception(f"V2 eksport feilet for job={job_id}")
-        return JSONResponse({"error": f"Eksport feilet: {e}"}, status_code=500)
+        return JSONResponse({"error": "Eksport feilet"}, status_code=500)
 
 
 # ============================================================
@@ -1437,11 +1510,11 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True):
 # ============================================================
 
 @v2_router.post("/pricedb/commit/{job_id}")
-def v2_pricedb_commit(job_id: str):
+def v2_pricedb_commit(job_id: str, user: User = Depends(require_sso)):
     """Commit approved review rows to the price database."""
-    t = _get_task(job_id)
-    if not t:
-        return JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
+    t, err = _authorize(job_id, user)
+    if err:
+        return err
     if t.get("status") not in ("review", "matched"):
         return JSONResponse(
             {"error": f"Kan ikke committe jobb med status '{t.get('status')}'"},
