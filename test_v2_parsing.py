@@ -61,6 +61,24 @@ def test_xlsx_multiline_headers_and_styled_sections_produce_only_products():
     ]
 
 
+def test_xlsx_multiline_headers_do_not_guess_between_numeric_columns():
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["Varer", None, "Ukjent antall", "Ukjent leverandørpris"])
+    sheet.append([None, "Varenr", None, None])
+    sheet.append(["Produkt A", 10001, 2, 99.0])
+    sheet.append(["Produkt B", 10002, 3, 149.0])
+    output = BytesIO()
+    workbook.save(output)
+
+    rows = parse_xlsx_rows(output.getvalue(), "tvetydige-kolonner.xlsx")
+
+    assert [row["price_before_discount"] for row in rows] == [None, None]
+    assert [row["calculated_unit_price"] for row in rows] == [None, None]
+    assert [row["competitor_line_amount"] for row in rows] == [None, None]
+    assert {row["competitor"] for row in rows} == {""}
+
+
 @pytest.mark.parametrize("description_header", ["Varer ", "Varer\N{NO-BREAK SPACE}"])
 def test_xlsx_positional_fallback_preserves_whitespace_headers(description_header):
     workbook = BytesIO()

@@ -1641,10 +1641,11 @@ def _find_multiline_xlsx_layout(sheet: Any) -> Optional[Dict[str, Any]]:
                 if isinstance(sheet.cell(row, column).value, (int, float))
                 and not isinstance(sheet.cell(row, column).value, bool)
             )
-        if numeric_counts:
-            price_column, numeric_count = max(numeric_counts.items(), key=lambda item: item[1])
-            if numeric_count:
-                columns["price"] = price_column
+        numeric_columns = [
+            column for column, count in numeric_counts.items() if count > 0
+        ]
+        if len(numeric_columns) == 1:
+            columns["price"] = numeric_columns[0]
 
     price_source = ""
     price_column = columns.get("price")
