@@ -17,6 +17,7 @@ from io import BytesIO
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+from openpyxl import load_workbook
 from pypdf import PdfReader
 
 logger = logging.getLogger(__name__)
@@ -1535,6 +1536,366 @@ def _calculate_confidence(item_no: str, description: str,
 # XLSX ROW EXTRACTION (generic competitor format)
 # ============================================================
 
+_XLSX_COLUMN_VARIANTS = {
+    "competitor": [
+        "Konkurrent Navn", "Konkurrent", "Leverandør", "Supplier",
+        "Competitor", "Kilde", "Firma",
+    ],
+    "artnr": [
+        "Konkurrent Art.Nr", "Art.Nr", "Artikkelnr", "Artikkel",
+        "Art.nr", "Varenr", "Varenummer", "Item No", "SKU",
+        "Konkurrent Artikkelnummer",
+    ],
+    "description": [
+        "Konkurrent Item Description", "Item Description", "Beskrivelse",
+        "Produktnavn", "Produkt", "Description", "Varenavn", "Varer", "Navn",
+        "Konkurrent Beskrivelse",
+    ],
+    "specification": [
+        "Konkurrent Specification", "Specification", "Spesifikasjon",
+        "Spec", "Detaljer",
+    ],
+    "price": [
+        "Konkurrent Pris", "Pris", "Price", "Enhetspris", "Stk.pris",
+        "Stkpris", "Unit Price",
+    ],
+    "unit": [
+        "Konkurrent salgsenhet", "Salgsenhet", "Enhet", "Unit",
+        "Pakningsenhet",
+    ],
+    "quantity": [
+        "Antall", "Kvantum", "Quantity", "Qty", "Mengde", "Ant",
+        "Bestilt antall",
+    ],
+}
+
+_XLSX_PRICE_SOURCE_HEADERS = {
+    "gymo": "GyMo",
+}
+
+_XLSX_TOTAL_ROW_LABELS = {"sum", "total", "totalt", "subtotal", "delsum"}
+
+
+def _xlsx_header_name(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().casefold()
+
+
+def _xlsx_cell_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value).strip()
+
+
+def _xlsx_fill_signature(cell: Any) -> Optional[Tuple[Any, ...]]:
+    fill = cell.fill
+    if not fill or not fill.fill_type:
+        return None
+    color = fill.fgColor
+    if color.type == "rgb":
+        color_value = color.rgb
+    elif color.type == "indexed":
+        color_value = color.indexed
+    elif color.type == "theme":
+        color_value = color.theme
+    else:
+        color_value = None
+    return fill.fill_type, color.type, color_value, color.tint
+
+
+def _xlsx_row_has_numeric_product_data(
+    sheet: Any,
+    row_number: int,
+    columns: Any,
+) -> bool:
+    return any(
+        (cell := sheet.cell(row_number, column)).data_type != "f"
+        and _to_float(cell.value) is not None
+        for column in columns
+    )
+
+
+def _xlsx_is_total_row(
+    description: str,
+    artnr: str,
+    artnr_is_formula: bool,
+) -> bool:
+    normalized_description = description.rstrip(":").strip().casefold()
+    return normalized_description in _XLSX_TOTAL_ROW_LABELS and (
+        artnr_is_formula or not artnr
+    )
+
+
+def _find_multiline_xlsx_layout(sheet: Any) -> Optional[Dict[str, Any]]:
+    """Find a multiline header block and one unambiguous price column."""
+    normalized_variants = {
+        field: {_xlsx_header_name(name) for name in variants}
+        for field, variants in _XLSX_COLUMN_VARIANTS.items()
+    }
+    columns: Dict[str, int] = {}
+    header_rows: Dict[str, int] = {}
+    header_cells = set()
+    preliminary_price_columns = set()
+
+    # Locate the two anchors needed to identify a multiline layout.
+    for row in sheet.iter_rows(min_row=1, max_row=min(sheet.max_row, 10)):
+        for cell in row:
+            header = _xlsx_header_name(cell.value)
+            if not header:
+                continue
+            for field in ("description", "artnr"):
+                variants = normalized_variants[field]
+                if field not in columns and header in variants:
+                    columns[field] = cell.column
+                    header_rows[field] = cell.row
+                    header_cells.add((cell.row, cell.column))
+                    break
+
+    if not columns.get("description") or not columns.get("artnr"):
+        return None
+    if header_rows["description"] == header_rows["artnr"]:
+        return None
+
+    def track_preliminary_price_columns(row: Any) -> None:
+        for cell in row:
+            header = _xlsx_header_name(cell.value)
+            if (
+                header in normalized_variants["price"]
+                or header in _XLSX_PRICE_SOURCE_HEADERS
+            ):
+                preliminary_price_columns.add(cell.column)
+
+    last_anchor_row = max(header_rows.values())
+    for row in sheet.iter_rows(min_row=1, max_row=last_anchor_row):
+        track_preliminary_price_columns(row)
+
+    # The header block ends immediately before the first product signal. A
+    # non-header item number always wins; description styling only identifies
+    # a section when the item number is absent.
+    description_column = columns["description"]
+    artnr_column = columns["artnr"]
+    product_data_columns = set(range(1, sheet.max_column + 1)) - {
+        description_column,
+        artnr_column,
+    }
+    def row_has_product_data(row_number: int) -> bool:
+        return _xlsx_row_has_numeric_product_data(
+            sheet,
+            row_number,
+            product_data_columns,
+        )
+
+    first_product_row = None
+    for row_number in range(last_anchor_row + 1, sheet.max_row + 1):
+        track_preliminary_price_columns(sheet[row_number])
+        artnr_cell = sheet.cell(row_number, artnr_column)
+        artnr = _xlsx_cell_text(artnr_cell.value)
+        description_cell = sheet.cell(row_number, description_column)
+        description = _xlsx_cell_text(description_cell.value)
+        if _xlsx_is_total_row(description, artnr, artnr_cell.data_type == "f"):
+            continue
+        if artnr and _xlsx_header_name(artnr) not in normalized_variants["artnr"]:
+            first_product_row = row_number
+            break
+
+        if not description:
+            continue
+        if _xlsx_header_name(description) in normalized_variants["description"]:
+            continue
+        if (
+            _xlsx_fill_signature(description_cell) or description_cell.font.bold
+        ) and not row_has_product_data(row_number):
+            continue
+        first_product_row = row_number
+        break
+
+    header_end_row = (
+        first_product_row - 1
+        if first_product_row is not None
+        else max(header_rows.values())
+    )
+
+    explicit_price_columns = set()
+    source_price_columns: Dict[int, str] = {}
+    owned_header_columns = set()
+    header_labels_by_column: Dict[int, set] = {}
+
+    # Collect every header signal in the relevant block. Price candidates are
+    # deliberately kept separate until ownership collisions can be removed.
+    for row in sheet.iter_rows(min_row=1, max_row=header_end_row):
+        row_number = row[0].row
+        description = _xlsx_cell_text(
+            sheet.cell(row_number, description_column).value
+        )
+        artnr_cell = sheet.cell(row_number, artnr_column)
+        artnr = _xlsx_cell_text(artnr_cell.value)
+        if _xlsx_is_total_row(description, artnr, artnr_cell.data_type == "f"):
+            continue
+        for cell in row:
+            if cell.data_type == "f":
+                continue
+            header = _xlsx_header_name(cell.value)
+            if not header:
+                continue
+            header_labels_by_column.setdefault(cell.column, set()).add(header)
+
+            for field, variants in normalized_variants.items():
+                if field == "price" or header not in variants:
+                    continue
+                owned_header_columns.add(cell.column)
+                if field not in columns:
+                    columns[field] = cell.column
+                    header_rows[field] = cell.row
+                header_cells.add((cell.row, cell.column))
+                break
+
+            if header in normalized_variants["price"]:
+                explicit_price_columns.add(cell.column)
+                header_cells.add((cell.row, cell.column))
+
+            source_name = _XLSX_PRICE_SOURCE_HEADERS.get(header)
+            if source_name:
+                source_price_columns[cell.column] = source_name
+                header_cells.add((cell.row, cell.column))
+
+    valid_source_columns = set(source_price_columns)
+    source_only_columns = valid_source_columns - explicit_price_columns
+    allowed_source_headers = set(_XLSX_PRICE_SOURCE_HEADERS)
+    for column in source_only_columns:
+        labels = header_labels_by_column.get(column, set())
+        source_labels = labels & allowed_source_headers
+        has_conflicting_label = any(
+            label not in normalized_variants["price"]
+            and label not in source_labels
+            for label in labels
+        )
+        if len(source_labels) != 1 or has_conflicting_label:
+            valid_source_columns.discard(column)
+
+    candidate_columns = (
+        explicit_price_columns | valid_source_columns
+    ) - owned_header_columns
+
+    price_source = ""
+    if len(candidate_columns) == 1:
+        price_column = next(iter(candidate_columns))
+        columns["price"] = price_column
+        price_source = source_price_columns.get(price_column, "")
+
+    return {
+        "columns": columns,
+        "header_cells": header_cells,
+        "first_header_row": min(row for row, _ in header_cells),
+        "product_data_columns": product_data_columns,
+        "price_signal_columns": preliminary_price_columns,
+        "price_source": price_source,
+    }
+
+
+def _parse_multiline_xlsx_rows(
+    content: bytes,
+    source_file: str,
+) -> Optional[List[Dict[str, Any]]]:
+    workbook = load_workbook(BytesIO(content), data_only=False)
+    sheet = workbook.active
+    layout = _find_multiline_xlsx_layout(sheet)
+    if layout is None:
+        return None
+
+    columns = layout["columns"]
+    header_cells = layout["header_cells"]
+    product_data_columns = layout["product_data_columns"]
+    price_source = layout["price_source"]
+    rows: List[Dict[str, Any]] = []
+    section = ""
+    subsection = ""
+    section_fill = None
+
+    def cell_value(row_number: int, field: str) -> Any:
+        column = columns.get(field)
+        if column is None or (row_number, column) in header_cells:
+            return None
+        return sheet.cell(row_number, column).value
+
+    for row_number in range(layout["first_header_row"], sheet.max_row + 1):
+        description_cell = sheet.cell(row_number, columns["description"])
+        description = _xlsx_cell_text(cell_value(row_number, "description"))
+        artnr = _xlsx_cell_text(cell_value(row_number, "artnr"))
+        raw_price = cell_value(row_number, "price")
+        price = _to_float(raw_price)
+
+        artnr_cell = sheet.cell(row_number, columns["artnr"])
+        if _xlsx_is_total_row(description, artnr, artnr_cell.data_type == "f"):
+            continue
+
+        fill_signature = _xlsx_fill_signature(description_cell)
+        is_styled_label = bool(fill_signature or description_cell.font.bold)
+        has_product_data = _xlsx_row_has_numeric_product_data(
+            sheet,
+            row_number,
+            (
+                column
+                for column in product_data_columns
+                if (row_number, column) not in header_cells
+            ),
+        )
+        if (
+            description
+            and not artnr
+            and price is None
+            and is_styled_label
+            and not has_product_data
+        ):
+            if section_fill is None and fill_signature is not None:
+                section_fill = fill_signature
+            if not section or (fill_signature is not None and fill_signature == section_fill):
+                section = description
+                subsection = ""
+            else:
+                subsection = description
+            continue
+
+        if not description and not artnr:
+            continue
+
+        quantity = _to_float(cell_value(row_number, "quantity"))
+        quantity_value = quantity if quantity else 0.0
+        competitor = _xlsx_cell_text(cell_value(row_number, "competitor")) or price_source
+        rows.append({
+            "source_file": source_file,
+            "competitor": competitor,
+            "competitor_artnr": artnr,
+            "description": description,
+            "quantity_purchased": quantity_value,
+            "packaging_text": "",
+            "packaging_count": 1,
+            "unit": _xlsx_cell_text(cell_value(row_number, "unit")),
+            "price_unit": "",
+            "price_before_discount": price,
+            "discount_pct": None,
+            "line_amount": None,
+            "calculated_unit_price": price,
+            "total_units": quantity_value,
+            "competitor_line_amount": (
+                round(quantity_value * price, 2)
+                if price is not None and quantity_value
+                else None
+            ),
+            "our_unit_price": None,
+            "our_comparable_line_price": None,
+            "savings_amount": None,
+            "section": section,
+            "subsection": subsection,
+        })
+
+    return rows
+
+
 def _match_xlsx_column(actual_columns: List[Any], candidates: List[str]) -> Optional[Any]:
     """Find which actual column name matches any of the candidate names (case-insensitive).
 
@@ -1563,6 +1924,9 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
     if no columns match the expected names.
     """
     try:
+        multiline_rows = _parse_multiline_xlsx_rows(content, source_file)
+        if multiline_rows is not None:
+            return multiline_rows
         df = pd.read_excel(BytesIO(content), engine="openpyxl")
     except Exception as e:
         raise ValueError(f"Kunne ikke lese XLSX: {e}")
@@ -1574,43 +1938,9 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
     # but pandas requires the exact label (including trailing spaces or NBSP).
     actual_cols = df.columns.tolist()
 
-    # Map each logical field to a list of possible column name variants
-    _COL_VARIANTS = {
-        "competitor": [
-            "Konkurrent Navn", "Konkurrent", "Leverandør", "Supplier",
-            "Competitor", "Kilde", "Firma",
-        ],
-        "artnr": [
-            "Konkurrent Art.Nr", "Art.Nr", "Artikkelnr", "Artikkel",
-            "Art.nr", "Varenr", "Varenummer", "Item No", "SKU",
-            "Konkurrent Artikkelnummer",
-        ],
-        "description": [
-            "Konkurrent Item Description", "Item Description", "Beskrivelse",
-            "Produktnavn", "Produkt", "Description", "Varenavn", "Navn",
-            "Konkurrent Beskrivelse",
-        ],
-        "specification": [
-            "Konkurrent Specification", "Specification", "Spesifikasjon",
-            "Spec", "Detaljer",
-        ],
-        "price": [
-            "Konkurrent Pris", "Pris", "Price", "Enhetspris", "Stk.pris",
-            "Stkpris", "Unit Price",
-        ],
-        "unit": [
-            "Konkurrent salgsenhet", "Salgsenhet", "Enhet", "Unit",
-            "Pakningsenhet",
-        ],
-        "quantity": [
-            "Antall", "Kvantum", "Quantity", "Qty", "Mengde", "Ant",
-            "Bestilt antall",
-        ],
-    }
-
     # Resolve actual column names for each field
     col_map = {}
-    for field, variants in _COL_VARIANTS.items():
+    for field, variants in _XLSX_COLUMN_VARIANTS.items():
         col_map[field] = _match_xlsx_column(actual_cols, variants)
 
     # If no description or artnr column found, try positional fallback:
