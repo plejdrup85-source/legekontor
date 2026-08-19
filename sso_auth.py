@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -25,9 +26,25 @@ SSO_EXPECTED_ISSUER = os.environ.get("SSO_EXPECTED_ISSUER", "onemed-dashboard")
 SSO_DASHBOARD_URL = os.environ["SSO_DASHBOARD_URL"]
 SSO_SESSION_COOKIE_TTL = int(os.environ.get("SSO_SESSION_COOKIE_TTL", "28800"))
 COOKIE_NAME = "sso_session"
+_ROLE_PATTERN = re.compile(r"[A-Za-z][A-Za-z0-9_.:-]*")
+
+
+def _normalize_role(role: object) -> str:
+    """Return a canonical role value, or an empty value for malformed claims."""
+    if not isinstance(role, str):
+        return ""
+    normalized = role.strip()
+    if not normalized.isascii() or _ROLE_PATTERN.fullmatch(normalized) is None:
+        return ""
+    return normalized.lower()
+
 
 # Roller som regnes som administratorer (kan endre delte ressurser, f.eks. katalog).
-ADMIN_ROLES = {r.strip() for r in os.environ.get("ADMIN_ROLES", "admin").split(",") if r.strip()}
+ADMIN_ROLES = {
+    normalized
+    for role in os.environ.get("ADMIN_ROLES", "admin,superadmin").split(",")
+    if (normalized := _normalize_role(role))
+}
 
 # ------------------------------------------------------------------
 # Sesjonstilbakekalling (denylist)
@@ -152,10 +169,15 @@ def require_role(*allowed_roles: str) -> Callable[..., User]:
 
     Uten argumenter kreves en av ADMIN_ROLES.
     """
-    allowed = set(allowed_roles) or set(ADMIN_ROLES)
+    configured_roles = allowed_roles if allowed_roles else tuple(ADMIN_ROLES)
+    allowed = {
+        normalized
+        for role in configured_roles
+        if (normalized := _normalize_role(role))
+    }
 
     def _dep(user: User = Depends(require_sso)) -> User:
-        if user.role not in allowed:
+        if _normalize_role(user.role) not in allowed:
             logger.warning(
                 f"Autorisasjon avvist: sub={user.sub} role={user.role} krever en av {sorted(allowed)}"
             )
@@ -166,7 +188,7 @@ def require_role(*allowed_roles: str) -> Callable[..., User]:
 
 
 def is_admin(user: User) -> bool:
-    return user.role in ADMIN_ROLES
+    return _normalize_role(user.role) in ADMIN_ROLES
 
 
 def sso_logout(request: Optional[Request] = None) -> Response:

@@ -1535,7 +1535,7 @@ def _calculate_confidence(item_no: str, description: str,
 # XLSX ROW EXTRACTION (generic competitor format)
 # ============================================================
 
-def _match_xlsx_column(actual_columns: List[str], candidates: List[str]) -> Optional[str]:
+def _match_xlsx_column(actual_columns: List[Any], candidates: List[str]) -> Optional[Any]:
     """Find which actual column name matches any of the candidate names (case-insensitive).
 
     Returns the actual column name or None if no match found.
@@ -1544,13 +1544,13 @@ def _match_xlsx_column(actual_columns: List[str], candidates: List[str]) -> Opti
         actual_low = str(actual).strip().lower()
         for cand in candidates:
             if actual_low == cand.lower():
-                return str(actual).strip()
+                return actual
     # Fuzzy: check if any candidate is contained in actual column name
     for actual in actual_columns:
         actual_low = str(actual).strip().lower()
         for cand in candidates:
             if cand.lower() in actual_low:
-                return str(actual).strip()
+                return actual
     return None
 
 
@@ -1570,7 +1570,9 @@ def parse_xlsx_rows(content: bytes, source_file: str) -> List[Dict[str, Any]]:
     if df.empty:
         return []
 
-    actual_cols = [str(c).strip() for c in df.columns.tolist()]
+    # Keep the original labels as lookup keys. Matching may normalize whitespace,
+    # but pandas requires the exact label (including trailing spaces or NBSP).
+    actual_cols = df.columns.tolist()
 
     # Map each logical field to a list of possible column name variants
     _COL_VARIANTS = {
