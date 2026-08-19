@@ -18,7 +18,7 @@ from v2.matching import match_deduped_rows
 from v2 import persistence as rv
 from v2.export import generate_export_xlsx, generate_export_pdf
 from v2 import pricedb
-from sso_auth import require_sso, require_role, is_admin, User
+from sso_auth import require_sso, require_role, User
 from ratelimit import limiter
 
 logger = logging.getLogger(__name__)
@@ -33,10 +33,6 @@ V2_MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_SIZE", str(50 * 1024 * 1024)))
 V2_MAX_TOTAL_UPLOAD_BYTES = int(os.getenv("V2_MAX_TOTAL_UPLOAD_BYTES", str(100 * 1024 * 1024)))
 V2_MAX_FILES = int(os.getenv("V2_MAX_FILES", "20"))
 V2_MAX_ROWS = int(os.getenv("V2_MAX_ROWS", "2000"))
-
-# Tilgang til gamle jobber uten registrert eier (fra før tilgangskontroll).
-# Default av (sikker): kun admin når eier mangler.
-V2_ALLOW_LEGACY_JOBS = os.getenv("V2_ALLOW_LEGACY_JOBS", "0").strip() == "1"
 
 V2_DIR = _DATA_DIR / "v2"
 V2_DIR.mkdir(parents=True, exist_ok=True)
@@ -108,23 +104,14 @@ def _get_task(job_id: str) -> Optional[Dict[str, Any]]:
     return _rehydrate_task(job_id)
 
 
-def _authorize(job_id: str, user: User):
-    """Hent task og håndhev eierskap.
+def _require_shared_job(job_id: str):
+    """Hent en jobb fra det delte, autentiserte V2-arbeidsområdet.
 
-    Returnerer (task, None) ved tilgang, eller (None, JSONResponse) ved avslag.
-    Bruker 404 (ikke 403) for å ikke bekrefte eksistensen av andres jobber.
+    V2-rutene krever en gyldig SSO-sesjon. ``owner_sub`` beholdes bare som
+    audit-metadata og begrenser ikke tilgang mellom autentiserte brukere.
     """
     t = _get_task(job_id)
     if not t:
-        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
-    owner = t.get("owner_sub")
-    if owner is None:
-        if is_admin(user) or V2_ALLOW_LEGACY_JOBS:
-            return t, None
-        logger.warning(f"V2 tilgang avvist (eierløs jobb) sub={user.sub} job={job_id}")
-        return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
-    if owner != user.sub and not is_admin(user):
-        logger.warning(f"V2 IDOR-forsøk avvist sub={user.sub} owner={owner} job={job_id}")
         return None, JSONResponse({"error": "Ukjent jobb-ID"}, status_code=404)
     return t, None
 
@@ -500,7 +487,7 @@ def _parse_job_files(job_id: str) -> None:
 def v2_status(job_id: str, user: User = Depends(require_sso)):
     """Get status for a V2 job, including per-file parse results."""
     try:
-        t, err = _authorize(job_id, user)
+        t, err = _require_shared_job(job_id)
         if err:
             return err
         payload = {
@@ -537,7 +524,7 @@ def v2_status(job_id: str, user: User = Depends(require_sso)):
 @v2_router.get("/rows/{job_id}")
 def v2_rows(job_id: str, deduped: bool = True, user: User = Depends(require_sso)):
     """Get rows for a V2 job. Use ?deduped=false for raw parsed rows."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     if t["status"] == "parsing":
@@ -551,15 +538,8 @@ def v2_rows(job_id: str, deduped: bool = True, user: User = Depends(require_sso)
 
 @v2_router.get("/jobs")
 def v2_jobs(limit: int = 50, user: User = Depends(require_sso)):
-    """List V2 jobs (most recent first) — kun egne jobber (admin ser alle)."""
-    jobs = _load_v2_jobs(limit=limit)
-    if not is_admin(user):
-        jobs = [
-            j for j in jobs
-            if j.get("owner_sub") == user.sub
-            or (j.get("owner_sub") is None and V2_ALLOW_LEGACY_JOBS)
-        ]
-    return {"jobs": jobs}
+    """List shared V2 jobs (most recent first) for authenticated users."""
+    return {"jobs": _load_v2_jobs(limit=limit)}
 
 
 # ============================================================
@@ -576,7 +556,7 @@ def _get_catalog_bundle():
 @limiter.limit("20/minute")
 def v2_start_matching(request: Request, job_id: str, prefer_own_brands: bool = True, user: User = Depends(require_sso)):
     """Start matching for a parsed V2 job."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
 
@@ -723,7 +703,7 @@ def _run_matching(job_id: str, bundle: Any, prefer_own_brands: bool) -> None:
 @v2_router.get("/matched/{job_id}")
 def v2_matched_rows(job_id: str, user: User = Depends(require_sso)):
     """Get matched rows with candidates for a V2 job."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     if t["status"] == "matching":
@@ -752,9 +732,9 @@ def v2_matched_rows(job_id: str, user: User = Depends(require_sso)):
 # V2 REVIEW ROUTES
 # ============================================================
 
-def _require_review_job(job_id: str, user: User) -> tuple:
-    """Validate job exists, is owned by the user, and is in review state."""
-    t, err = _authorize(job_id, user)
+def _require_review_job(job_id: str) -> tuple:
+    """Validate that a shared job exists and is in review state."""
+    t, err = _require_shared_job(job_id)
     if err:
         return None, err
     if t.get("status") not in ("review", "matched"):
@@ -770,7 +750,7 @@ def _require_review_job(job_id: str, user: User) -> tuple:
 @v2_router.get("/review/{job_id}")
 def v2_review(job_id: str, user: User = Depends(require_sso)):
     """Get full review data with all overrides applied."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     if t.get("status") not in ("review", "matched"):
@@ -805,7 +785,7 @@ def v2_review(job_id: str, user: User = Depends(require_sso)):
 @v2_router.post("/review/{job_id}/select")
 async def v2_select_candidate(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Select a candidate for one row. Body: {dedup_idx: int, candidate_idx: int}"""
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -839,7 +819,7 @@ async def v2_batch_select(job_id: str, request: Request, user: User = Depends(re
 
     Body: {override_existing: bool} — whether to override rows that already have a selection.
     """
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -868,7 +848,7 @@ async def v2_batch_select(job_id: str, request: Request, user: User = Depends(re
 @v2_router.post("/review/{job_id}/decide")
 async def v2_decide(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Set review status for one row. Body: {dedup_idx: int, status: 'approved'|'rejected'|'pending'}"""
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -905,7 +885,7 @@ async def v2_decide(job_id: str, request: Request, user: User = Depends(require_
 @v2_router.post("/review/{job_id}/bulk-decide")
 async def v2_bulk_decide(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Set review status for multiple rows. Body: {dedup_indices: [int], status: str}"""
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -930,7 +910,7 @@ async def v2_extras(job_id: str, request: Request, user: User = Depends(require_
 
     Body: {dedup_idx: int, comment?: str}
     """
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -967,7 +947,7 @@ async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(
     Body: {query: str, limit?: int}
     Returns matching products from both LK and full catalogs, ranked by relevance.
     """
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -1076,7 +1056,7 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
     Looks up the product in the catalog, adds it as a new candidate, and selects it.
     Returns the updated row data.
     """
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -1198,7 +1178,7 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
 @v2_router.post("/review/{job_id}/delete")
 async def v2_delete_row(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Soft-delete a row. Body: {dedup_idx: int}"""
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -1214,7 +1194,7 @@ async def v2_delete_row(job_id: str, request: Request, user: User = Depends(requ
 @v2_router.post("/review/{job_id}/restore")
 async def v2_restore_row(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Restore a soft-deleted row. Body: {dedup_idx: int}"""
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -1233,7 +1213,7 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
 
     Creates a new review row, runs matching, and returns the full row.
     """
-    t, err = _require_review_job(job_id, user)
+    t, err = _require_review_job(job_id)
     if err:
         return err
 
@@ -1339,7 +1319,7 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
 @v2_router.post("/review/{job_id}/lock")
 async def v2_lock(job_id: str, request: Request, user: User = Depends(require_sso)):
     """Lock the job to prevent further edits."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     try:
@@ -1353,7 +1333,7 @@ async def v2_lock(job_id: str, request: Request, user: User = Depends(require_ss
 @v2_router.post("/review/{job_id}/unlock")
 def v2_unlock(job_id: str, user: User = Depends(require_sso)):
     """Unlock the job to allow edits."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     rv.set_lock(job_id, False)
@@ -1435,7 +1415,7 @@ def v2_get_learnings(limit: int = 200, _: User = Depends(require_role())):
 @v2_router.get("/review/{job_id}/ui", response_class=HTMLResponse)
 def v2_review_ui(job_id: str, user: User = Depends(require_sso)):
     """Serve the review UI page."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     html_path = Path(__file__).parent / "templates" / "review.html"
@@ -1458,7 +1438,7 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True, 
         format: 'xlsx' (default) or 'pdf'
         show_line_prices: true (default) or false
     """
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     if t.get("status") not in ("review", "matched"):
@@ -1512,7 +1492,7 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True, 
 @v2_router.post("/pricedb/commit/{job_id}")
 def v2_pricedb_commit(job_id: str, user: User = Depends(require_sso)):
     """Commit approved review rows to the price database."""
-    t, err = _authorize(job_id, user)
+    t, err = _require_shared_job(job_id)
     if err:
         return err
     if t.get("status") not in ("review", "matched"):

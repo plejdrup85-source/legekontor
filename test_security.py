@@ -2,7 +2,7 @@
 
 Dekker rettelsene fra sikkerhetsrevisjonen (OWASP ASVS L2):
   - V2 krever autentisering (ingen offentlige endepunkter)
-  - Eier-/objektnivå-autorisasjon (IDOR) på jobber
+  - Delt V2-arbeidsområde for alle autentiserte brukere
   - Funksjonsnivå-autorisasjon (admin) på katalog/admin
   - Sesjonstilbakekalling ved logout
   - Sikkerhets-HTTP-hoder
@@ -10,6 +10,7 @@ Dekker rettelsene fra sikkerhetsrevisjonen (OWASP ASVS L2):
 """
 import os
 import time
+import uuid
 
 os.environ.setdefault("SSO_SECRET", "testsecret_32_bytes_minimum_ok_ok_ok")
 os.environ.setdefault("SSO_EXPECTED_AUD", "legekontor")
@@ -41,6 +42,24 @@ def _sess(sub="userA", role="user"):
 @pytest.fixture()
 def client():
     return TestClient(appmod.app)
+
+
+def _create_review_job(owner_sub="userA"):
+    job_id = uuid.uuid4().hex
+    (vr.V2_UPLOADS_DIR / job_id).mkdir(parents=True, exist_ok=True)
+    vr._append_v2_job({
+        "job_id": job_id,
+        "created_at": "2026",
+        "status": "review",
+        "owner_sub": owner_sub,
+    })
+    rv.save_review(job_id, [{
+        "dedup_idx": 0,
+        "description": "x",
+        "review_status": "pending",
+        "candidates": [],
+    }])
+    return job_id
 
 
 def test_v2_requires_auth(client):
@@ -82,16 +101,52 @@ def test_admin_roles_use_strict_ascii_case_insensitive_matching(client):
     assert statuses == [200, 403, 403]
 
 
-def test_v2_idor_blocked(client):
-    import uuid
-    jid = uuid.uuid4().hex
-    (vr.V2_UPLOADS_DIR / jid).mkdir(parents=True, exist_ok=True)
-    vr._append_v2_job({"job_id": jid, "created_at": "2026", "status": "review", "owner_sub": "userA"})
-    rv.save_review(jid, [{"dedup_idx": 0, "description": "x", "candidates": []}])
+def test_v2_jobs_are_visible_across_authenticated_users(client):
+    job_id = _create_review_job(owner_sub="userA")
 
-    assert client.get(f"/v2/review/{jid}", cookies={"sso_session": _sess("userB")}).status_code == 404
-    assert client.get(f"/v2/review/{jid}", cookies={"sso_session": _sess("userA")}).status_code == 200
-    assert client.get(f"/v2/review/{jid}", cookies={"sso_session": _sess("adm", "admin")}).status_code == 200
+    response = client.get("/v2/jobs", cookies={"sso_session": _sess("userB")})
+
+    assert response.status_code == 200
+    shared_job = next(job for job in response.json()["jobs"] if job["job_id"] == job_id)
+    assert shared_job["owner_sub"] == "userA"
+
+
+def test_v2_review_workflow_is_shared_across_authenticated_users(client):
+    job_id = _create_review_job(owner_sub="userA")
+    cookies = {"sso_session": _sess("userB")}
+
+    assert client.get(f"/v2/status/{job_id}", cookies=cookies).status_code == 200
+    assert client.get(f"/v2/review/{job_id}/ui", cookies=cookies).status_code == 200
+    assert client.get(f"/v2/review/{job_id}", cookies=cookies).status_code == 200
+    decision = client.post(
+        f"/v2/review/{job_id}/decide",
+        json={"dedup_idx": 0, "status": "approved"},
+        cookies=cookies,
+    )
+    assert decision.status_code == 200
+    review = client.get(f"/v2/review/{job_id}", cookies=cookies).json()
+    assert review["rows"][0]["review_status"] == "approved"
+
+
+def test_v2_job_routes_require_auth_and_unknown_job_stays_hidden(client):
+    job_id = _create_review_job()
+
+    assert client.get(f"/v2/status/{job_id}").status_code == 401
+    assert client.get(
+        f"/v2/status/{uuid.uuid4().hex}",
+        cookies={"sso_session": _sess("userB")},
+    ).status_code == 404
+
+
+def test_v2_shared_job_can_be_committed_while_learning_remains_admin_only(client):
+    job_id = _create_review_job()
+    user_cookie = {"sso_session": _sess("userB")}
+    admin_cookie = {"sso_session": _sess("admin", "admin")}
+
+    assert client.get("/v2/learning", cookies=user_cookie).status_code == 403
+    assert client.post(f"/v2/pricedb/commit/{job_id}", cookies=user_cookie).status_code == 200
+    assert client.get("/v2/learning", cookies=admin_cookie).status_code == 200
+    assert client.post(f"/v2/pricedb/commit/{job_id}", cookies=admin_cookie).status_code == 200
 
 
 def test_logout_revokes_session(client):
