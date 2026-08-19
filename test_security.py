@@ -67,6 +67,21 @@ def test_admin_only_catalog(client):
     assert r.status_code == 200
 
 
+def test_admin_roles_use_strict_ascii_case_insensitive_matching(client):
+    roles = ["SUPERADMIN", "\N{LATIN SMALL LETTER LONG S}uperadmin", 123]
+
+    statuses = [
+        client.get(
+            "/admin",
+            cookies={"sso_session": _sess(f"role-{index}", role)},
+            follow_redirects=False,
+        ).status_code
+        for index, role in enumerate(roles)
+    ]
+
+    assert statuses == [200, 403, 403]
+
+
 def test_v2_idor_blocked(client):
     import uuid
     jid = uuid.uuid4().hex
