@@ -15,6 +15,11 @@ rather than duplicating them.
 """
 import json
 import logging
+import os
+import threading
+import uuid
+import fcntl
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,6 +29,21 @@ logger = logging.getLogger(__name__)
 _DATA_DIR = Path(__import__("os").getenv("DATA_DIR", "/var/data")).resolve()
 V2_PRICEDB_PATH = _DATA_DIR / "v2" / "pricedb.jsonl"
 V2_PRICEDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+_PRICEDB_LOCK = threading.Lock()
+
+
+@contextmanager
+def _pricedb_transaction_lock():
+    """Serialize the database read-modify-write across threads and workers."""
+    with _PRICEDB_LOCK:
+        V2_PRICEDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = V2_PRICEDB_PATH.with_name(f".{V2_PRICEDB_PATH.name}.lock")
+        with open(lock_path, "a+", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _utc_now_iso() -> str:
@@ -34,7 +54,14 @@ def _build_record(row: Dict[str, Any], job_id: str, committed_at: str) -> Dict[s
     """Build a flat price database record from a review row (with overrides applied)."""
     sel_idx = row.get("selected_candidate_idx")
     candidates = row.get("candidates", [])
-    cand = candidates[sel_idx] if (sel_idx is not None and 0 <= sel_idx < len(candidates)) else None
+    cand = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.get("candidate_idx") == sel_idx
+        ),
+        None,
+    )
 
     # Normalize source_file(s) — always store the full list and a display string
     raw_source = row.get("source_file", "")
@@ -87,15 +114,24 @@ def commit_job(job_id: str, review_rows: List[Dict[str, Any]]) -> int:
     for row in review_rows:
         if row.get("review_status") != "approved" or row.get("deleted"):
             continue
+        candidate = next(
+            (
+                item
+                for item in row.get("candidates", [])
+                if item.get("candidate_idx") == row.get("selected_candidate_idx")
+            ),
+            None,
+        )
+        if candidate is None or candidate.get("eligible") is False:
+            continue
         new_records.append(_build_record(row, job_id, now))
 
     # Read existing, remove old records for this job
-    existing = _read_all()
-    kept = [r for r in existing if r.get("job_id") != job_id]
-
-    # Write kept + new
-    kept.extend(new_records)
-    _write_all(kept)
+    with _pricedb_transaction_lock():
+        existing = _read_all()
+        kept = [r for r in existing if r.get("job_id") != job_id]
+        kept.extend(new_records)
+        _write_all(kept)
 
     logger.info(f"V2 pricedb: committed {len(new_records)} records for job={job_id}")
     return len(new_records)
@@ -163,9 +199,17 @@ def _read_all() -> List[Dict[str, Any]]:
 
 
 def _write_all(records: List[Dict[str, Any]]) -> None:
+    V2_PRICEDB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = V2_PRICEDB_PATH.with_name(
+        f".{V2_PRICEDB_PATH.name}.{uuid.uuid4().hex}.tmp"
+    )
     try:
-        with open(V2_PRICEDB_PATH, "w", encoding="utf-8") as f:
+        with open(temp_path, "w", encoding="utf-8") as f:
             for r in records:
                 f.write(json.dumps(r, ensure_ascii=False) + "\n")
-    except Exception as e:
-        logger.warning(f"V2 pricedb: write error: {e}")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, V2_PRICEDB_PATH)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()

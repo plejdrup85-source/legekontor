@@ -15,10 +15,11 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from v2.parsing import classify_file, parse_file
 from v2.normalize import deduplicate
 from v2.matching import match_deduped_rows
+from v2.catalog_rules import ALC_FIELDS, ITEM_STATUS_FIELDS, annotate_candidate
 from v2 import persistence as rv
 from v2.export import generate_export_xlsx, generate_export_pdf
 from v2 import pricedb
-from sso_auth import require_sso, require_role, User
+from sso_auth import is_admin, require_sso, require_role, User
 from ratelimit import limiter
 
 logger = logging.getLogger(__name__)
@@ -552,6 +553,17 @@ def _get_catalog_bundle():
     return _app.CATALOG_BUNDLE
 
 
+def _catalog_health_error(bundle: Any) -> Optional[str]:
+    for source, catalog in (("LK", bundle.lk), ("Full", bundle.full)):
+        for item in catalog.items:
+            row = item.row if isinstance(getattr(item, "row", None), dict) else {}
+            status = next((row.get(key) for key in ITEM_STATUS_FIELDS if key in row), None)
+            alc = next((row.get(key) for key in ALC_FIELDS if key in row), None)
+            if status is None or not str(status).strip() or alc is None or not str(alc).strip():
+                return f"Kataloghelsefeil i {source}: Item Status og ALC er obligatoriske for V2"
+    return None
+
+
 @v2_router.post("/match/{job_id}")
 @limiter.limit("20/minute")
 def v2_start_matching(request: Request, job_id: str, prefer_own_brands: bool = True, user: User = Depends(require_sso)):
@@ -565,10 +577,18 @@ def v2_start_matching(request: Request, job_id: str, prefer_own_brands: bool = T
             {"error": f"Kan ikke matche jobb med status '{t['status']}'. Krever 'parsed', 'matched', eller 'error'."},
             status_code=400,
         )
+    if t["status"] in ("matched", "review") and rv.has_material_review_state(job_id):
+        return JSONResponse(
+            {"error": "Ny matching er blokkert etter at review er opprettet"},
+            status_code=409,
+        )
 
     bundle = _get_catalog_bundle()
     if bundle is None:
         return JSONResponse({"error": "Katalog ikke lastet. Last opp katalog først."}, status_code=400)
+    health_error = _catalog_health_error(bundle)
+    if health_error:
+        return JSONResponse({"error": health_error}, status_code=409)
 
     t["status"] = "matching"
     _append_v2_job({"job_id": job_id, "status": "matching"})
@@ -747,6 +767,153 @@ def _require_review_job(job_id: str) -> tuple:
     return t, None
 
 
+_REVIEW_DECISION_STATUSES = {"pending", "approved", "not_same", "no_suitable"}
+
+
+def _candidate_identity(candidate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if candidate is None:
+        return None
+    return {
+        "candidate_idx": candidate.get("candidate_idx"),
+        "our_artnr": str(candidate.get("our_artnr") or ""),
+        "matched_from": str(candidate.get("matched_from") or candidate.get("source") or ""),
+    }
+
+
+def _if_match_revision(request: Request, job_id: str) -> tuple[Optional[int], Optional[JSONResponse]]:
+    value = (request.headers.get("if-match") or "").strip().strip('"')
+    if not value:
+        return None, JSONResponse({"error": "If-Match med review-revisjon er påkrevd"}, status_code=428)
+    try:
+        revision = int(value)
+    except ValueError:
+        return None, JSONResponse({"error": "Ugyldig If-Match-revisjon"}, status_code=400)
+    if revision != rv.get_review_revision(job_id):
+        return None, JSONResponse({"error": "Review er endret av en annen bruker", "revision": rv.get_review_revision(job_id)}, status_code=409)
+    return revision, None
+
+
+def _catalog_row_for_artnr(
+    bundle: Any, artnr: str, source: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    if bundle is None or not artnr:
+        return None
+    source = (source or "").strip().lower()
+    catalogs = {
+        "lk": bundle.lk,
+        "full": bundle.full,
+    }
+    selected_catalogs = [catalogs[source]] if source in catalogs else list(catalogs.values())
+    matches = []
+    for catalog in selected_catalogs:
+        for item in catalog.items:
+            if str(getattr(item, "artnr", "")).strip() == str(artnr).strip():
+                if isinstance(item.row, dict):
+                    matches.append(item.row)
+                break
+    return matches[0] if len(matches) == 1 else None
+
+
+def _annotate_current_candidate(candidate: Dict[str, Any], bundle: Any) -> Dict[str, Any]:
+    source = candidate.get("matched_from") or candidate.get("source")
+    catalog_row = _catalog_row_for_artnr(
+        bundle, candidate.get("our_artnr", ""), source
+    )
+    annotated = annotate_candidate(candidate, catalog_row)
+    annotated["catalog_resolved"] = catalog_row is not None
+    if catalog_row is None:
+        annotated["eligible"] = False
+        annotated["masterdata_error"] = (
+            "Katalogproduktet finnes ikke i den angitte katalogkilden"
+            if bundle is not None
+            else "Produktkatalogen er ikke tilgjengelig"
+        )
+        return annotated
+
+    current_fields = {
+        "our_description": ("Katalog: Item Description", "Item Description", "Beskrivelse"),
+        "our_specification": ("Katalog: Specification", "Specification", "Spesifikasjon"),
+        "our_producer": ("Katalog: Producer Name", "Producer Name", "Produsent"),
+        "our_gid": ("Katalog: GID", "GID"),
+    }
+    for target, source_fields in current_fields.items():
+        for field in source_fields:
+            if catalog_row.get(field) not in (None, ""):
+                annotated[target] = str(catalog_row[field])
+                break
+
+    price = None
+    price_source = ""
+    try:
+        price, price_source = bundle.price_for_artnr(
+            candidate.get("our_artnr", ""), source=source
+        )
+        price = float(price) if price is not None else None
+    except (AttributeError, TypeError, ValueError):
+        price = None
+    if price is None or not math.isfinite(price) or price < 0:
+        annotated["eligible"] = False
+        price_error = "Gjeldende katalogpris mangler eller er ugyldig"
+        annotated["masterdata_error"] = ". ".join(
+            part for part in (annotated.get("masterdata_error"), price_error) if part
+        )
+        annotated["our_unit_price"] = None
+    else:
+        annotated["our_unit_price"] = price
+        annotated["price_source"] = price_source or source or ""
+    return annotated
+
+
+def _annotate_review_row(row: Dict[str, Any], bundle: Any = None) -> Dict[str, Any]:
+    annotated = dict(row)
+    annotated["candidates"] = [
+        _annotate_current_candidate(candidate, bundle)
+        for candidate in row.get("candidates", [])
+    ]
+    return annotated
+
+
+def _candidate_by_idx(row: Dict[str, Any], candidate_idx: Any) -> Optional[Dict[str, Any]]:
+    return next(
+        (
+            candidate
+            for candidate in row.get("candidates", [])
+            if candidate.get("candidate_idx") == candidate_idx
+        ),
+        None,
+    )
+
+
+def _active_candidate(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    candidate_idx = row.get("selected_candidate_idx")
+    if candidate_idx is None:
+        candidate_idx = row.get("suggested_candidate_idx", row.get("best_candidate_idx"))
+    return _candidate_by_idx(row, candidate_idx)
+
+
+def _review_projection(
+    job_id: str,
+) -> tuple[Optional[List[Dict[str, Any]]], Optional[Dict[str, Any]]]:
+    legacy_rows = rv.load_review(job_id)
+    if legacy_rows is None:
+        return None, None
+    # Legacy migration may write an explicit selection. Complete it before
+    # taking the single authoritative snapshot used by this projection.
+    rv.rehydrate_legacy_approved_selections(job_id, legacy_rows)
+    workspace = rv.load_review_workspace(job_id)
+    review_rows = workspace.get("review")
+    if review_rows is None:
+        return None, workspace
+    bundle = _get_catalog_bundle()
+    current_rows = [_annotate_review_row(row, bundle) for row in review_rows]
+    return rv.apply_overrides(current_rows, job_id, workspace=workspace), workspace
+
+
+def _review_rows_with_rules(job_id: str) -> Optional[List[Dict[str, Any]]]:
+    rows, _workspace = _review_projection(job_id)
+    return rows
+
+
 @v2_router.get("/review/{job_id}")
 def v2_review(job_id: str, user: User = Depends(require_sso)):
     """Get full review data with all overrides applied."""
@@ -759,16 +926,15 @@ def v2_review(job_id: str, user: User = Depends(require_sso)):
             status_code=400,
         )
 
-    review_rows = rv.load_review(job_id)
-    if review_rows is None:
+    rows, workspace = _review_projection(job_id)
+    if rows is None:
         return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
-
-    rows = rv.apply_overrides(review_rows, job_id)
     lock = rv.get_lock_info(job_id)
 
     # Summary counts
     approved = sum(1 for r in rows if r.get("review_status") == "approved" and not r.get("deleted"))
-    rejected = sum(1 for r in rows if r.get("review_status") == "rejected" and not r.get("deleted"))
+    not_same = sum(1 for r in rows if r.get("review_status") == "not_same" and not r.get("deleted"))
+    no_suitable = sum(1 for r in rows if r.get("review_status") == "no_suitable" and not r.get("deleted"))
     pending = sum(1 for r in rows if r.get("review_status") == "pending" and not r.get("deleted"))
     deleted = sum(1 for r in rows if r.get("deleted"))
 
@@ -777,7 +943,15 @@ def v2_review(job_id: str, user: User = Depends(require_sso)):
         "status": t.get("status"),
         "lock": lock,
         "count": len(rows),
-        "summary": {"approved": approved, "rejected": rejected, "pending": pending, "deleted": deleted},
+        "summary": {
+            "approved": approved,
+            "not_same": not_same,
+            "no_suitable": no_suitable,
+            "pending": pending,
+            "deleted": deleted,
+        },
+        "can_commit_pricedb": is_admin(user),
+        "revision": workspace["state"]["revision"],
         "rows": rows,
     })
 
@@ -788,6 +962,9 @@ async def v2_select_candidate(job_id: str, request: Request, user: User = Depend
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     dedup_idx = body.get("dedup_idx")
@@ -795,7 +972,39 @@ async def v2_select_candidate(job_id: str, request: Request, user: User = Depend
     if dedup_idx is None or candidate_idx is None:
         return JSONResponse({"error": "dedup_idx og candidate_idx er påkrevd"}, status_code=400)
 
-    rv.save_selection(job_id, int(dedup_idx), int(candidate_idx))
+    rows = _review_rows_with_rules(job_id)
+    row = next((r for r in rows or [] if r.get("dedup_idx") == int(dedup_idx)), None)
+    if row is None:
+        return JSONResponse({"error": f"Rad {dedup_idx} ikke funnet"}, status_code=404)
+    if row.get("deleted"):
+        return JSONResponse({"error": "Fjernet rad må gjenopprettes før endring"}, status_code=409)
+    candidate = _candidate_by_idx(row, int(candidate_idx))
+    if candidate is None:
+        return JSONResponse({"error": "Kandidaten finnes ikke"}, status_code=400)
+    if not candidate.get("eligible"):
+        return JSONResponse(
+            {"error": candidate.get("masterdata_error") or "Ugyldig kandidat"},
+            status_code=409,
+        )
+
+    previous_status = row.get("review_status", "pending")
+    sels = rv.load_selections(job_id)
+    decs = rv.load_decisions(job_id)
+    sels[str(dedup_idx)] = {
+        "candidate_idx": int(candidate_idx),
+        "candidate_status": "selected",
+        "selected_at": _utc_now_iso(),
+        "candidate_identity": _candidate_identity(candidate),
+    }
+    if previous_status != "pending":
+        decs[str(dedup_idx)] = {
+            "status": "pending",
+            "decided_at": _utc_now_iso(),
+        }
+    try:
+        rv.save_review_state(job_id, selections=sels, decisions=decs, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
 
     # Record learning from selection
     try:
@@ -803,14 +1012,21 @@ async def v2_select_candidate(job_id: str, request: Request, user: User = Depend
         if review_rows:
             for r in review_rows:
                 if r.get("dedup_idx") == int(dedup_idx):
-                    cands = r.get("candidates", [])
-                    if 0 <= int(candidate_idx) < len(cands):
-                        record_selection_learning(job_id, r, cands[int(candidate_idx)])
+                    selected = _candidate_by_idx(r, int(candidate_idx))
+                    if selected is not None:
+                        record_selection_learning(job_id, r, selected)
                     break
     except Exception as e:
         logger.warning(f"V2 learning on select failed: {e}")
 
-    return {"ok": True, "dedup_idx": dedup_idx, "candidate_idx": candidate_idx}
+    return {
+        "ok": True,
+        "dedup_idx": dedup_idx,
+        "candidate_idx": candidate_idx,
+        "candidate_status": "selected",
+        "review_status": "pending",
+        "previous_status": previous_status,
+    }
 
 
 @v2_router.post("/review/{job_id}/batch-select")
@@ -822,6 +1038,9 @@ async def v2_batch_select(job_id: str, request: Request, user: User = Depends(re
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     override = body.get("override_existing", False)
@@ -830,38 +1049,109 @@ async def v2_batch_select(job_id: str, request: Request, user: User = Depends(re
         return JSONResponse({"error": "Ingen review-data"}, status_code=404)
 
     sels = rv.load_selections(job_id)
+    decs = rv.load_decisions(job_id)
     count = 0
 
     for row in review_rows:
         idx_str = str(row.get("dedup_idx", ""))
         if not override and idx_str in sels:
             continue
-        best = row.get("best_candidate_idx")
-        if best is not None:
-            sels[idx_str] = best
+        best = row.get("suggested_candidate_idx", row.get("best_candidate_idx"))
+        candidate = _candidate_by_idx(_annotate_review_row(row, _get_catalog_bundle()), best)
+        if candidate is not None and candidate.get("eligible"):
+            sels[idx_str] = {
+                "candidate_idx": best,
+                "candidate_status": "selected",
+                "selected_at": _utc_now_iso(),
+                "candidate_identity": _candidate_identity(candidate),
+            }
+            decs[idx_str] = {"status": "pending", "decided_at": _utc_now_iso()}
             count += 1
 
-    rv.save_selections(job_id, sels)
+    try:
+        rv.save_review_state(job_id, selections=sels, decisions=decs, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
     return {"ok": True, "selected_count": count}
 
 
 @v2_router.post("/review/{job_id}/decide")
 async def v2_decide(job_id: str, request: Request, user: User = Depends(require_sso)):
-    """Set review status for one row. Body: {dedup_idx: int, status: 'approved'|'rejected'|'pending'}"""
+    """Set one explicit review decision."""
     t, err = _require_review_job(job_id)
     if err:
         return err
 
     body = await request.json()
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
+    if body.get("revision") != expected_revision:
+        return JSONResponse({"error": "Beslutningen bruker en utdatert revisjon"}, status_code=409)
     dedup_idx = body.get("dedup_idx")
     status = body.get("status")
-    if dedup_idx is None or status not in ("approved", "rejected", "pending"):
+    if status == "rejected":
+        status = "not_same"
+    if dedup_idx is None or status not in _REVIEW_DECISION_STATUSES:
         return JSONResponse(
-            {"error": "dedup_idx og status ('approved'|'rejected'|'pending') er påkrevd"},
+            {"error": "dedup_idx og en gyldig beslutningsstatus er påkrevd"},
             status_code=400,
         )
 
-    rv.save_decision(job_id, int(dedup_idx), status)
+    rows = _review_rows_with_rules(job_id)
+    row = next((r for r in rows or [] if r.get("dedup_idx") == int(dedup_idx)), None)
+    if row is None:
+        return JSONResponse({"error": f"Rad {dedup_idx} ikke funnet"}, status_code=404)
+    if row.get("deleted"):
+        return JSONResponse({"error": "Fjernet rad må gjenopprettes før beslutning"}, status_code=409)
+    previous_status = row.get("review_status", "pending")
+    selection_to_save = None
+    active_candidate = _active_candidate(row)
+    if body.get("candidate_identity") != _candidate_identity(active_candidate):
+        return JSONResponse({"error": "Kandidaten er endret. Last inn raden på nytt."}, status_code=409)
+    if status == "approved":
+        candidate = active_candidate
+        if candidate is None or not candidate.get("eligible"):
+            error = (
+                candidate.get("masterdata_error")
+                if candidate
+                else "Velg et gyldig OneMed-produkt før godkjenning"
+            )
+            return JSONResponse({"error": error}, status_code=409)
+        if row.get("merge_warning") and not body.get("acknowledge_critical", False):
+            return JSONResponse(
+                {"error": "Raden har et kritisk avvik som må bekreftes"},
+                status_code=409,
+            )
+        if row.get("selected_candidate_idx") is None:
+            selection_to_save = candidate["candidate_idx"]
+
+    state = rv.load_review_state(job_id)
+    undo_token = rv.add_undo_snapshot(state, int(dedup_idx))
+    sels = state["selections"]
+    decs = state["decisions"]
+    if selection_to_save is not None:
+        sels[str(dedup_idx)] = {
+            "candidate_idx": selection_to_save,
+            "candidate_status": "selected",
+            "selected_at": _utc_now_iso(),
+            "candidate_identity": _candidate_identity(active_candidate),
+        }
+    decs[str(dedup_idx)] = {
+        "status": status,
+        "decided_at": _utc_now_iso(),
+        "candidate_identity": _candidate_identity(active_candidate),
+    }
+    try:
+        rv.save_review_state(
+            job_id,
+            selections=sels,
+            decisions=decs,
+            undo_tokens=state["undo_tokens"],
+            expected_revision=expected_revision,
+        )
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
 
     # Record learning when approving
     if status == "approved":
@@ -871,15 +1161,61 @@ async def v2_decide(job_id: str, request: Request, user: User = Depends(require_
                 sels = rv.load_selections(job_id)
                 for r in review_rows:
                     if r.get("dedup_idx") == int(dedup_idx):
-                        sel_idx = sels.get(str(dedup_idx), r.get("selected_candidate_idx"))
+                        selection = sels.get(str(dedup_idx))
+                        sel_idx = (
+                            selection.get("candidate_idx")
+                            if isinstance(selection, dict)
+                            else selection
+                        )
+                        if sel_idx is None:
+                            sel_idx = r.get(
+                                "suggested_candidate_idx",
+                                r.get("best_candidate_idx"),
+                            )
                         cands = r.get("candidates", [])
-                        if sel_idx is not None and 0 <= sel_idx < len(cands):
-                            record_approval_learning(job_id, r, cands[sel_idx])
+                        selected = _candidate_by_idx(r, sel_idx)
+                        if selected is not None:
+                            record_approval_learning(
+                                job_id, r, selected, undo_token=undo_token
+                            )
                         break
         except Exception as e:
             logger.warning(f"V2 learning on approve failed: {e}")
 
-    return {"ok": True, "dedup_idx": dedup_idx, "status": status}
+    return {
+        "ok": True,
+        "dedup_idx": dedup_idx,
+        "status": status,
+        "previous_status": previous_status,
+        "undo_token": undo_token,
+    }
+
+
+@v2_router.post("/review/{job_id}/undo")
+async def v2_undo_decision(job_id: str, request: Request, user: User = Depends(require_sso)):
+    """Restore the exact selection and decision state captured by one decision."""
+    t, err = _require_review_job(job_id)
+    if err:
+        return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
+    body = await request.json()
+    token = (body.get("undo_token") or "").strip()
+    if not token:
+        return JSONResponse({"error": "undo_token er påkrevd"}, status_code=400)
+    try:
+        snapshot = rv.consume_undo_snapshot(job_id, token, expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
+    if snapshot is None:
+        return JSONResponse({"error": "Angre-token er ugyldig eller brukt"}, status_code=409)
+    remove_learning_by_undo_token(token)
+    return {
+        "ok": True,
+        "dedup_idx": snapshot.get("dedup_idx"),
+        "restored": True,
+    }
 
 
 @v2_router.post("/review/{job_id}/bulk-decide")
@@ -888,54 +1224,150 @@ async def v2_bulk_decide(job_id: str, request: Request, user: User = Depends(req
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     indices = body.get("dedup_indices", [])
     status = body.get("status")
-    if not indices or status not in ("approved", "rejected", "pending"):
+    if status == "rejected":
+        status = "not_same"
+    if not indices or status not in _REVIEW_DECISION_STATUSES:
         return JSONResponse({"error": "dedup_indices og status er påkrevd"}, status_code=400)
 
-    decs = rv.load_decisions(job_id)
-    now = _utc_now_iso()
-    for idx in indices:
-        decs[str(idx)] = {"status": status, "decided_at": now}
-    rv.save_decisions(job_id, decs)
+    try:
+        normalized_indices = list(dict.fromkeys(int(index) for index in indices))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Ugyldige rad-ID-er"}, status_code=400)
 
-    return {"ok": True, "count": len(indices), "status": status}
+    rows = _review_rows_with_rules(job_id) or []
+    rows_by_idx = {row.get("dedup_idx"): row for row in rows}
+    missing = [index for index in normalized_indices if index not in rows_by_idx]
+    if missing:
+        return JSONResponse(
+            {"error": "En eller flere rader finnes ikke", "blocked_indices": missing},
+            status_code=404,
+        )
+    deleted = [index for index in normalized_indices if rows_by_idx[index].get("deleted")]
+    if deleted:
+        return JSONResponse(
+            {"error": "Fjernede rader må gjenopprettes", "blocked_indices": deleted},
+            status_code=409,
+        )
+
+    blocked = []
+    selections_to_save = []
+    if status == "approved":
+        for index in normalized_indices:
+            row = rows_by_idx[index]
+            suggested_idx = row.get(
+                "suggested_candidate_idx", row.get("best_candidate_idx")
+            )
+            candidate = _candidate_by_idx(row, suggested_idx)
+            if row.get("deleted") or row.get("merge_warning"):
+                blocked.append(index)
+                continue
+            if candidate is None or not candidate.get("eligible"):
+                blocked.append(index)
+                continue
+            selections_to_save.append((index, candidate["candidate_idx"]))
+    if blocked:
+        return JSONResponse(
+            {
+                "error": "Bulk-godkjenning er blokkert av kritisk avvik eller ugyldig kandidat",
+                "blocked_indices": blocked,
+            },
+            status_code=409,
+        )
+
+    decs = rv.load_decisions(job_id)
+    sels = rv.load_selections(job_id)
+    now = _utc_now_iso()
+    for idx, candidate_idx in selections_to_save:
+        sels[str(idx)] = {
+            "candidate_idx": candidate_idx,
+            "candidate_status": "selected",
+            "selected_at": now,
+            "candidate_identity": _candidate_identity(
+                _candidate_by_idx(rows_by_idx[idx], candidate_idx)
+            ),
+        }
+    for idx in normalized_indices:
+        candidate = _candidate_by_idx(rows_by_idx[idx], rows_by_idx[idx].get("suggested_candidate_idx"))
+        decs[str(idx)] = {
+            "status": status,
+            "decided_at": now,
+            "candidate_identity": _candidate_identity(candidate),
+        }
+    try:
+        rv.save_review_state(job_id, selections=sels, decisions=decs, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
+
+    return {"ok": True, "count": len(normalized_indices), "status": status}
 
 
 @v2_router.post("/review/{job_id}/extras")
 async def v2_extras(job_id: str, request: Request, user: User = Depends(require_sso)):
-    """Update comment for one row.
+    """Update comment and quantity overrides for one existing review row.
 
-    Body: {dedup_idx: int, comment?: str}
+    Body: {dedup_idx: int, comment?: str, quantity_override?: number,
+           quantity_override_competitor?: number}
     """
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     dedup_idx = body.get("dedup_idx")
     if dedup_idx is None:
         return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
+    try:
+        dedup_idx = int(dedup_idx)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "Ugyldig dedup_idx"}, status_code=400)
 
-    rv.save_extra(
-        job_id,
-        int(dedup_idx),
-        comment=body.get("comment"),
-    )
+    rows = _review_rows_with_rules(job_id)
+    if rows is None:
+        return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
+    row = next((candidate for candidate in rows if candidate.get("dedup_idx") == dedup_idx), None)
+    if row is None:
+        return JSONResponse({"error": "Ukjent rad"}, status_code=404)
+    if row.get("deleted"):
+        return JSONResponse({"error": "Fjernede rader må gjenopprettes"}, status_code=409)
 
-    # Handle quantity overrides (stored in extras.json)
-    if "quantity_override" in body or "quantity_override_competitor" in body:
-        extras = rv.load_extras(job_id)
-        entry = extras.get(str(dedup_idx), {})
-        if "quantity_override" in body:
-            entry["quantity_override"] = body["quantity_override"]
-        if "quantity_override_competitor" in body:
-            entry["quantity_override_competitor"] = body["quantity_override_competitor"]
-        entry["updated_at"] = _utc_now_iso()
-        extras[str(dedup_idx)] = entry
-        rv.save_extras(job_id, extras)
+    normalized_quantities: Dict[str, float] = {}
+    for field in ("quantity_override", "quantity_override_competitor"):
+        if field not in body:
+            continue
+        raw_value = body[field]
+        if isinstance(raw_value, bool):
+            return JSONResponse({"error": "Antall må være et endelig tall større enn 0"}, status_code=400)
+        try:
+            normalized = float(str(raw_value).strip().replace(" ", "").replace(",", "."))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "Ugyldig antall"}, status_code=400)
+        if not math.isfinite(normalized) or normalized <= 0:
+            return JSONResponse({"error": "Antall må være et endelig tall større enn 0"}, status_code=400)
+        normalized_quantities[field] = normalized
+
+    # Validate the complete request before the single persistence write. This
+    # prevents a valid comment from being saved alongside an invalid quantity.
+    extras = rv.load_extras(job_id)
+    entry = dict(extras.get(str(dedup_idx), {}))
+    if "comment" in body:
+        entry["comment"] = body.get("comment")
+    entry.update(normalized_quantities)
+    entry["updated_at"] = _utc_now_iso()
+    extras[str(dedup_idx)] = entry
+    try:
+        rv.save_extras(job_id, extras, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
 
     return {"ok": True, "dedup_idx": dedup_idx}
 
@@ -972,7 +1404,7 @@ async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(
 
     def _make_result(item, score, source):
         artnr = str(item.artnr)
-        price, _ = bundle.price_for_artnr(artnr)
+        price, _ = bundle.price_for_artnr(artnr, source=source)
         row_data = item.row if hasattr(item, "row") else {}
         desc = ""
         spec = ""
@@ -983,7 +1415,7 @@ async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(
             spec = str(row_data.get("Katalog: Specification") or row_data.get("Specification") or row_data.get("Spesifikasjon") or "")
             producer = str(row_data.get("Katalog: Producer Name") or row_data.get("Producer Name") or row_data.get("Produsent") or "")
             gid = _extract_gid(row_data)
-        return {
+        return annotate_candidate({
             "our_artnr": artnr,
             "our_description": desc,
             "our_specification": spec,
@@ -993,7 +1425,7 @@ async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(
             "matched_from": source,
             "match_quality": "Søk",
             "_score": round(score, 4),
-        }
+        }, row_data)
 
     # Use BM25 directly for fast, deterministic results — skip Claude/embeddings
     query_upper = query.upper()
@@ -1031,17 +1463,27 @@ async def v2_search_catalog(job_id: str, request: Request, user: User = Depends(
                 seen_in_catalog.add(item.artnr)
 
         for item, score in merged:
-            if item.artnr in seen:
+            identity = (source, item.artnr)
+            if identity in seen:
                 continue
-            results.append(_make_result(item, score, source))
-            seen.add(item.artnr)
+            result = _make_result(item, score, source)
+            if not result.get("eligible"):
+                continue
+            results.append(result)
+            seen.add(identity)
             if len(results) >= limit:
                 break
         if len(results) >= limit:
             break
 
     # Sort globally by score descending
-    results.sort(key=lambda r: -r.get("_score", 0))
+    results.sort(
+        key=lambda r: (
+            -r.get("_score", 0),
+            r.get("alc") if r.get("alc") is not None else math.inf,
+            r.get("our_artnr", ""),
+        )
+    )
     # Remove internal score from response
     for r in results:
         r.pop("_score", None)
@@ -1059,10 +1501,14 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     dedup_idx = body.get("dedup_idx")
     our_artnr = (body.get("our_artnr") or "").strip()
+    matched_from = (body.get("matched_from") or body.get("source") or "").strip().lower()
     if dedup_idx is None or not our_artnr:
         return JSONResponse({"error": "dedup_idx og our_artnr er påkrevd"}, status_code=400)
 
@@ -1071,26 +1517,29 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
         return JSONResponse({"error": "Produktkatalog er ikke lastet"}, status_code=503)
 
     # Look up price
-    price, price_source = bundle.price_for_artnr(our_artnr)
+    price, price_source = bundle.price_for_artnr(
+        our_artnr, source=matched_from or None
+    )
 
     # Try to find the product details from catalog items
     desc = ""
     spec = ""
     producer = ""
     gid = ""
-    for catalog, source in [(bundle.lk, "lk"), (bundle.full, "full")]:
-        for item in catalog.items:
-            if str(getattr(item, "artnr", "")).strip() == our_artnr:
-                row_data = item.row if hasattr(item, "row") else {}
-                if isinstance(row_data, dict):
-                    desc = str(row_data.get("Katalog: Item Description") or row_data.get("Item Description") or row_data.get("Description") or "")
-                    spec = str(row_data.get("Katalog: Specification") or row_data.get("Specification") or row_data.get("Spesifikasjon") or "")
-                    producer = str(row_data.get("Katalog: Producer Name") or row_data.get("Producer Name") or row_data.get("Produsent") or "")
-                    gid_raw = str(row_data.get("Katalog: GID") or row_data.get("GID") or "")
-                    gid = "" if gid_raw.lower() == "nan" else gid_raw
-                break
-        if desc:
-            break
+    catalog_row = _catalog_row_for_artnr(bundle, our_artnr, matched_from or None)
+    if isinstance(catalog_row, dict):
+        desc = str(catalog_row.get("Katalog: Item Description") or catalog_row.get("Item Description") or catalog_row.get("Description") or "")
+        spec = str(catalog_row.get("Katalog: Specification") or catalog_row.get("Specification") or catalog_row.get("Spesifikasjon") or "")
+        producer = str(catalog_row.get("Katalog: Producer Name") or catalog_row.get("Producer Name") or catalog_row.get("Produsent") or "")
+        gid_raw = str(catalog_row.get("Katalog: GID") or catalog_row.get("GID") or "")
+        gid = "" if gid_raw.lower() == "nan" else gid_raw
+
+    metadata = annotate_candidate({}, catalog_row)
+    if not metadata.get("eligible"):
+        return JSONResponse(
+            {"error": metadata.get("masterdata_error") or "Ugyldig katalogprodukt"},
+            status_code=409,
+        )
 
     # Load review data and update the row
     review_rows = rv.load_review(job_id)
@@ -1104,6 +1553,8 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
             break
     if row is None:
         return JSONResponse({"error": f"Rad {dedup_idx} ikke funnet"}, status_code=404)
+    if rv.apply_overrides([row], job_id)[0].get("deleted"):
+        return JSONResponse({"error": "Fjernet rad må gjenopprettes før endring"}, status_code=409)
 
     # Build new candidate
     candidates = row.get("candidates", [])
@@ -1111,8 +1562,12 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
     om_units = row.get("quantity_override") if row.get("quantity_override") is not None else (row.get("total_units", 0) or 0)
     competitor_line = row.get("competitor_line_amount")
 
-    new_cand = {
-        "candidate_idx": len(candidates),
+    next_candidate_idx = max(
+        (candidate.get("candidate_idx", -1) for candidate in candidates),
+        default=-1,
+    ) + 1
+    new_cand = annotate_candidate({
+        "candidate_idx": next_candidate_idx,
         "our_artnr": our_artnr,
         "our_description": desc,
         "our_specification": spec,
@@ -1121,8 +1576,8 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
         "our_unit_price": price,
         "price_source": price_source,
         "match_quality": "Manuelt valgt",
-        "matched_from": "manual",
-    }
+        "matched_from": matched_from or "manual",
+    }, catalog_row)
 
     # Calculate prices for new candidate using OM units
     if price is not None and om_units > 0:
@@ -1138,7 +1593,9 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
     # Check if artnr already exists in candidates
     existing_idx = None
     for c in candidates:
-        if c.get("our_artnr") == our_artnr:
+        if c.get("our_artnr") == our_artnr and (
+            not matched_from or c.get("matched_from") == matched_from
+        ):
             existing_idx = c["candidate_idx"]
             break
 
@@ -1154,9 +1611,28 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
     row["selected_candidate_idx"] = selected_idx
     row["match_status"] = "matched"
 
-    # Persist updated review.json and selection
-    rv.save_review(job_id, review_rows)
-    rv.save_selection(job_id, int(dedup_idx), selected_idx)
+    # Persist candidate replacement and review state as one transaction.
+    sels = rv.load_selections(job_id)
+    decs = rv.load_decisions(job_id)
+    sels[str(dedup_idx)] = {
+        "candidate_idx": selected_idx,
+        "candidate_status": "selected",
+        "selected_at": _utc_now_iso(),
+        "candidate_identity": _candidate_identity(
+            next((item for item in candidates if item.get("candidate_idx") == selected_idx), None)
+        ),
+    }
+    decs[str(dedup_idx)] = {"status": "pending", "decided_at": _utc_now_iso()}
+    try:
+        rv.save_review_workspace(
+            job_id,
+            review=review_rows,
+            selections=sels,
+            decisions=decs,
+            expected_revision=expected_revision,
+        )
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
 
     # Apply overrides to get the final state for this row
     overridden = rv.apply_overrides([row], job_id)
@@ -1171,6 +1647,8 @@ async def v2_replace_candidate(job_id: str, request: Request, user: User = Depen
             "our_unit_price": final_row.get("our_unit_price"),
             "our_comparable_line_price": final_row.get("our_comparable_line_price"),
             "savings_amount": final_row.get("savings_amount"),
+            "candidate_status": "selected",
+            "review_status": "pending",
         },
     }
 
@@ -1181,13 +1659,25 @@ async def v2_delete_row(job_id: str, request: Request, user: User = Depends(requ
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     dedup_idx = body.get("dedup_idx")
     if dedup_idx is None:
         return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
 
-    rv.save_deletion(job_id, int(dedup_idx))
+    rows = _review_rows_with_rules(job_id) or []
+    row = next((item for item in rows if item.get("dedup_idx") == int(dedup_idx)), None)
+    if row is None:
+        return JSONResponse({"error": "Ukjent rad"}, status_code=404)
+    deletions = rv.load_deletions(job_id)
+    deletions[str(int(dedup_idx))] = {"deleted_at": _utc_now_iso()}
+    try:
+        rv.save_deletions(job_id, deletions, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
     return {"ok": True, "dedup_idx": dedup_idx, "deleted": True}
 
 
@@ -1197,13 +1687,25 @@ async def v2_restore_row(job_id: str, request: Request, user: User = Depends(req
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     dedup_idx = body.get("dedup_idx")
     if dedup_idx is None:
         return JSONResponse({"error": "dedup_idx er påkrevd"}, status_code=400)
 
-    rv.remove_deletion(job_id, int(dedup_idx))
+    rows = _review_rows_with_rules(job_id) or []
+    row = next((item for item in rows if item.get("dedup_idx") == int(dedup_idx)), None)
+    if row is None:
+        return JSONResponse({"error": "Ukjent rad"}, status_code=404)
+    deletions = rv.load_deletions(job_id)
+    deletions.pop(str(int(dedup_idx)), None)
+    try:
+        rv.save_deletions(job_id, deletions, expected_revision=expected_revision)
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
     return {"ok": True, "dedup_idx": dedup_idx, "deleted": False}
 
 
@@ -1216,6 +1718,9 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
     t, err = _require_review_job(job_id)
     if err:
         return err
+    expected_revision, revision_error = _if_match_revision(request, job_id)
+    if revision_error:
+        return revision_error
 
     body = await request.json()
     description = (body.get("description") or "").strip()
@@ -1224,22 +1729,30 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
         return JSONResponse({"error": "Beskrivelse er påkrevd"}, status_code=400)
     if price is None:
         return JSONResponse({"error": "Pris er påkrevd"}, status_code=400)
+    if isinstance(price, bool):
+        return JSONResponse({"error": "Ugyldig pris"}, status_code=400)
     try:
         price = float(price)
     except (ValueError, TypeError):
         return JSONResponse({"error": "Ugyldig pris"}, status_code=400)
+    if not math.isfinite(price) or price < 0:
+        return JSONResponse({"error": "Pris må være et endelig tall som er 0 eller høyere"}, status_code=400)
 
     competitor_name = (body.get("competitor_name") or "").strip()
     competitor_artnr = (body.get("competitor_artnr") or "").strip()
     specification = (body.get("specification") or "").strip()
     quantity = body.get("quantity")
     if quantity is not None:
+        if isinstance(quantity, bool):
+            return JSONResponse({"error": "Ugyldig antall"}, status_code=400)
         try:
             quantity = float(quantity)
         except (ValueError, TypeError):
-            quantity = 1.0
+            return JSONResponse({"error": "Ugyldig antall"}, status_code=400)
     else:
         quantity = 1.0
+    if not math.isfinite(quantity) or quantity <= 0:
+        return JSONResponse({"error": "Antall må være et endelig tall større enn 0"}, status_code=400)
 
     review_rows = rv.load_review(job_id)
     if review_rows is None:
@@ -1295,8 +1808,6 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
             new_row["our_unit_price"] = matched.get("our_unit_price")
             new_row["our_comparable_line_price"] = matched.get("our_comparable_line_price")
             new_row["savings_amount"] = matched.get("savings_amount")
-            if new_row["best_candidate_idx"] is not None:
-                new_row["selected_candidate_idx"] = new_row["best_candidate_idx"]
         except Exception as e:
             logger.warning(f"V2 add-row matching failed: {e}")
 
@@ -1307,7 +1818,12 @@ async def v2_add_row(job_id: str, request: Request, user: User = Depends(require
 
     # Append to review.json
     review_rows.append(final_row)
-    rv.save_review(job_id, review_rows)
+    try:
+        rv.save_review_workspace(
+            job_id, review=review_rows, expected_revision=expected_revision
+        )
+    except rv.StaleRevisionError:
+        return JSONResponse({"error": "Review er endret av en annen bruker"}, status_code=409)
 
     # Apply overrides to return the proper state
     overridden = rv.apply_overrides([final_row], job_id)
@@ -1374,7 +1890,19 @@ def load_learnings() -> List[Dict[str, Any]]:
                         continue
     except Exception:
         pass
-    return entries
+    revoked = set()
+    if rv.V2_REVIEWS_DIR.exists():
+        for state_path in (
+            list(rv.V2_REVIEWS_DIR.glob("*/workspace.json"))
+            + list(rv.V2_REVIEWS_DIR.glob("*/state.json"))
+        ):
+            try:
+                stored = json.loads(state_path.read_text(encoding="utf-8"))
+                state = stored.get("state", stored)
+                revoked.update(state.get("revoked_learning_tokens", []))
+            except Exception:
+                continue
+    return [entry for entry in entries if entry.get("undo_token") not in revoked]
 
 
 def record_selection_learning(job_id: str, row: Dict[str, Any], candidate: Dict[str, Any]) -> None:
@@ -1391,7 +1919,13 @@ def record_selection_learning(job_id: str, row: Dict[str, Any], candidate: Dict[
     })
 
 
-def record_approval_learning(job_id: str, row: Dict[str, Any], candidate: Dict[str, Any]) -> None:
+def record_approval_learning(
+    job_id: str,
+    row: Dict[str, Any],
+    candidate: Dict[str, Any],
+    *,
+    undo_token: Optional[str] = None,
+) -> None:
     """Record when a user approves a row (strong positive signal)."""
     _save_learning({
         "type": "approval",
@@ -1402,7 +1936,31 @@ def record_approval_learning(job_id: str, row: Dict[str, Any], candidate: Dict[s
         "our_artnr": candidate.get("our_artnr", ""),
         "our_description": candidate.get("our_description", ""),
         "match_quality": candidate.get("match_quality", ""),
+        "undo_token": undo_token,
     })
+
+
+def remove_learning_by_undo_token(undo_token: str) -> None:
+    """Remove a provisional approval signal when its decision is undone."""
+    if not undo_token or not _LEARNING_FILE.exists():
+        return
+    retained = [
+        entry for entry in load_learnings()
+        if entry.get("undo_token") != undo_token
+    ]
+    temp_path = _LEARNING_FILE.with_suffix(".tmp")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            for entry in retained:
+                handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, _LEARNING_FILE)
+    except OSError as exc:
+        logger.warning(f"Kunne ikke rydde fysisk learning-signal; tombstone er aktiv: {exc}")
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
 
 
 @v2_router.get("/learning")
@@ -1447,11 +2005,9 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True, 
             status_code=400,
         )
 
-    review_rows = rv.load_review(job_id)
-    if review_rows is None:
+    rows = _review_rows_with_rules(job_id)
+    if rows is None:
         return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
-
-    rows = rv.apply_overrides(review_rows, job_id)
 
     try:
         if format == "pdf":
@@ -1490,7 +2046,7 @@ def v2_export(job_id: str, format: str = "xlsx", show_line_prices: bool = True, 
 # ============================================================
 
 @v2_router.post("/pricedb/commit/{job_id}")
-def v2_pricedb_commit(job_id: str, user: User = Depends(require_sso)):
+def v2_pricedb_commit(job_id: str, user: User = Depends(require_role())):
     """Commit approved review rows to the price database."""
     t, err = _require_shared_job(job_id)
     if err:
@@ -1501,11 +2057,9 @@ def v2_pricedb_commit(job_id: str, user: User = Depends(require_sso)):
             status_code=400,
         )
 
-    review_rows = rv.load_review(job_id)
-    if review_rows is None:
+    rows = _review_rows_with_rules(job_id)
+    if rows is None:
         return JSONResponse({"error": "Review-data ikke funnet"}, status_code=404)
-
-    rows = rv.apply_overrides(review_rows, job_id)
     count = pricedb.commit_job(job_id, rows)
     return {"ok": True, "job_id": job_id, "committed": count}
 

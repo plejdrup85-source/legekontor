@@ -5,7 +5,10 @@ Uses the existing matcher.Catalog and LegekontorCatalogBundle from app.py
 without modifying them. Keeps top-N candidates per row for later review.
 """
 import logging
+import math
 from typing import Any, Dict, List, Optional, Tuple
+
+from v2.catalog_rules import annotate_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +26,23 @@ def _build_v1_compat_row(deduped_row: Dict[str, Any]) -> Dict[str, Any]:
         "Konkurrent Specification": deduped_row.get("specification", ""),
         "Konkurrent Art.Nr": deduped_row.get("competitor_artnr", ""),
     }
+
+
+def _candidate_sort_key(candidate: Dict[str, Any]) -> tuple:
+    quality_rank = {
+        "Høy": 0,
+        "Medium": 1,
+        "Lav": 2,
+        "Manuelt valgt": 3,
+        "Søk": 3,
+        "Ingen": 4,
+    }
+    alc = candidate.get("alc")
+    return (
+        quality_rank.get(candidate.get("match_quality"), 3),
+        alc if isinstance(alc, (int, float)) and math.isfinite(alc) else math.inf,
+        str(candidate.get("our_artnr", "")),
+    )
 
 
 def _extract_candidate_fields(artnr: str, best_row: Optional[Dict[str, Any]],
@@ -62,7 +82,7 @@ def _extract_candidate_fields(artnr: str, best_row: Optional[Dict[str, Any]],
         if gid.lower() == "nan":
             gid = ""
 
-    return {
+    return annotate_candidate({
         "our_artnr": str(artnr or ""),
         "our_description": description,
         "our_specification": specification,
@@ -72,7 +92,7 @@ def _extract_candidate_fields(artnr: str, best_row: Optional[Dict[str, Any]],
         "price_source": price_source,
         "match_quality": quality,
         "matched_from": source,
-    }
+    }, best_row)
 
 
 def match_deduped_rows(
@@ -120,19 +140,20 @@ def _match_single_row(
 
     # Collect candidates from both catalogs
     candidates: List[Dict[str, Any]] = []
-    seen_artnrs: set = set()
+    seen_candidates: set = set()
 
     # Try LK catalog first
     try:
         artnr_lk, _alts_lk, best_row_lk, quality_lk = bundle.lk.match_row(
             compat_row, top_n=top_n * 3, prefer_own_brands=prefer_own_brands
         )
-        if artnr_lk and artnr_lk not in seen_artnrs:
-            price_lk, psrc_lk = bundle.price_for_artnr(artnr_lk)
+        if artnr_lk and ("lk", artnr_lk) not in seen_candidates:
+            price_lk, psrc_lk = bundle.price_for_artnr(artnr_lk, source="lk")
             cand = _extract_candidate_fields(artnr_lk, best_row_lk, quality_lk, "lk", price_lk, psrc_lk)
-            cand["candidate_idx"] = len(candidates)
-            candidates.append(cand)
-            seen_artnrs.add(artnr_lk)
+            if cand.get("eligible"):
+                cand["candidate_idx"] = len(candidates)
+                candidates.append(cand)
+                seen_candidates.add(("lk", artnr_lk))
     except Exception as e:
         logger.warning(f"V2 matching LK feilet for rad {row.get('dedup_idx')}: {e}")
 
@@ -141,12 +162,13 @@ def _match_single_row(
         artnr_full, _alts_full, best_row_full, quality_full = bundle.full.match_row(
             compat_row, top_n=top_n * 3, prefer_own_brands=prefer_own_brands
         )
-        if artnr_full and artnr_full not in seen_artnrs:
-            price_full, psrc_full = bundle.price_for_artnr(artnr_full)
+        if artnr_full and ("full", artnr_full) not in seen_candidates:
+            price_full, psrc_full = bundle.price_for_artnr(artnr_full, source="full")
             cand = _extract_candidate_fields(artnr_full, best_row_full, quality_full, "full", price_full, psrc_full)
-            cand["candidate_idx"] = len(candidates)
-            candidates.append(cand)
-            seen_artnrs.add(artnr_full)
+            if cand.get("eligible"):
+                cand["candidate_idx"] = len(candidates)
+                candidates.append(cand)
+                seen_candidates.add(("full", artnr_full))
     except Exception as e:
         logger.warning(f"V2 matching full feilet for rad {row.get('dedup_idx')}: {e}")
 
@@ -157,22 +179,25 @@ def _match_single_row(
             compat_row, top_n=top_n * 3, prefer_own_brands=prefer_own_brands
         )
         if artnr_best:
-            if artnr_best in seen_artnrs:
+            if (source_best, artnr_best) in seen_candidates:
                 # Already in candidates, find it
                 for c in candidates:
-                    if c["our_artnr"] == artnr_best:
+                    if c["our_artnr"] == artnr_best and c.get("matched_from") == source_best:
                         best_candidate_idx = c["candidate_idx"]
                         break
             else:
                 # New candidate from combined match
-                price_best, psrc_best = bundle.price_for_artnr(artnr_best)
+                price_best, psrc_best = bundle.price_for_artnr(
+                    artnr_best, source=source_best
+                )
                 cand = _extract_candidate_fields(
                     artnr_best, best_row_best, quality_best, source_best, price_best, psrc_best
                 )
-                cand["candidate_idx"] = len(candidates)
-                best_candidate_idx = cand["candidate_idx"]
-                candidates.append(cand)
-                seen_artnrs.add(artnr_best)
+                if cand.get("eligible"):
+                    cand["candidate_idx"] = len(candidates)
+                    best_candidate_idx = cand["candidate_idx"]
+                    candidates.append(cand)
+                    seen_candidates.add((source_best, artnr_best))
 
             if best_candidate_idx is None:
                 best_candidate_idx = 0  # first candidate
@@ -183,8 +208,12 @@ def _match_single_row(
     if best_candidate_idx is None and candidates:
         best_candidate_idx = 0
 
-    # Trim to top_n
+    # Match quality is authoritative; positive ALC is the stable tie-break.
+    candidates.sort(key=_candidate_sort_key)
     candidates = candidates[:top_n]
+    for candidate_idx, candidate in enumerate(candidates):
+        candidate["candidate_idx"] = candidate_idx
+    best_candidate_idx = 0 if candidates else None
 
     # Calculate comparison fields for each candidate
     total_units = row.get("total_units", 0) or 0
@@ -204,7 +233,9 @@ def _match_single_row(
 
     # Set top-level fields from best candidate
     if best_candidate_idx is not None and best_candidate_idx < len(candidates):
-        best = candidates[best_candidate_idx]
+        best = next(
+            c for c in candidates if c.get("candidate_idx") == best_candidate_idx
+        )
         result["our_unit_price"] = best.get("our_unit_price")
         result["our_comparable_line_price"] = best.get("our_comparable_line_price")
         result["savings_amount"] = best.get("savings_amount")
