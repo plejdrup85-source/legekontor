@@ -1013,6 +1013,7 @@ def _load_catalog_excel(path: str, sheet_name: str | int | None = None, column_m
             "Producer Item Number": "Katalog: Producer Item Number",
             "GID": "Katalog: GID",
             "ALC": "Katalog: ALC",
+            "Item Status": "Katalog: Item Status",
             "Item group": "Katalog: Item group",
             "Web Title": "Katalog: Web Title",
             "Web Text": "Katalog: Web Text",
@@ -1077,6 +1078,10 @@ def _load_catalog_excel(path: str, sheet_name: str | int | None = None, column_m
     map_if_exists(["Web Title", "Web title", "Tittel"], "Katalog: Web Title")
     map_if_exists(["Web Text", "Web text", "Webtekst"], "Katalog: Web Text")
     map_if_exists(["ALC", "alc", "Alc"], "Katalog: ALC")
+    map_if_exists(
+        ["Item Status", "Varestatus", "Produktstatus", "Sales Status"],
+        "Katalog: Item Status",
+    )
     map_if_exists(["GID", "Gid", "gid", "Global Item ID", "Global Item Id"], "Katalog: GID")
 
     if rename_map:

@@ -43,7 +43,6 @@ def _find_font(name: str = "DejaVuSans.ttf") -> Optional[Path]:
 
 # Column order for the export Excel
 EXPORT_COLUMNS = [
-    "Review-status",
     "Konkurrent",
     "Konkurrent Art.Nr",
     "Beskrivelse",
@@ -61,7 +60,6 @@ EXPORT_COLUMNS = [
     "Vårt linjebeløp",
     "Besparelse",
     "Besparelse %",
-    "Match-kvalitet",
     "Kommentar",
     "Sammenslått",
     "Avvik i sammenslått",
@@ -69,7 +67,6 @@ EXPORT_COLUMNS = [
 
 # Columns when line prices are hidden
 EXPORT_COLUMNS_NO_PRICES = [
-    "Review-status",
     "Konkurrent",
     "Konkurrent Art.Nr",
     "Beskrivelse",
@@ -82,7 +79,6 @@ EXPORT_COLUMNS_NO_PRICES = [
     "Vårt produktnavn",
     "Vår spesifikasjon",
     "Vår produsent",
-    "Match-kvalitet",
     "Kommentar",
     "Sammenslått",
     "Avvik i sammenslått",
@@ -111,14 +107,14 @@ def calculate_totals(export_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         ol = r.get("Vårt linjebeløp")
         uc = r.get("Totale enheter Konkurrent")
         uo = r.get("Totale Enheter OM")
-        if cl is not None:
-            total_comp += float(cl)
         if ol is not None:
             total_our += float(ol)
-        if uc is not None:
-            total_units_comp += float(uc)
-        if uo is not None:
-            total_units_om += float(uo)
+            if cl is not None:
+                total_comp += float(cl)
+            if uc is not None:
+                total_units_comp += float(uc)
+            if uo is not None:
+                total_units_om += float(uo)
         count += 1
     total_savings = total_comp - total_our
     savings_pct = round(total_savings / total_comp * 100, 1) if total_comp else 0.0
@@ -141,14 +137,22 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         # Skip deleted rows
         if r.get("deleted"):
             continue
-        # Get selected candidate
+        # Project only an explicit reviewer selection; untouched suggestions stay blank.
         sel_idx = r.get("selected_candidate_idx")
         candidates = r.get("candidates", [])
-        cand = candidates[sel_idx] if (sel_idx is not None and 0 <= sel_idx < len(candidates)) else None
+        cand = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.get("candidate_idx") == sel_idx
+                and candidate.get("eligible") is not False
+            ),
+            None,
+        )
 
         comp_line = r.get("competitor_line_amount")
-        our_line = r.get("our_comparable_line_price")
-        savings = r.get("savings_amount")
+        our_line = r.get("our_comparable_line_price") if cand else None
+        savings = r.get("savings_amount") if cand else None
 
         # Calculate savings percentage
         savings_pct = None
@@ -171,7 +175,6 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         om_units = r.get("quantity_override") if r.get("quantity_override") is not None else base_units
 
         row = {
-            "Review-status": r.get("review_status", "pending"),
             "Konkurrent": r.get("competitor", ""),
             "Konkurrent Art.Nr": r.get("competitor_artnr", ""),
             "Beskrivelse": r.get("description", ""),
@@ -185,11 +188,10 @@ def build_export_rows(review_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]
             "Vårt produktnavn": cand.get("our_description", "") if cand else "",
             "Vår spesifikasjon": cand.get("our_specification", "") if cand else "",
             "Vår produsent": cand.get("our_producer", "") if cand else "",
-            "Vår pris/enhet": r.get("our_unit_price"),
+            "Vår pris/enhet": r.get("our_unit_price") if cand else None,
             "Vårt linjebeløp": our_line,
             "Besparelse": savings,
             "Besparelse %": savings_pct,
-            "Match-kvalitet": cand.get("match_quality", "") if cand else "Ingen",
             "Kommentar": r.get("comment", ""),
             "Sammenslått": merge_note,
             "Avvik i sammenslått": warn_note,
@@ -502,7 +504,11 @@ def generate_export_pdf(review_rows: List[Dict[str, Any]], show_line_prices: boo
         pdf.set_font(FONT, "B", 9)
         pdf.set_text_color(*C_DARK)
         our_name = _s(r.get("Vårt produktnavn"), 50)
-        pdf.cell(half_w - 8, 4, our_name if our_name else "-")
+        pdf.cell(
+            half_w - 8,
+            4,
+            our_name if our_name else "Ingen OneMed-match valgt",
+        )
 
         pdf.set_xy(rx, row_y + 10)
         pdf.set_font(FONT, "", 7.5)

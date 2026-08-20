@@ -117,15 +117,22 @@ def test_v2_review_workflow_is_shared_across_authenticated_users(client):
 
     assert client.get(f"/v2/status/{job_id}", cookies=cookies).status_code == 200
     assert client.get(f"/v2/review/{job_id}/ui", cookies=cookies).status_code == 200
-    assert client.get(f"/v2/review/{job_id}", cookies=cookies).status_code == 200
+    review = client.get(f"/v2/review/{job_id}", cookies=cookies)
+    assert review.status_code == 200
     decision = client.post(
         f"/v2/review/{job_id}/decide",
-        json={"dedup_idx": 0, "status": "approved"},
+        json={
+            "dedup_idx": 0,
+            "status": "not_same",
+            "revision": review.json()["revision"],
+            "candidate_identity": None,
+        },
+        headers={"If-Match": str(review.json()["revision"])},
         cookies=cookies,
     )
     assert decision.status_code == 200
     review = client.get(f"/v2/review/{job_id}", cookies=cookies).json()
-    assert review["rows"][0]["review_status"] == "approved"
+    assert review["rows"][0]["review_status"] == "not_same"
 
 
 def test_v2_job_routes_require_auth_and_unknown_job_stays_hidden(client):
@@ -138,13 +145,13 @@ def test_v2_job_routes_require_auth_and_unknown_job_stays_hidden(client):
     ).status_code == 404
 
 
-def test_v2_shared_job_can_be_committed_while_learning_remains_admin_only(client):
+def test_v2_pricedb_commit_and_learning_are_admin_only(client):
     job_id = _create_review_job()
     user_cookie = {"sso_session": _sess("userB")}
     admin_cookie = {"sso_session": _sess("admin", "admin")}
 
     assert client.get("/v2/learning", cookies=user_cookie).status_code == 403
-    assert client.post(f"/v2/pricedb/commit/{job_id}", cookies=user_cookie).status_code == 200
+    assert client.post(f"/v2/pricedb/commit/{job_id}", cookies=user_cookie).status_code == 403
     assert client.get("/v2/learning", cookies=admin_cookie).status_code == 200
     assert client.post(f"/v2/pricedb/commit/{job_id}", cookies=admin_cookie).status_code == 200
 

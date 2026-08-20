@@ -233,6 +233,13 @@ CATALOG_SYSTEM_FIELDS = [
         "patterns": ["alc", "average landed cost", "landed cost"],
     },
     {
+        "key": "Item Status",
+        "label": "Varestatus",
+        "required": False,
+        "description": "Kun produkter med status Sellable kan velges i V2",
+        "patterns": ["item status", "varestatus", "produktstatus", "sales status"],
+    },
+    {
         "key": "Pris",
         "label": "Pris / enhetspris",
         "required": False,
@@ -330,6 +337,7 @@ def _apply_column_mapping(df: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataF
         "Producer Item Number": "Katalog: Producer Item Number",
         "GID": "Katalog: GID",
         "ALC": "Katalog: ALC",
+        "Item Status": "Katalog: Item Status",
         "Pris": None,  # Price column name varies; keep original
         "Item group": "Katalog: Item group",
         "Web Title": "Katalog: Web Title",
@@ -389,8 +397,13 @@ class LegekontorCatalogBundle:
         artnr, _alts, best_row, quality = self.full.match_row(mrow, top_n=top_n, prefer_own_brands=prefer_own_brands)
         return artnr, best_row, quality, "full"
 
-    def price_for_artnr(self, artnr: str) -> Tuple[Optional[float], str]:
-        d = self.price_lookup.get(str(artnr).strip())
+    def price_for_artnr(
+        self, artnr: str, source: Optional[str] = None
+    ) -> Tuple[Optional[float], str]:
+        normalized = str(artnr).strip()
+        d = self.price_lookup.get(f"{source}:{normalized}") if source else None
+        if not d:
+            d = self.price_lookup.get(normalized)
         if not d:
             return None, ""
         return d.get("price"), d.get("source") or ""
@@ -1191,9 +1204,20 @@ def _start_embeddings_build_background() -> None:
 
             lk_sheet = CURRENT_LK_SHEET if CURRENT_LK_SHEET is not None else LK_SHEET_NAME
             full_sheet = CURRENT_FULL_SHEET if CURRENT_FULL_SHEET is not None else FULL_SHEET_NAME
+            saved_mapping = _load_saved_mapping()
 
-            lk2 = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=True, sheet_name=lk_sheet)
-            full2 = Catalog.from_excel(str(CATALOG_PATH), use_embeddings=True, sheet_name=full_sheet)
+            lk2 = Catalog.from_excel(
+                str(CATALOG_PATH),
+                use_embeddings=True,
+                sheet_name=lk_sheet,
+                column_mapping=saved_mapping,
+            )
+            full2 = Catalog.from_excel(
+                str(CATALOG_PATH),
+                use_embeddings=True,
+                sheet_name=full_sheet,
+                column_mapping=saved_mapping,
+            )
 
             CATALOG_BUNDLE.lk.embed_index = getattr(lk2, "embed_index", None)
             CATALOG_BUNDLE.full.embed_index = getattr(full2, "embed_index", None)
@@ -1286,6 +1310,7 @@ def load_catalog_from_disk() -> None:
         p = _to_float(r.get(full_price_col)) if full_price_col else None
         if p is None:
             continue
+        price_lookup[f"full:{art}"] = {"price": float(p), "source": "full"}
         price_lookup[art] = {"price": float(p), "source": "full"}
 
     # LK overstyrer
@@ -1296,6 +1321,7 @@ def load_catalog_from_disk() -> None:
         p = _to_float(r.get(lk_price_col)) if lk_price_col else None
         if p is None:
             continue
+        price_lookup[f"lk:{art}"] = {"price": float(p), "source": "lk"}
         price_lookup[art] = {"price": float(p), "source": "lk"}
 
     # Ikke bygg embeddings ved startup
